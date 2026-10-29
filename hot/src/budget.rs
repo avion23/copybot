@@ -105,6 +105,22 @@ pub fn lane_available(bankroll: f64, deployed: f64) -> f64 {
     }
     (bankroll - deployed.max(0.0)).max(0.0)
 }
+/// Conservative taker-fee reserve against the largest documented rate (7%).
+/// FAK takes liquidity; GTC orders are also taker-capable while postOnly=false.
+/// The fill price can be any price from zero through the buy limit, so the
+/// maximum fee on that interval occurs at min(limit, 0.5).
+pub const MAX_DOCUMENTED_TAKER_RATE: f64 = 0.07;
+pub fn buy_budget_cost(shares: f64, buy_limit: f64) -> Option<f64> {
+    if !shares.is_finite() || shares < 0.0 || !buy_limit.is_finite()
+        || !(0.0..=1.0).contains(&buy_limit)
+    {
+        return None;
+    }
+    let fee_price = buy_limit.min(0.5);
+    let fee = shares * MAX_DOCUMENTED_TAKER_RATE * fee_price * (1.0 - fee_price);
+    let cost = shares * buy_limit + fee;
+    cost.is_finite().then_some(cost)
+}
 pub fn buy_fits(available: f64, free_cash: Option<f64>, cost: f64) -> bool {
     buy_fits_aged(available, free_cash, cost, Some(0))
 }

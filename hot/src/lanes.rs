@@ -32,6 +32,7 @@ pub enum Skip {
     SellNoPosition,
     SellAlreadyReserved,
     NotReady,
+    InvalidFeeEstimate,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Route {
@@ -45,7 +46,10 @@ pub struct Intent {
     pub side: u8,
     pub shares: f64,
     pub limit: f64,
+    /// Order notional before fee, in micro-dollars.
     pub usd: Micro,
+    /// Reserved gross buy cash: notional plus worst-case taker fee.
+    pub budget_usd: Micro,
     pub execution: Execution,
     pub his_remaining: f64,
     pub he_was_maker: bool,
@@ -528,6 +532,7 @@ impl Router {
                 shares,
                 limit,
                 usd: 0,
+                budget_usd: 0,
                 execution: c.execution,
                 his_remaining: (d.order_size - d.fill_size).max(0.0),
                 he_was_maker: d.role == "maker",
@@ -575,9 +580,12 @@ impl Router {
         if shares < crate::venue::VENUE_MIN_SHARES {
             return Err(Skip::BelowVenueMinimum);
         }
+        let Some(cost_per_share) = crate::budget::buy_budget_cost(1.0, limit) else {
+            return Err(Skip::InvalidFeeEstimate);
+        };
         let cap_fill = pol.caps.max_usd_per_fill * scale;
-        if usd > cap_fill {
-            shares = whole(cap_fill / limit);
+        if shares * cost_per_share > cap_fill {
+            shares = whole(cap_fill / cost_per_share);
             if shares <= 0.0 {
                 return Err(Skip::DustAfterSizing);
             }
@@ -587,24 +595,28 @@ impl Router {
             return Err(Skip::BelowVenueMinimum);
         }
         let usd_micro = (usd * MICRO) as Micro;
+        let Some(cost) = crate::budget::buy_budget_cost(shares, limit) else {
+            return Err(Skip::InvalidFeeEstimate);
+        };
+        let budget_micro = (cost * MICRO).ceil() as Micro;
         let day_cap = (pol.caps.daily_usd * scale * MICRO) as Micro;
-        if lane.state.spent_today.load(Ordering::Relaxed) + usd_micro > day_cap {
+        if lane.state.spent_today.load(Ordering::Relaxed) + budget_micro > day_cap {
             return Err(Skip::DailyBudget);
         }
         let open_cap = (pol.caps.max_open_usd * scale * MICRO) as Micro;
-        if lane.state.open_usd.load(Ordering::Relaxed) + usd_micro > open_cap {
+        if lane.state.open_usd.load(Ordering::Relaxed) + budget_micro > open_cap {
             return Err(Skip::MaxOpen);
         }
         {
             let mut pt = lane.per_token.lock().unwrap();
             let spent = *pt.get(&d.token_id).unwrap_or(&0);
-            if spent + usd_micro > (pol.caps.per_market_usd * scale * MICRO) as Micro {
+            if spent + budget_micro > (pol.caps.per_market_usd * scale * MICRO) as Micro {
                 return Err(Skip::PerMarketCap);
             }
-            pt.insert(d.token_id.clone(), spent + usd_micro);
+            pt.insert(d.token_id.clone(), spent + budget_micro);
         }
-        lane.state.spent_today.fetch_add(usd_micro, Ordering::Relaxed);
-        lane.state.open_usd.fetch_add(usd_micro, Ordering::Relaxed);
+        lane.state.spent_today.fetch_add(budget_micro, Ordering::Relaxed);
+        lane.state.open_usd.fetch_add(budget_micro, Ordering::Relaxed);
         self.claim(&d.token_id, lane_ix);
         Ok(Intent {
             lane: lane_ix,
@@ -613,6 +625,7 @@ impl Router {
             shares,
             limit,
             usd: usd_micro,
+            budget_usd: budget_micro,
             execution: c.execution,
             his_remaining: (d.order_size - d.fill_size).max(0.0),
             he_was_maker: d.role == "maker",
@@ -2401,6 +2414,7 @@ mod route_tests {
             shares: 5.0,
             limit: 0.62,
             usd: 0,
+            budget_usd: 0,
             execution: Execution::Hybrid,
             his_remaining: 4600.0,
             he_was_maker: false,

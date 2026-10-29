@@ -482,8 +482,12 @@ impl PendingLog {
                     .entry((p.lane.clone(), p.token.clone()))
                     .or_default() += p.shares;
             }
-            let usd = p.shares * p.limit;
-            if !usd.is_finite() || usd <= 0.0 {
+            // Rebuild the same gross reservation as Router::decide after a
+            // control tick or restart; pending taker-capable buys can incur fees.
+            let Some(usd) = crate::budget::buy_budget_cost(p.shares, p.limit) else {
+                continue;
+            };
+            if usd <= 0.0 {
                 continue;
             }
             *by_lane.entry(p.lane.clone()).or_default() += usd;

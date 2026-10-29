@@ -7781,9 +7781,12 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                             let pol = lane.policy();
                             let deployed = lane.state.open_usd.load(Ordering::Relaxed)
                                 as f64 / MICRO;
+                            // Router.decide has already included this intent in open_usd.
+                            // Subtract its own reservation exactly once before the cash gate.
+                            let cost = intent.budget_usd as f64 / MICRO;
                             let available = copybot_hot::budget::lane_available(
                                 pol.seed_usd,
-                                deployed,
+                                (deployed - cost).max(0.0),
                             );
                             let (free_cash, cash_age) = physical_wallet
                                 .lock()
@@ -7793,7 +7796,6 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                     w.fetched_at.map(|t| copybot_hot::ledger::now_secs() - t),
                                 ))
                                 .unwrap_or((None, None));
-                            let cost = intent.usd as f64 / MICRO;
                             if !copybot_hot::budget::buy_fits_aged(
                                 available,
                                 free_cash,
@@ -7814,6 +7816,7 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                             .token_id[..intent.token_id.len().min(14)], "cost_usd" :
                                             cost, "lane_available_usd" : available, "lane_seed_usd" :
                                             pol.seed_usd, "lane_deployed_usd" : deployed,
+                                            "fee_reserve_usd" : cost - intent.usd as f64 / MICRO,
                                             "physical_cash" : free_cash, }
                                         ),
                                     );
@@ -7945,7 +7948,8 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                             => serde_json::json!("take"), Route::RestInFront { limit,
                             room_ticks } => serde_json::json!({ "rest" : limit,
                             "room_ticks" : room_ticks }), }, "usd" : intent.usd as f64 /
-                            MICRO, "his_px" : d.price, "pad_c" : ((limit - d.price) *
+                            MICRO, "budget_usd" : intent.budget_usd as f64 / MICRO,
+                            "his_px" : d.price, "pad_c" : ((limit - d.price) *
                             10000.0).round() / 100.0, "his_fill" : d.fill_size,
                             "his_order" : d.order_size, "his_remaining" : intent
                             .his_remaining, "exec" : format!("{:?}", intent.execution),
