@@ -170,7 +170,7 @@ All line references below are to this worktree after the completed fingerprint d
 
 | Current (2026-10-29 source) | Target ownership / observable invariant |
 |---|---|
-| `hot/src/main.rs` 9,472 lines: startup, feeds, matching, budgets, submission, exit rescue, reconcile, HTTP dashboard, control and tests mixed; 34 `tokio::spawn` sites reported in independent review | `main.rs` only composes dependencies, launches supervised tasks and returns typed process status; task handlers own one distinct operation; every source file **≤1,000 lines** after migration, no duplicated decision engine |
+| COPYBOT-2 A3 extraction in progress: baseline `hot/src/main.rs` **9,419** lines at `dd1670e`; event persistence, throttling, bounded stdout mirroring and event clock moved unchanged to `runtime/telemetry.rs` (**90** lines). Entrypoint remains **9,339** lines; startup, feeds, matching, execution, reconciliation, dashboard and tests still need extraction. No trading-semantic change in this slice | `main.rs` only composes dependencies, launches supervised tasks and returns typed process status; task handlers own one distinct operation; every source file **≤1,000 lines** after migration, no duplicated decision engine |
 | `feeds.rs` pending WebSocket; `book.rs` public book; A1 removed fingerprint and A2 removed the optional `txpool.rs` 20-second poll | **One authoritative pending WebSocket signal**. `book.rs` remains market-data-for-pricing and resting safety only; keep deliberate provider redundancy *within one feed protocol* and one dedupe point. |
 | `RawTx` identifies decoded maker address but not authenticated sender/order intent; V2 exchange-only filters | Typed `ObservedTx` → `VerifiedLeaderFill` with verified settlement origin, contract/version, validated order identity/signature and replay-proof occurrence. Unknown protocol refuses admission; unsupported modern position system not silently treated as CTF |
 | `lanes.rs` mixes pure sizing/exits/routing with mutex-backed reservations; `main.rs` cash check double counted own reservation before prior patch | Pure `size_buy`, `price_route`, `exit_rule`, `fee_bound`; one `EngineState::reserve` returning scoped token. Fee-inclusive strategy budget; actual buy physical cash only order notional; pending recovery returns same commitments |
@@ -216,6 +216,12 @@ configured pending WS (one live detection protocol)
 ```
 
 All async tasks send typed messages to the owner; no spawned closure independently updates wallet, position, pending and reservation maps. The owner may run in a single task and serialize only state transitions, leaving network I/O outside the critical section. Explicit bounded ingress has a tracked overload policy: never silently drop an exit, incident or recovery event; halt new buys when the evidence queue becomes stale. Recovery replays a single durable order identity before re-enabling buys.
+
+## COPYBOT-2 execution status
+
+The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
+
+A3 is **partial**, not complete: the first mechanical slice moves the event emitter and clock into the binary's `runtime/telemetry.rs`. The emitter's channel bound, throttle intervals, persistence/error behavior and call sites are unchanged. Existing tests remain unchanged, including the throttle assertions. Validation retains **741 library + 47 binary + 181 deploy tests**, all passing; the existing synthetic redemption/restart integration suite also passes **9 tests**. Release build, release hygiene (zero findings) and generated-guide check pass. No recorded market replay is shipped, so synthetic replay is not presented as live-data evidence. The remaining entrypoint and oversized library files still exceed their budgets. A4-A6 are not implemented by this extraction. No leader-timing benefit is claimed.
 
 ## Migration order — smallest complete, four-gate-clean steps
 
