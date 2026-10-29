@@ -16,7 +16,6 @@ pub mod firerate;
 pub mod incidents;
 pub mod funding;
 pub mod flatten;
-pub mod fingerprint;
 pub mod laneid;
 pub mod lanes;
 pub mod latency;

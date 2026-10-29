@@ -206,7 +206,7 @@ pub fn tick_size(price: f64) -> f64 {
     if price > 0.96 || price < 0.04 { 0.001 } else { 0.01 }
 }
 pub async fn run_book_feed(cache: Arc<BookCache>, tokens: Arc<Mutex<Vec<String>>>) {
-    run_book_feed_with(cache, tokens, None, None, None).await
+    run_book_feed_with(cache, tokens, None, None).await
 }
 pub const WATCH_CAP: usize = 200;
 pub const WATCH_HARD_MAX: usize = 2 * WATCH_CAP;
@@ -233,23 +233,15 @@ pub fn canonical(tokens: &[String]) -> Vec<String> {
 pub async fn run_book_feed_multi(
     cache: Arc<BookCache>,
     tokens: Arc<Mutex<Vec<String>>>,
-    fps: Option<
-        (
-            Arc<crate::fingerprint::Fingerprints>,
-            Arc<crate::fingerprint::FingerprintScore>,
-            std::sync::mpsc::Sender<crate::fingerprint::Candidate>,
-        ),
-    >,
     prints: Option<Arc<TradePrints>>,
     levels: Option<Arc<Levels>>,
     sockets: usize,
 ) {
     let mut handles = Vec::new();
     for i in 0..sockets.max(1) {
-        let (c, t, f, pr, lv) = (
+        let (c, t, pr, lv) = (
             cache.clone(),
             tokens.clone(),
-            fps.clone(),
             prints.clone(),
             levels.clone(),
         );
@@ -257,7 +249,7 @@ pub async fn run_book_feed_multi(
             .push(
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(120 * i as u64)).await;
-                    run_book_feed_with(c, t, f, pr, lv).await
+                    run_book_feed_with(c, t, pr, lv).await
                 }),
             );
     }
@@ -268,13 +260,6 @@ pub async fn run_book_feed_multi(
 pub async fn run_book_feed_with(
     cache: Arc<BookCache>,
     tokens: Arc<Mutex<Vec<String>>>,
-    fps: Option<
-        (
-            Arc<crate::fingerprint::Fingerprints>,
-            Arc<crate::fingerprint::FingerprintScore>,
-            std::sync::mpsc::Sender<crate::fingerprint::Candidate>,
-        ),
-    >,
     prints: Option<Arc<TradePrints>>,
     levels: Option<Arc<Levels>>,
 ) {
@@ -288,7 +273,6 @@ pub async fn run_book_feed_with(
                 &cache,
                 &want,
                 &tokens,
-                fps.as_ref(),
                 prints.as_ref(),
                 levels.as_ref(),
             )
@@ -299,16 +283,10 @@ pub async fn run_book_feed_with(
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
 }
-type FpTrio = (
-    Arc<crate::fingerprint::Fingerprints>,
-    Arc<crate::fingerprint::FingerprintScore>,
-    std::sync::mpsc::Sender<crate::fingerprint::Candidate>,
-);
 async fn pump(
     cache: &Arc<BookCache>,
     tokens: &[String],
     watch: &Arc<Mutex<Vec<String>>>,
-    fps: Option<&FpTrio>,
     prints: Option<&Arc<TradePrints>>,
     levels: Option<&Arc<Levels>>,
 ) -> Result<(), String> {
@@ -346,7 +324,7 @@ async fn pump(
             None => vec![& v],
         };
         for it in items {
-            apply_frame(it, cache, prints, levels, fps);
+            apply_frame(it, cache, prints, levels);
         }
     }
 }
@@ -358,7 +336,6 @@ pub fn apply_frame(
     cache: &Arc<BookCache>,
     prints: Option<&Arc<TradePrints>>,
     levels: Option<&Arc<Levels>>,
-    fps: Option<&FpTrio>,
 ) {
     match it["event_type"].as_str().unwrap_or("") {
         "price_change" => {
@@ -380,21 +357,6 @@ pub fn apply_frame(
                     fstr(&c["size"]),
                 ) {
                     l.put(token, px, sz);
-                }
-                if let Some((fp, score, tx)) = fps {
-                    let side = match c["side"].as_str().unwrap_or("") {
-                        s if s.eq_ignore_ascii_case("buy") => 0u8,
-                        s if s.eq_ignore_ascii_case("sell") => 1u8,
-                        _ => continue,
-                    };
-                    if let (Some(px), Some(sz)) = (fstr(&c["price"]), fstr(&c["size"])) {
-                        if let Some(cand) = fp.on_book(token, px, sz) {
-                            if cand.side == side {
-                                score.saw(cand.clone());
-                                let _ = tx.send(cand);
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -448,24 +410,6 @@ pub fn apply_frame(
                     }
                     l.put_snapshot(token, &all);
                 }
-                if let Some((fp, score, tx)) = fps {
-                    for (side, arr) in [(0u8, b), (1u8, a)] {
-                        for lvl in arr {
-                            let (Some(ps), Some(ss)) = (
-                                lvl["price"].as_str(),
-                                lvl["size"].as_str(),
-                            ) else { continue };
-                            let (Ok(px), Ok(sz)) = (ps.parse::<f64>(), ss.parse::<f64>())
-                            else { continue };
-                            if let Some(c) = fp.on_book(token, px, sz) {
-                                if c.side == side {
-                                    score.saw(c.clone());
-                                    let _ = tx.send(c);
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -492,7 +436,6 @@ mod tests {
             &cache,
             Some(&prints),
             None,
-            None,
         );
         assert_eq!(
             prints.cumulative_at("T", 0.50), 100.0,
@@ -505,7 +448,7 @@ mod tests {
         let prints = std::sync::Arc::new(TradePrints::new());
         let f = print_frame("T", "0.50", "100", "buy");
         for _ in 0..3 {
-            apply_frame(&f, &cache, Some(&prints), None, None);
+            apply_frame(&f, &cache, Some(&prints), None);
         }
         assert_eq!(prints.cumulative_at("T", 0.50), 100.0);
     }
@@ -518,13 +461,11 @@ mod tests {
             &cache,
             Some(&prints),
             None,
-            None,
         );
         apply_frame(
             &print_frame("T", "0.50", "100", "sell"),
             &cache,
             Some(&prints),
-            None,
             None,
         );
         assert_eq!(
@@ -540,7 +481,7 @@ mod tests {
             { "event_type" : "last_trade_price", "asset_id" : "T", "price" : "0.50",
             "size" : "100" }
         );
-        apply_frame(&f, &cache, Some(&prints), None, None);
+        apply_frame(&f, &cache, Some(&prints), None);
         assert_eq!(prints.cumulative_at("T", 0.50), 100.0);
     }
     #[test]
@@ -735,7 +676,7 @@ mod tests {
         }"#,
             )
             .unwrap();
-        apply_frame(&frame, &c, None, None, None);
+        apply_frame(&frame, &c, None, None);
         let t = c.top("TOK1").expect("price_change must feed the cache");
         assert_eq!((t.best_bid, t.best_ask), (0.60, 0.62));
     }
@@ -754,7 +695,7 @@ mod tests {
         }"#,
             )
             .unwrap();
-        apply_frame(&frame, &c, None, None, None);
+        apply_frame(&frame, &c, None, None);
         assert!(c.top("A").is_some() && c.top("B").is_some());
     }
     #[test]
@@ -768,7 +709,7 @@ mod tests {
         }"#,
             )
             .unwrap();
-        apply_frame(&frame, &c, None, None, None);
+        apply_frame(&frame, &c, None, None);
         let t = c.top("TOK1").unwrap();
         assert_eq!((t.best_bid, t.best_ask), (0.60, 0.63));
     }
@@ -783,7 +724,7 @@ mod tests {
         }"#,
             )
             .unwrap();
-        apply_frame(&frame, &c, Some(&pr), None, None);
+        apply_frame(&frame, &c, Some(&pr), None);
         assert_eq!(pr.cumulative_at("TOK1", 0.62), 150.0);
         assert_eq!(
             pr.cumulative_at("TOK1", 0.70), 0.0,
@@ -803,7 +744,7 @@ mod tests {
             r#"42"#,
         ] {
             let v: serde_json::Value = serde_json::from_str(bad).unwrap();
-            apply_frame(&v, &c, None, None, None);
+            apply_frame(&v, &c, None, None);
         }
         assert!(c.is_empty());
     }
@@ -920,7 +861,6 @@ mod tests {
             &c,
             None,
             Some(&l),
-            None,
         );
         apply_frame(
             &fr(
@@ -931,7 +871,6 @@ mod tests {
             &c,
             None,
             Some(&l),
-            None,
         );
         assert_eq!(l.size_at("T", 0.62), Some(0.0), "size 0 IS the cancel signal");
     }

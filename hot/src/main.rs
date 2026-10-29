@@ -1,7 +1,6 @@
 #![cfg_attr(test, allow(non_snake_case))]
 use copybot_hot::book::BookCache;
 use copybot_hot::control::Control;
-use copybot_hot::fingerprint::{FingerprintScore, Fingerprints};
 use copybot_hot::ledger::Ledger;
 use copybot_hot::txpool::{self, TxpoolStats};
 use copybot_hot::calldata::{decode_all, participants};
@@ -1663,7 +1662,6 @@ async fn control_task(
     pend_ctl: Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
     emitter: Arc<Emitter>,
     watch: Arc<std::sync::Mutex<Vec<String>>>,
-    fps: Arc<Fingerprints>,
     resting: Arc<copybot_hot::resting::RestingBook>,
     levels_ctl: Arc<copybot_hot::book::Levels>,
     prints_ctl: Arc<copybot_hot::book::TradePrints>,
@@ -1692,7 +1690,6 @@ async fn control_task(
                     .all()
                     .into_iter()
                     .map(|r| r.token)
-                    .chain(fps.known_tokens())
                     .chain(
                         held.iter().filter(|(_, s)| **s > 1e-9).map(|(t, _)| t.clone()),
                     )
@@ -1721,7 +1718,6 @@ async fn control_task(
                     );
                 last = snap;
             }
-            let _ = &fps;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -1872,8 +1868,6 @@ actually reach the venue and are refused. This key controls no funds."
                 else { "DRY — nothing will be submitted" }, }
             ),
         );
-    let fps = Arc::new(Fingerprints::new());
-    let fpscore = Arc::new(FingerprintScore::new());
     let resting_book = Arc::new(copybot_hot::resting::RestingBook::new());
     let sell_tranches = Arc::new(copybot_hot::lanes::TrancheLedger::new(4096));
     let fire_rate = Arc::new(
@@ -1956,12 +1950,10 @@ actually reach the venue and are refused. This key controls no funds."
         std::sync::Mutex::new(Vec::new()),
     );
     {
-        let (fptx, _fprx) = std::sync::mpsc::channel();
         tokio::spawn(
             copybot_hot::book::run_book_feed_multi(
                 books.clone(),
                 watch_tokens.clone(),
-                Some((fps.clone(), fpscore.clone(), fptx)),
                 Some(prints.clone()),
                 Some(levels.clone()),
                 3,
@@ -2777,7 +2769,6 @@ still be holding something, check that the funder address is right."
                 pending_log.clone(),
                 emitter.clone(),
                 watch_tokens.clone(),
-                fps.clone(),
                 resting_book.clone(),
                 levels.clone(),
                 prints.clone(),
@@ -2817,13 +2808,7 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(8806);
-        let (c, r, fp2, sc2, bk2) = (
-            control.clone(),
-            router.clone(),
-            fps.clone(),
-            fpscore.clone(),
-            books.clone(),
-        );
+        let (c, r, bk2) = (control.clone(), router.clone(), books.clone());
         let pend_dash = pending_log.clone();
         let custody_dash = custody_report.clone();
         let leader_pnl_dash = leader_pnl.clone();
@@ -2971,13 +2956,7 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                         .await;
                     continue;
                 };
-                let (c, r, fp2, sc2, bk2) = (
-                    c.clone(),
-                    r.clone(),
-                    fp2.clone(),
-                    sc2.clone(),
-                    bk2.clone(),
-                );
+                let (c, r, bk2) = (c.clone(), r.clone(), bk2.clone());
                 let (http2, funder2, lane_specs) = (
                     http_mu.clone(),
                     funder_mu.clone(),
@@ -3991,13 +3970,6 @@ declared net external funding (deposits - withdrawals); independent of lane allo
                                         realised))
                                     );
                                 }
-                                body["fingerprint"] = serde_json::json!(
-                                    { "watching" : fp2.known_len(), "emitted" : * fp2.emitted
-                                    .lock().unwrap(), "abstained_contested" : * fp2
-                                    .abstained_contested.lock().unwrap(), "abstained_stale" : *
-                                    fp2.abstained_stale.lock().unwrap(), "shadow" : sc2
-                                    .verdict(30), }
-                                );
                                 body["books_cached"] = serde_json::json!(bk2.len());
                                 body["resting"] = {
                                     let now = copybot_hot::ledger::now_secs();
@@ -7731,20 +7703,6 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                             }
                             continue;
                         }
-                    }
-                }
-                {
-                    let remaining = (d.order_size - d.fill_size).max(0.0);
-                    let book_size = books
-                        .top(&d.token_id)
-                        .map(|t| if d.side == 0 { t.best_bid } else { t.best_ask })
-                        .unwrap_or(0.0);
-                    let _ = book_size;
-                    fpscore.confirm(&d.token_id, d.side, d.price, d.fill_size);
-                    if remaining > 0.0 {
-                        fps.learn(&d.token_id, d.side, d.price, remaining, remaining);
-                    } else {
-                        fps.forget(&d.token_id);
                     }
                 }
                 let decided = router.decide(lane_ix, &d, progress);
