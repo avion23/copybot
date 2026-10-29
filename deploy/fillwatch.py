@@ -5,20 +5,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-try:
-    import corroborate
-    _CORROBORATE_REAL = True
-except ImportError:
-
-    class corroborate:
-        CONFIRMED = 'CONFIRMED'
-        REFUTED = 'REFUTED'
-        UNVERIFIABLE = 'UNVERIFIABLE'
-        STRANDED_MIN_USD = 25.0
-        Ctx = staticmethod(lambda *a, **k: None)
-        check = staticmethod(lambda *a, **k: ('CONFIRMED', 'corroboration unavailable'))
-        halts = staticmethod(lambda v: True)
-    _CORROBORATE_REAL = False
+import corroborate
 BOT_DIR = os.environ.get('BOT_DIR', '/opt/copybot')
 BOT_PORT = int(os.environ.get('BOT_PORT', '8807'))
 RUN_DIR = os.path.join(BOT_DIR, 'run')
@@ -335,8 +322,6 @@ def find_faults(his, ours, lanes, now, balances, marks=None):
     return faults
 
 def run(window_secs, dry_run):
-    if not _CORROBORATE_REAL:
-        log('WARN: corroborate.py is NOT importable here — MISS corroboration is INERT (it fails closed and halts exactly as before). Deploy it into this tree.')
     now = time.time()
     lanes = bot_state()
     if not lanes:
