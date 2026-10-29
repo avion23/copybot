@@ -5,6 +5,8 @@ pub(crate) mod control;
 pub(crate) mod dashboard_model;
 pub(crate) mod execution;
 pub(crate) mod exits;
+pub(crate) mod exit_sweep;
+pub(crate) mod flatten_task;
 pub(crate) mod http;
 pub(crate) mod merge;
 pub(crate) mod operator;
