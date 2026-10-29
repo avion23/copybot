@@ -91,6 +91,9 @@ impl LaneConfig {
                 format!("lane {}: per_market_usd exceeds max_open_usd", self.name),
             );
         }
+        if !self.sell_all_frac.is_finite() || !(0.0..=1.0).contains(&self.sell_all_frac) {
+            return Err(format!("lane {}: sell_all_frac must be in [0,1]", self.name));
+        }
         if self.min_order_usd < 1.0 {
             return Err(
                 format!(
@@ -846,17 +849,16 @@ mod tests {
         (copied, clips)
     }
     #[test]
-    fn ANY_sell_of_his_flattens_our_WHOLE_position() {
-        assert_eq!(
-            crate ::config::SELL_ALL_ON_ANY_SELL, 0.0,
-            "the production default must flatten on any sell"
-        );
-        for frac in [0.0001_f64, 0.01, 0.1, 0.3, 0.5, 0.9, 0.95, 1.0] {
+    fn DEFAULT_sell_policy_mirrors_a_partial_exit_and_flattens_a_full_exit() {
+        assert_eq!(crate::config::RUNTIME_SELL_ALL_FRAC, 1.0);
+        for frac in [0.0001_f64, 0.01, 0.1, 0.3, 0.5, 0.9, 0.95] {
             assert!(
-                frac >= crate ::config::SELL_ALL_ON_ANY_SELL,
-                "his {frac} exit must flatten us, not mirror proportionally"
+                frac < crate::config::RUNTIME_SELL_ALL_FRAC,
+                "his {frac} partial exit must remain proportional by default"
             );
         }
+        assert!(1.0 >= crate::config::RUNTIME_SELL_ALL_FRAC);
+        assert_eq!(crate::config::SELL_ALL_ON_ANY_SELL, 0.0);
     }
     #[test]
     fn a_lane_may_still_OPT_OUT_of_flattening() {

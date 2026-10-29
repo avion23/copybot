@@ -168,7 +168,7 @@ pub struct ExecToml {
     pub exclude_political: bool,
 }
 fn f095f() -> f64 {
-    SELL_ALL_ON_ANY_SELL
+    RUNTIME_SELL_ALL_FRAC
 }
 fn taker() -> String {
     "taker".into()
@@ -245,7 +245,8 @@ pub const RUNTIME_BUY_SLIPPAGE: f64 = 0.15;
 pub const RUNTIME_SELL_SLIPPAGE: f64 = 1.0;
 pub const RUNTIME_SELL_FLOOR_FRAC: f64 = 0.5;
 pub const SELL_ALL_ON_ANY_SELL: f64 = 0.0;
-pub const RUNTIME_SELL_ALL_FRAC: f64 = SELL_ALL_ON_ANY_SELL;
+/// A partial leader exit mirrors the same fraction; only a complete exit flattens.
+pub const RUNTIME_SELL_ALL_FRAC: f64 = 1.0;
 pub fn build_runtime_lane(
     spec: &crate::wallets::WalletSpec,
 ) -> Result<(Lane, crate::risk::RiskConfig), String> {

@@ -44,6 +44,6 @@ mode = "taker"
 buy_slippage_c = 0.15
 sell_slippage_c = 1.0
 sell_floor_frac = 0.0
-sell_all_frac = 0.0
+sell_all_frac = 1.0
 copy_makers = false
 copy_maker_sells = false

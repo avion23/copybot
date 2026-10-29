@@ -27,7 +27,7 @@ The parser accepts `taker` or `hybrid`. Split buy/sell slippage fields take prec
 
 Do not infer units from the historical `_c` suffix alone: inspect `hot/src/config.rs` and `hot/src/lanes.rs` for the value's actual use. This export preserves those calculations.
 
-`sell_all_frac = 0.0` requests the current any-sell flatten policy. A nonzero threshold changes when an exit becomes a full flatten. `sell_floor_frac` constrains the exit price relative to the leader; allowing broad slippage can fill at a substantially worse price. Setting it to zero does not guarantee a full fill in an empty market.
+The default `sell_all_frac = 1.0` mirrors an eligible partial leader sell proportionally and flattens only at a full exit. `sell_all_frac = 0.0` explicitly opts into flatten-on-first-sell; existing persisted zero settings are not rewritten. Values outside [0,1] are rejected. `sell_floor_frac` constrains the exit price relative to the leader; allowing broad slippage can fill at a substantially worse price. Setting it to zero does not guarantee a full fill in an empty market.
 
 ## Observers
 

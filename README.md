@@ -21,7 +21,7 @@ Abomination81 Copybot is a self-hosted Polymarket copy-trading engine. It watche
 - **Independent oversight.** Guardian, watcher, fillwatch, and buywatch run separately from the trading loop.
 - **One operator view.** Pool balances, lanes, positions, execution state, and incidents in the included dashboard.
 
-This is execution software, not a source of profitable leaders. Copying a profitable account does not guarantee the same prices or results. In particular, the current runtime-lane default can flatten a position on a leader's first sell; this is not necessarily a proportional mirror of every trim. Read the execution settings before enabling a lane.
+This is execution software, not a source of profitable leaders. Copying a profitable account does not guarantee the same prices or results. The new lane default mirrors eligible partial sells proportionally and flattens at a full leader exit (`sell_all_frac = 1.0`). An explicit `sell_all_frac = 0.0` keeps the older flatten-on-first-sell behavior, including in persisted operator settings. Read the execution settings before enabling a lane.
 
 ## Start here
 
