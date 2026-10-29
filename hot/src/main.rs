@@ -7784,6 +7784,7 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                             // Router.decide has already included this intent in open_usd.
                             // Subtract its own reservation exactly once before the cash gate.
                             let cost = intent.budget_usd as f64 / MICRO;
+                            let cash_cost = intent.usd as f64 / MICRO;
                             let available = copybot_hot::budget::lane_available(
                                 pol.seed_usd,
                                 (deployed - cost).max(0.0),
@@ -7796,10 +7797,11 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                     w.fetched_at.map(|t| copybot_hot::ledger::now_secs() - t),
                                 ))
                                 .unwrap_or((None, None));
-                            if !copybot_hot::budget::buy_fits_aged(
+                            if !copybot_hot::budget::buy_fits_aged_with_cash_cost(
                                 available,
                                 free_cash,
                                 cost,
+                                cash_cost,
                                 cash_age,
                             ) {
                                 *control
@@ -7816,7 +7818,8 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                             .token_id[..intent.token_id.len().min(14)], "cost_usd" :
                                             cost, "lane_available_usd" : available, "lane_seed_usd" :
                                             pol.seed_usd, "lane_deployed_usd" : deployed,
-                                            "fee_reserve_usd" : cost - intent.usd as f64 / MICRO,
+                                            "fee_reserve_usd" : cost - cash_cost,
+                                            "physical_cash_required_usd" : cash_cost,
                                             "physical_cash" : free_cash, }
                                         ),
                                     );

@@ -21,7 +21,7 @@ Use either `bankroll_usd` with derived budget fractions or the parser's absolute
 
 `compound` controls the existing realized-gain/loss sizing behavior. Set it intentionally. A lane budget is a strategy allocation inside a shared account, not security isolation between different owners.
 
-Entries reserve the worst-case published taker fee at up to 7% base rate: `fee = shares × rate × p × (1-p)`, with the maximum over all prices at or below the buy limit. This reduces available fill, market, daily, and open budgets before submission. The venue-reported fee remains authoritative for ledger P&L; this is a conservative sizing bound, not a per-market fee quote. Update the bound if Polymarket changes its fee schedules or exponent.
+Entries reserve the worst-case published taker fee at up to 7% base rate: `fee = shares × rate × p × (1-p)`, with the maximum over all prices at or below the buy limit. This reduces available fill, market, daily, and open budgets before submission. For taker buys, the fee is withheld in shares rather than requiring additional USDC. The fee-equivalent reduces strategy budget headroom, while the physical cash check requires only the submitted order notional. The venue-reported fee remains authoritative for ledger P&L; the reserve is a conservative sizing bound, not a per-market fee quote. Update the bound if Polymarket changes its fee schedules or exponent.
 
 ## Execution
 

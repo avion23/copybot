@@ -131,24 +131,38 @@ pub fn buy_fits_aged(
     cost: f64,
     last_good_age_secs: Option<i64>,
 ) -> bool {
-    if !available.is_finite() || !cost.is_finite() {
+    buy_fits_aged_with_cash_cost(available, free_cash, cost, cost, last_good_age_secs)
+}
+
+/// A buy fee is withheld in outcome shares, not debited as extra USDC.
+/// Reserve its USDC-equivalent for strategy limits but require only the
+/// order's notional from the physical cash balance.
+pub fn buy_fits_aged_with_cash_cost(
+    available_budget: f64,
+    free_cash: Option<f64>,
+    reserved_budget: f64,
+    order_cash: f64,
+    last_good_age_secs: Option<i64>,
+) -> bool {
+    if !available_budget.is_finite()
+        || !reserved_budget.is_finite()
+        || !order_cash.is_finite()
+        || free_cash.is_some_and(|c| !c.is_finite())
+    {
         return false;
     }
-    if free_cash.is_some_and(|c| !c.is_finite()) {
-        return false;
-    }
-    if !(cost > 0.0) {
+    if !(order_cash > 0.0 && reserved_budget >= order_cash) {
         return false;
     }
     let eps = 1e-6;
-    if available + eps < cost {
+    if available_budget + eps < reserved_budget {
         return false;
     }
-    if !matches!(last_good_age_secs, Some(age) if age <= CASH_STALE_SECS) {
+    if !matches!(last_good_age_secs, Some(age) if (0..=CASH_STALE_SECS).contains(&age)) {
         return false;
     }
     match free_cash {
-        Some(c) => c + eps >= cost,
+        Some(c) => c + eps >= order_cash,
         None => true,
     }
 }

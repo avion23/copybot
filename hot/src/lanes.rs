@@ -48,7 +48,7 @@ pub struct Intent {
     pub limit: f64,
     /// Order notional before fee, in micro-dollars.
     pub usd: Micro,
-    /// Reserved gross buy cash: notional plus worst-case taker fee.
+    /// Fee-inclusive economic reservation, not the physical USDC debit.
     pub budget_usd: Micro,
     pub execution: Execution,
     pub his_remaining: f64,
