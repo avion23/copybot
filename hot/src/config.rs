@@ -8,6 +8,7 @@ pub struct Root {
     pub lane: Vec<LaneToml>,
 }
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Bot {
     #[serde(default = "dry")]
     pub mode: String,
@@ -24,8 +25,6 @@ pub struct Bot {
     pub signal_guard_path: String,
     #[serde(default = "dflt_recycle_secs")]
     pub recycle_secs: u64,
-    #[serde(default)]
-    pub txpool_rpc: Option<String>,
     #[serde(default = "yes")]
     pub race_h2: bool,
 }

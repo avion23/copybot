@@ -14,7 +14,7 @@ Abomination81 Copybot is a self-hosted Polymarket copy-trading engine. It watche
 
 ## What it does
 
-- **Fast discovery.** Multiple WebSocket feeds, duplicate-signal handling, and optional transaction-pool discovery.
+- **Signal discovery.** Configured pending-transaction WebSockets with duplicate-signal handling; market-book streams support pricing and resting-order safety, not leader detection.
 - **Controlled sizing.** Per-lane budgets, price bands, copy percentages, and configurable compounding.
 - **Local execution.** Local order signing, connection racing, and configured taker or maker behavior.
 - **Exit management.** Sell handling, reconciliation, and restart recovery through the existing engine.

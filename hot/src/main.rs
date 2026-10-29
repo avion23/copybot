@@ -2,7 +2,6 @@
 use copybot_hot::book::BookCache;
 use copybot_hot::control::Control;
 use copybot_hot::ledger::Ledger;
-use copybot_hot::txpool::{self, TxpoolStats};
 use copybot_hot::calldata::{decode_all, participants};
 use copybot_hot::config::{addr20, Root};
 use copybot_hot::feeds::{FeedConfig, FeedStats, RawTx};
@@ -4054,13 +4053,6 @@ declared net external funding (deposits - withdrawals); independent of lane allo
             }
         });
     }
-    let txstats = Arc::new(TxpoolStats::default());
-    let txstats_fill = txstats.clone();
-    if let Some(rpc) = root.bot.txpool_rpc.clone() {
-        tokio::spawn(
-            txpool::run(rpc, tx.clone(), txstats.clone(), Duration::from_secs(20)),
-        );
-    }
     {
         let (s, e, bk, wt) = (
             stats.clone(),
@@ -7628,9 +7620,6 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                 };
                 if !book.first_seen(&raw.source, key, None) {
                     continue;
-                }
-                if raw.source == "txpool" {
-                    txstats_fill.rescued.fetch_add(1, Ordering::Relaxed);
                 }
                 if d.side == 0 {
                     let his_now = control

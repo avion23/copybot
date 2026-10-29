@@ -46,7 +46,6 @@ pub mod restwatch;
 pub mod snapshot;
 pub mod response_times;
 pub mod risk;
-pub mod txpool;
 pub mod sweep;
 pub mod venue;
 pub mod wallets;
