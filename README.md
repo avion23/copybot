@@ -10,7 +10,7 @@ Abomination81 Copybot is a self-hosted Polymarket copy-trading engine. It watche
 
 **Private preview · Linux deployment · Rust + Python · Bring your own wallet and feeds**
 
-[Visual project guide](docs/index.html) · [Installation](docs/INSTALL.md) · [Configuration](docs/CONFIGURATION.md) · [Operations](docs/OPERATIONS.md) · [Release scope](docs/RELEASE-SCOPE.md)
+[Visual project guide](docs/index.html) · [Installation](docs/INSTALL.md) · [Configuration](docs/CONFIGURATION.md) · [Architecture target](docs/ARCHITECTURE.md) · [Operations](docs/OPERATIONS.md) · [Release scope](docs/RELEASE-SCOPE.md)
 
 ## What it does
 
