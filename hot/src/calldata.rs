@@ -19,7 +19,7 @@ pub struct Decoded {
 pub const TAKER_OCCURRENCE: u16 = u16::MAX;
 #[inline]
 fn word(b: &[u8], off: usize) -> Option<&[u8]> {
-    b.get(off..off + 32)
+    b.get(off..)?.get(..32)
 }
 #[inline]
 fn word_usize(b: &[u8], off: usize) -> Option<usize> {
@@ -74,12 +74,14 @@ fn shares_and_price(
     ord: usize,
     fill_raw: u128,
 ) -> Option<(f64, f64, f64, u8)> {
-    let maker_amt = word_u128(b, ord + F_MAKER_AMT * 32)?;
-    let taker_amt = word_u128(b, ord + F_TAKER_AMT * 32)?;
-    let side = word_u128(b, ord + F_SIDE * 32)? as u8;
+    let order = b.get(ord..)?;
+    let maker_amt = word_u128(order, F_MAKER_AMT * 32)?;
+    let taker_amt = word_u128(order, F_TAKER_AMT * 32)?;
+    let side = word_u128(order, F_SIDE * 32)?;
     if maker_amt == 0 || taker_amt == 0 || side > 1 {
         return None;
     }
+    let side = side as u8;
     let (ma, ta) = (maker_amt as f64, taker_amt as f64);
     let price = if side == 0 { ma / ta } else { ta / ma };
     if !(price > 0.0 && price < 1.0) {
@@ -105,17 +107,19 @@ pub fn participants(calldata: &[u8]) -> Vec<[u8; 20]> {
             }
         }
     };
-    if let Some(t) = word_usize(b, 32) {
-        push(t + F_MAKER * 32);
+    if let Some(t) = word_usize(b, 32).and_then(|off| off.checked_add(F_MAKER * 32)) {
+        push(t);
     }
     if let Some(mo) = word_usize(b, 64) {
         if let Some(n) = word_usize(b, mo) {
             if n <= 512 {
-                let body = mo + 32;
+                let Some(body) = mo.checked_add(32) else { return out };
                 for i in 0..n {
-                    if let Some(rel) = word_usize(b, body + i * 32) {
-                        push(body + rel + F_MAKER * 32);
-                    }
+                    let Some(index) = body.checked_add(i * 32) else { continue };
+                    let Some(rel) = word_usize(b, index) else { continue };
+                    let Some(maker) = body.checked_add(rel)
+                        .and_then(|off| off.checked_add(F_MAKER * 32)) else { continue };
+                    push(maker);
                 }
             }
         }
@@ -147,7 +151,8 @@ fn decode_all_inner(calldata: &[u8], wallet_20: &[u8; 20]) -> Option<Vec<Decoded
     if n_makers > 512 || n_fills > 512 {
         return None;
     }
-    let makers_body = maker_orders_off + 32;
+    let makers_body = maker_orders_off.checked_add(32)?;
+    let fills_body = maker_fills_off.checked_add(32)?;
     let mut out: Vec<Decoded> = Vec::new();
     let push = |
         ord: usize,
@@ -160,9 +165,10 @@ fn decode_all_inner(calldata: &[u8], wallet_20: &[u8; 20]) -> Option<Vec<Decoded
             return None;
         }
         let (size, price, order_size, side) = shares_and_price(b, ord, fill_raw)?;
+        let order = b.get(ord..)?;
         let mut salt = [0u8; 32];
-        salt.copy_from_slice(word(b, ord)?);
-        let token_id = word_dec_string(b, ord + F_TOKEN * 32)?;
+        salt.copy_from_slice(word(order, 0)?);
+        let token_id = word_dec_string(order, F_TOKEN * 32)?;
         if token_id.len() < 6 {
             return None;
         }
@@ -186,18 +192,18 @@ fn decode_all_inner(calldata: &[u8], wallet_20: &[u8; 20]) -> Option<Vec<Decoded
         Some(())
     };
     for i in 0..n_makers {
-        let Some(rel) = word_usize(b, makers_body + i * 32) else { continue };
-        let ord = makers_body + rel;
-        if !addr_matches(b, ord + F_MAKER * 32, wallet_20) {
+        let Some(rel) = word_usize(b, makers_body.checked_add(i * 32)?) else { continue };
+        let ord = makers_body.checked_add(rel)?;
+        if !addr_matches(b, ord.checked_add(F_MAKER * 32)?, wallet_20) {
             continue;
         }
         if i >= n_fills {
             continue;
         }
-        let Some(fill) = word_u128(b, maker_fills_off + 32 + i * 32) else { continue };
+        let Some(fill) = word_u128(b, fills_body.checked_add(i * 32)?) else { continue };
         let _ = push(ord, fill, "maker", i as u16, &mut out);
     }
-    if addr_matches(b, taker_order_off + F_MAKER * 32, wallet_20) {
+    if addr_matches(b, taker_order_off.checked_add(F_MAKER * 32)?, wallet_20) {
         let _ = push(taker_order_off, taker_fill, "taker", TAKER_OCCURRENCE, &mut out);
     }
     Some(out)
