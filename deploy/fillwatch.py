@@ -156,6 +156,37 @@ def leader_balances(pairs):
         out[owner.lower(), token] = int(raw, 16) / 1000000.0
     return out
 
+def parse_bot_state(pool, status):
+    if not isinstance(pool, dict) or not isinstance(pool.get('lanes'), list):
+        raise Unverifiable('bot API: pool.lanes must be an explicit list')
+    if not isinstance(status, dict) or not isinstance(status.get('lanes'), dict):
+        raise Unverifiable('bot API: status.lanes must be an explicit object')
+    lanes = {}
+    for lane in pool['lanes']:
+        if not isinstance(lane, dict):
+            raise Unverifiable('bot API: each pool lane must be an object')
+        name = lane.get('name')
+        if not isinstance(name, str) or not name or name in lanes:
+            raise Unverifiable('bot API: lane names must be nonempty and unique')
+        leader = lane.get('leader')
+        if not isinstance(leader, str) or not leader:
+            raise Unverifiable('bot API: each lane must identify its leader')
+        if not isinstance(lane.get('armed'), bool) or not isinstance(lane.get('ready'), bool):
+            raise Unverifiable('bot API: armed and ready must be explicit booleans')
+        state = status['lanes'].get(name)
+        if not isinstance(state, dict) or not isinstance(state.get('holdings'), dict):
+            raise Unverifiable('bot API: each pool lane must have explicit status holdings')
+        holdings = state['holdings']
+        for token, shares in holdings.items():
+            if not isinstance(token, str) or not token:
+                raise Unverifiable('bot API: holdings must identify each token')
+            if type(shares) not in (int, float) or not 0.0 <= shares <= sys.float_info.max:
+                raise Unverifiable('bot API: holdings must be finite nonnegative share counts')
+        lanes[name] = {'leader': leader.lower(), 'armed': lane['armed'], 'ready': lane['ready'], 'holdings': dict(holdings)}
+    if set(status['lanes']) != set(lanes):
+        raise Unverifiable('bot API: pool and status lane sets disagree')
+    return lanes
+
 def bot_state():
     try:
         req = urllib.request.Request('http://127.0.0.1:%d/api/pool' % BOT_PORT, headers={'User-Agent': UA})
@@ -166,14 +197,7 @@ def bot_state():
             status = json.loads(r.read().decode())
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise Unverifiable('bot API: %s' % e)
-    lanes = {}
-    for l in pool.get('lanes') or []:
-        name = l.get('name')
-        if not name:
-            continue
-        st = (status.get('lanes') or {}).get(name) or {}
-        lanes[name] = {'leader': str(l.get('leader') or '').lower(), 'armed': bool(l.get('armed')), 'ready': l.get('ready'), 'holdings': st.get('holdings') or {}}
-    return lanes
+    return parse_bot_state(pool, status)
 
 def halt_buys(lane, reason, dry_run):
     if dry_run:
