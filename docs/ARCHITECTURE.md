@@ -242,6 +242,10 @@ The browser requests the capability in a password dialog per mutation, keeps it 
 
 `deploy/guardian_checks.py` now owns the deterministic conservation, chain-allocation, drift, fire-exposure, orphan, sizing and numerical kernels; `guardian.py` imports them explicitly and keeps operator actions, polling, persistence, ledger I/O, alert delivery and scheduling at the edge. This removes 204 net lines from `guardian.py` (2,077 → 1,873) without adding a second authority, generic framework, alternate path or behavior fallback; the new kernel module has 217 lines. All numeric thresholds are defined once in `guardian_checks.py` and re-exported through the original imports. It is an A3 boundary step, **not** a completed A5 Observer contract. Neither guardian's remaining size nor the other oversized runtime files yet meets the 1,000-line constraint.
 
+### A3: watcher evidence extraction (COPYBOT-3)
+
+`deploy/guardian_watcher_evidence.py` (276 lines) now owns the watcher alert cursors, read-only event/log readers, feed/heartbeat diagnostics, critical-line lane scoping, reconnect/resume decisions and stale-halt detection; `guardian.py` (1,873 → 1,610 lines) owns the operator writes, notifications, persistence, I/O orchestration and incident authority. Alert sequence reset still emits a diagnostic via an **explicit** `log` callback. Heartbeat reads now receive an **explicit** path from the caller; no second config path, extra writer or silent evidence default was added. All thresholds have one definition, and no independent Observer service was added. This is an intermediate A3 extraction, not a claim of a unified A5 Observer.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
