@@ -2,6 +2,7 @@
 
 pub(crate) mod accounting;
 pub(crate) mod control;
+pub(crate) mod custody_monitor;
 pub(crate) mod dashboard_model;
 pub(crate) mod execution;
 pub(crate) mod exits;
