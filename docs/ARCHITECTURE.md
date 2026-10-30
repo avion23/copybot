@@ -286,6 +286,10 @@ Guardian now imports its five checked-in monitoring dependencies (`resolution`, 
 
 `hot/src/lanes_route_tests.rs` (506 lines) now holds the pre-existing route/resting-policy regression module, still under `lanes::route_tests` with its original helpers and assertions. This is test-only source separation, not a new runtime decision path, a new test or evidence of improved outcomes. `lanes.rs` decreases from 2,926 to 2,422 lines; the remaining core tests and live Router/Lane sizing/admission responsibilities still require ownership-based splitting. No changes to market data, trades, or budget policy are made in this step.
 
+### A3: lane core verification isolation (COPYBOT-3)
+
+The existing `lanes::tests` module has been separated into `hot/src/lanes_tests/mod.rs` (905 lines, including the shared offline fixtures) and child module `hot/src/lanes_tests/more.rs` (746 lines), while prior route tests remain in `hot/src/lanes_route_tests.rs` (506 lines). This is a **mechanical relocation of existing tests**, not new tests, altered assertions or duplicated runtime policy; the child imports the same fixture scope. Production `hot/src/lanes.rs` is now **779 lines**, below the A3 cap. Its live Router/Lane code still mixes sizing, routing and reservations; the structural budget is met, but the intended pure-kernel/state-owner redesign remains open.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
