@@ -13,6 +13,66 @@ pub struct RawTx {
     pub to: String,
     pub seen_ns: u128,
 }
+/// A pending transaction source is useful only when it delivers full objects.
+/// A hash-only subscription is not a source of settlement calldata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingFrameError {
+    InvalidJson,
+    HashOnly,
+    MissingTransactionObject,
+    MissingHash,
+    MissingInput,
+    MissingDestination,
+    InvalidHash,
+}
+impl std::fmt::Display for PendingFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJson => write!(f, "invalid pending frame JSON"),
+            Self::HashOnly => write!(f, "hash-only pending feed cannot supply settlement calldata"),
+            Self::MissingTransactionObject => write!(f, "pending frame lacks a transaction object"),
+            Self::MissingHash => write!(f, "pending transaction missing hash"),
+            Self::MissingInput => write!(f, "pending transaction missing calldata"),
+            Self::MissingDestination => write!(f, "pending transaction has invalid destination"),
+            Self::InvalidHash => write!(f, "pending transaction has invalid hash identity"),
+        }
+    }
+}
+impl std::error::Error for PendingFrameError {}
+#[derive(Debug, Clone)]
+pub struct PendingObject {
+    pub hash: String,
+    pub input: String,
+    pub to: String,
+}
+pub fn parse_pending_object(raw: &str) -> Result<PendingObject, PendingFrameError> {
+    let v: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| PendingFrameError::InvalidJson)?;
+    let result = v.pointer("/params/result")
+        .ok_or(PendingFrameError::MissingTransactionObject)?;
+    if result.is_string() {
+        return Err(PendingFrameError::HashOnly);
+    }
+    if !result.is_object() {
+        return Err(PendingFrameError::MissingTransactionObject);
+    }
+    let hash = result["hash"].as_str().ok_or(PendingFrameError::MissingHash)?;
+    if hash.len() != 66 || !hash.starts_with("0x")
+        || !hash[2..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(PendingFrameError::InvalidHash);
+    }
+    let input = result["input"].as_str()
+        .ok_or(PendingFrameError::MissingInput)?;
+    let to = match &result["to"] {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Null => "",
+        _ => return Err(PendingFrameError::MissingDestination),
+    };
+    Ok(PendingObject {
+        hash: hash.to_owned(), input: input.to_owned(), to: to.to_owned(),
+    })
+}
 #[derive(Debug, Clone)]
 pub struct FeedConfig {
     pub name: String,
@@ -241,6 +301,11 @@ async fn run_socket(
             consecutive_failures = 0;
             if ended_ok {
                 eprintln!("[{name}] stream ended cleanly");
+            } else if let Err(error) = &outcome {
+                // A late protocol violation remains an error, even after an
+                // otherwise healthy session exceeded the early-failure window.
+                stats.error();
+                eprintln!("[{name}] pending feed unavailable: {error}");
             }
         }
         stats.reconnect();
@@ -280,13 +345,17 @@ async fn pump(
         .map_err(|e| format!("subscribe send: {e}"))?;
     match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
         Ok(Some(Ok(Message::Text(t)))) => {
-            if t.contains("\"error\"") {
-                return Err(
-                    format!("subscription rejected: {}", & t[..t.len().min(120)]),
-                );
+            let ack: serde_json::Value = serde_json::from_str(&t)
+                .map_err(|_| "malformed subscription acknowledgement".to_string())?;
+            if ack.get("error").is_some() {
+                // The provider may echo endpoint credentials in the error body.
+                return Err("subscription rejected by provider".into());
+            }
+            if ack["result"].as_str().filter(|id| !id.is_empty()).is_none() {
+                return Err("subscription acknowledgement has no subscription ID".into());
             }
         }
-        Ok(Some(Ok(_))) => {}
+        Ok(Some(Ok(_))) => return Err("subscription acknowledgement is not text".into()),
         Ok(Some(Err(e))) => return Err(format!("ack: {e}")),
         Ok(None) => return Err("closed before ack".into()),
         Err(_) => return Err("ack timeout".into()),
@@ -322,6 +391,14 @@ async fn pump(
             Message::Close(_) => return Ok(()),
             _ => continue,
         };
+        // Prove a full transaction object, not just that this socket sent
+        // a frame (generic newPendingTransactions often emits hashes only).
+        let seen_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "local receipt clock before Unix epoch".to_string())?
+            .as_nanos();
+        let pending = parse_pending_object(&raw)
+            .map_err(|error| format!("pending feed unverifiable: {error}"))?;
         proved = true;
         stats.frame();
         frames_since_watch_refresh += 1;
@@ -329,36 +406,7 @@ async fn pump(
             frames_since_watch_refresh = 0;
             watch_list = watched.snapshot();
         }
-        let lower_has = |needle: &str| {
-            raw
-                .as_bytes()
-                .windows(needle.len())
-                .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-        };
-        let is_ctf = lower_has(CTF_EXCHANGE_V2);
-        let is_neg = if is_ctf { false } else { lower_has(NEG_RISK_CTF_EXCHANGE_V2) };
-        let is_watched = if is_ctf || is_neg {
-            false
-        } else {
-            watch_list.iter().any(|a| lower_has(a))
-        };
-        if !is_ctf && !is_neg && !is_watched {
-            continue;
-        }
-        let seen_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let v: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let r = &v["params"]["result"];
-        let to = r["to"]
-            .as_str()
-            .unwrap_or("")
-            .trim_start_matches("0x")
-            .to_ascii_lowercase();
+        let to = pending.to.trim_start_matches("0x").to_ascii_lowercase();
         let Some(kind) = classify_to(&to, &watch_list) else {
             continue;
         };
@@ -366,21 +414,15 @@ async fn pump(
         if kind != TxKind::Watched {
             stats.exchange_tx();
         }
-        let (hash, input) = (
-            r["hash"].as_str().unwrap_or(""),
-            r["input"].as_str().unwrap_or(""),
-        );
-        if hash.is_empty() || input.len() < 10 {
-            continue;
+        if !pending.input.starts_with("0x") || pending.input.len() < 10 {
+            return Err("matched pending transaction has no settlement calldata".into());
         }
-        let bytes = match hex::decode(input.trim_start_matches("0x")) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let bytes = hex::decode(&pending.input[2..])
+            .map_err(|_| "matched pending transaction has invalid calldata hex".to_string())?;
         if out
             .send(RawTx {
                 source: name.to_string(),
-                hash: hash.to_string(),
+                hash: pending.hash,
                 input: bytes,
                 to_neg_risk: neg,
                 to: to.clone(),

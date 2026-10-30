@@ -482,6 +482,10 @@ The former runtime/exit_sweep.rs used only the first 500 venue rows per account 
 
 The shared `OrderAdmissionOwner` guard now serializes `Router::decide` with `Control::tick_with`, preventing a control tick from replacing per-token, spent, open and sell-reservation caches inside another thread's admission transaction. Poisoned ownership yields typed `Skip::OrderStateUnavailable` and disarms lanes; invalid signal side/price/amount yields `Skip::InvalidSignalEvidence`. Monetary micro-USD casting and additive cap checks refuse non-finite/overflow values instead of saturating. Startup refuses unsupported signature types, invented shadow signing keys and configured-signer/key mismatch, without logging key contents. This is one serialized **admission cache owner**, not yet one durable order-state owner: independent Ledger and Pending/WAL commit/release authority remains and must be unified with validated restart transitions before A4 is DONE.
 
+### A4: pending-feed full-object proof (D-593)
+
+The pending feed now validates the subscription acknowledgement without printing provider-supplied error bodies and parses every notification through typed PendingFrameError. A hash-only newPendingTransactions frame explicitly fails the source instead of being misclassified as a healthy socket with zero executable transactions. Full transaction identity and calldata fields are required; an invalid exchange-target packet refuses the feed rather than silently disappearing. The ingress receipt clock is stamped before decoding. Generic provider subscriptions remain provisional until an independently verified full-object stream exists; the bot does not hydrate hash-only streams and no provider was contacted during this slice. Additional signal origin/signature authentication remains outstanding.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
