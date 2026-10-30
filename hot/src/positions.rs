@@ -4,6 +4,7 @@ pub enum Completeness {
     Complete,
     Truncated { pages: usize, cap: usize },
     Failed { after_pages: usize, why: String },
+    RateLimited { after_pages: usize, attempts: usize },
 }
 impl Completeness {
     pub fn is_complete(&self) -> bool {
@@ -18,6 +19,9 @@ impl Completeness {
             Completeness::Failed { after_pages, why } => {
                 format!("page {} failed: {why}", after_pages + 1)
             }
+            Completeness::RateLimited { after_pages, attempts } => {
+                format!("page {} rate limited after {attempts} attempts (HTTP 429)", after_pages + 1)
+            }
         }
     }
 }
@@ -29,6 +33,23 @@ pub struct Positions {
 }
 pub const PAGE: usize = 500;
 pub const MAX_PAGES: usize = 50;
+pub const MAX_RATE_LIMIT_RETRIES: usize = 3;
+pub const MAX_RATE_LIMIT_WAIT_SECS: u64 = 4;
+
+/// One bounded retry budget per complete snapshot, not per page. Do not
+/// retry faster than a numeric Retry-After, or violate a wait beyond
+/// the bounded budget: return typed RateLimited instead.
+pub fn rate_limit_retry_delay(
+    hit: usize,
+    retry_after_secs: Option<u64>,
+) -> Option<std::time::Duration> {
+    if !(1..=MAX_RATE_LIMIT_RETRIES).contains(&hit) {
+        return None;
+    }
+    let exponential = 1_u64 << (hit - 1);
+    let wait = retry_after_secs.map_or(exponential, |requested| requested.max(exponential));
+    (wait <= MAX_RATE_LIMIT_WAIT_SECS).then_some(std::time::Duration::from_secs(wait))
+}
 impl Positions {
     /// A malformed balance row cannot establish that any token is absent.
     pub fn confirms_zero(&self, token: &str, not_before: i64) -> bool {
@@ -198,16 +219,41 @@ pub async fn fetch(
     let mut rows = Vec::new();
     let mut lens = Vec::new();
     let mut failed = None;
-    for page in 0..MAX_PAGES {
+    let mut rate_limit_hits = 0usize;
+    let mut rate_limited = None;
+    'pages: for page in 0..MAX_PAGES {
         let url = page_url(base, user, size_threshold, page * PAGE, extra);
-        let got = match http.get(&url).send().await {
-            Ok(r) if r.status().is_success() => {
-                r.json::<Vec<serde_json::Value>>()
-                    .await
-                    .map_err(|e| format!("decode: {e}"))
+        let got = loop {
+            match http.get(&url).send().await {
+                Ok(response) if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    rate_limit_hits += 1;
+                    let retry_after = match response.headers().get(reqwest::header::RETRY_AFTER) {
+                        None => None,
+                        Some(value) => {
+                            // A nonnumeric/HTTP-date wait cannot be bounded
+                            // without an authoritative server-time reference.
+                            match value.to_str().ok().and_then(|s| s.parse::<u64>().ok()) {
+                                Some(seconds) => Some(seconds),
+                                None => {
+                                    rate_limited = Some((page, rate_limit_hits));
+                                    break 'pages;
+                                }
+                            }
+                        }
+                    };
+                    let Some(delay) = rate_limit_retry_delay(rate_limit_hits, retry_after) else {
+                        rate_limited = Some((page, rate_limit_hits));
+                        break 'pages;
+                    };
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(response) if response.status().is_success() => {
+                    break response.json::<Vec<serde_json::Value>>()
+                        .await.map_err(|e| format!("decode: {e}"));
+                }
+                Ok(response) => break Err(format!("http {}", response.status().as_u16())),
+                Err(error) => break Err(format!("transport: {error}")),
             }
-            Ok(r) => Err(format!("http {}", r.status().as_u16())),
-            Err(e) => Err(format!("transport: {e}")),
         };
         match got {
             Ok(batch) => {
@@ -224,7 +270,10 @@ pub async fn fetch(
             }
         }
     }
-    let completeness = judge(&lens, failed, MAX_PAGES);
+    let completeness = match rate_limited {
+        Some((after_pages, attempts)) => Completeness::RateLimited { after_pages, attempts },
+        None => judge(&lens, failed, MAX_PAGES),
+    };
     Positions {
         rows,
         completeness,

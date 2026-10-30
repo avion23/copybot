@@ -11,6 +11,7 @@ use std::fmt;
 pub enum PositionError {
     Truncated { pages: usize, cap: usize },
     Unavailable { after_pages: usize },
+    RateLimited { after_pages: usize, attempts: usize },
     InvalidAsset { row: usize },
     DuplicateAsset { row: usize },
     InvalidSize { row: usize },
@@ -25,6 +26,9 @@ impl fmt::Display for PositionError {
             }
             Self::Unavailable { after_pages } => {
                 write!(f, "position snapshot unavailable after {after_pages} pages")
+            }
+            Self::RateLimited { after_pages, attempts } => {
+                write!(f, "position snapshot rate limited on page {} after {attempts} attempts", after_pages + 1)
             }
             Self::InvalidAsset { row } => write!(f, "position row {row} has no valid asset"),
             Self::DuplicateAsset { row } => write!(f, "position row {row} repeats an asset"),
@@ -43,6 +47,9 @@ pub fn complete_balances(snapshot: &Positions) -> Result<HashMap<String, f64>, P
         }
         Completeness::Failed { after_pages, .. } => {
             return Err(PositionError::Unavailable { after_pages: *after_pages });
+        }
+        Completeness::RateLimited { after_pages, attempts } => {
+            return Err(PositionError::RateLimited { after_pages: *after_pages, attempts: *attempts });
         }
     }
     let mut balances = HashMap::with_capacity(snapshot.rows.len());

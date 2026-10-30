@@ -1,5 +1,18 @@
 # Operations
 
+## Local 180-second no-order dry run
+
+From the repository root, set `bot.mode = "dry"` in `deploy/copybot2.toml`. Dry mode with zero enabled leader lanes is an explicit **observe-only** boot: it can inspect feed and CLOB authentication without placing orders. Never use `mode = "shadow"` for this check; shadow is an order-submitting mode.
+
+The D-600 operator reported the command form `env -i ... timeout 180 hot/target/release/copybot-hot deploy/copybot2.toml`. Its actual environment assignments were not supplied, so they cannot be reproduced verbatim. This is the equivalent isolated-environment command with an externally loaded signing key, not a claim of the exact agent environment:
+
+```sh
+env -i PATH="$PATH" HOME="$HOME" PRIVATE_KEY="${PRIVATE_KEY:?load local signer key}" \
+  timeout 180 hot/target/release/copybot-hot deploy/copybot2.toml
+```
+
+Use only a locally provisioned key, never put the key in Git or an output log, and do not enable live/shadow execution or arm a lane. `signature_type = 3` uses the Deposit Wallet contract as `funder` and the EOA owner as `signer`; CLOB authentication alone does not prove the venue will accept a signed 1271 order. A transient HTTP 429 on a Data API positions page receives at most three bounded retries across the complete snapshot. Exhaustion remains **RateLimited / unverifiable**; it never means zero holdings.
+
 ## Three controls, three different effects
 
 | Operator state | Effect |

@@ -60,7 +60,8 @@ pub(crate) async fn serve_positions(
                 *pos_cache2.lock().await = Some(fetched.clone());
                 fetched
             }
-            copybot_hot::positions::Completeness::Failed { .. } => {
+            copybot_hot::positions::Completeness::Failed { .. }
+            | copybot_hot::positions::Completeness::RateLimited { .. } => {
                 match cached
                     .filter(|c| now_s - c.as_of <= POS_FALLBACK_SECS)
                 {
@@ -74,7 +75,8 @@ pub(crate) async fn serve_positions(
     let stale_reason: Option<String> = match &snapshot
         .completeness
     {
-        copybot_hot::positions::Completeness::Failed { .. } => {
+        copybot_hot::positions::Completeness::Failed { .. }
+        | copybot_hot::positions::Completeness::RateLimited { .. } => {
             Some(snapshot.completeness.reason())
         }
         _ => None,
