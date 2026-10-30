@@ -11,30 +11,21 @@ import sys
 import threading
 import time
 import urllib.request
-try:
-    import notify
-    _NOTIFY_REAL = True
-except ImportError:
+import notify
+import corroborate
 
-    class notify:
-        configured = staticmethod(lambda: False)
-        send = staticmethod(lambda *a, **k: False)
-        local_stamp = staticmethod(lambda t=None: '')
-    _NOTIFY_REAL = False
-try:
-    import corroborate
-    _CORROBORATE_REAL = True
-except ImportError:
-
-    class corroborate:
-        CONFIRMED = 'CONFIRMED'
-        REFUTED = 'REFUTED'
-        UNVERIFIABLE = 'UNVERIFIABLE'
-        STRANDED_MIN_USD = 25.0
-        Ctx = staticmethod(lambda *a, **k: None)
-        check = staticmethod(lambda *a, **k: ('CONFIRMED', 'corroboration unavailable'))
-        halts = staticmethod(lambda v: True)
-    _CORROBORATE_REAL = False
+# All observer dependencies are mandatory: a missing module cannot forge
+# independent confirmation or silently disable alert delivery.
+if not (hasattr(notify, 'API') and callable(getattr(notify, 'configured', None))
+        and callable(getattr(notify, 'send', None))):
+    raise ImportError('watcher requires the real notify module')
+if not (hasattr(corroborate, 'CORROBORATORS')
+        and callable(getattr(corroborate, 'check', None))
+        and callable(getattr(corroborate, 'halts', None))
+        and callable(getattr(corroborate, 'Ctx', None))):
+    raise ImportError('watcher requires the real corroborate module')
+_NOTIFY_REAL = True
+_CORROBORATE_REAL = True
 HIM = os.environ.get('WATCH_WALLET', '').lower()
 BOT_DIR = os.environ.get('BOT_DIR', '/opt/copybot')
 BOT_PORT = int(os.environ.get('BOT_PORT', '8807'))
@@ -716,9 +707,6 @@ def main():
         if fills_dropped > _dropped_alerted:
             alert('CRITICAL', 'FILLS', f'{fills_dropped} unjudged leader fill(s) evicted by the {his_fills.maxlen}-row cap — MISS detection is INCOMPLETE; raise WATCHER_FILLS_MAX')
             _dropped_alerted = fills_dropped
-    for _name, _real in (('corroborate', _CORROBORATE_REAL), ('notify', _NOTIFY_REAL)):
-        if not _real:
-            print('%s [WARN] %s.py is NOT importable here — the checks that depend on it are INERT (they fail closed, so nothing is less safe; they simply do nothing). Deploy it into this tree.' % (time.strftime('%H:%M:%S'), _name), flush=True)
     restored = load_fills()
     threading.Thread(target=ws_listen, daemon=True).start()
     who, problem = armed_state()
