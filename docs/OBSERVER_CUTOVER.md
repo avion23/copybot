@@ -75,6 +75,15 @@ sudo systemctl status copybot-observer.service
 sudo journalctl -u copybot-observer.service -n 60 --no-pager
 ```
 
+Before enabling the Observer, verify that the `run/` directory is a real
+(non-symlink) directory owned by the Observer's service user and not writable
+by its group or other accounts. `run/observer.owner.lock` must be a regular,
+single-link file owned by the same user, mode `0600`. Both the legacy and
+Observer entrypoints now refuse an insecure directory/file rather than
+starting without their mutual-exclusion guarantee. If the existing paths do
+not meet those requirements, arrange an operator-reviewed ownership/mode
+repair before cutover; do not silently relax the file checks.
+
 Verify that the new process holds `run/observer.owner.lock` and that
 the legacy units remain inactive. The unit also enforces conflicts and
 removes PRIVATE_KEY from its environment; only the existing narrowly

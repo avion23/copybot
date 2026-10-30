@@ -25,12 +25,24 @@ class _Lease:
         if self._fd is not None:
             raise RuntimeError("Observer owner lease already acquired")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        parent = os.stat(self.path.parent, follow_symlinks=False)
+        if (not stat.S_ISDIR(parent.st_mode)
+                or parent.st_uid != os.geteuid()
+                or stat.S_IMODE(parent.st_mode) & 0o022):
+            raise PermissionError(
+                "Observer run directory must be owned and not group/other writable"
+            )
         flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
         fd = os.open(self.path, flags, 0o600)
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
-                raise RuntimeError("Observer owner lease must be a regular owned file")
+            if (not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_nlink != 1):
+                raise PermissionError(
+                    "Observer lease must be a single-link owned mode-0600 file"
+                )
             fcntl.flock(fd, self._mode | fcntl.LOCK_NB)
         except Exception:
             os.close(fd)
