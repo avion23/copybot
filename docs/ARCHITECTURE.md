@@ -254,6 +254,10 @@ Guardian now imports its five checked-in monitoring dependencies (`resolution`, 
 
 `deploy/guardian_foreign_writer.py` (124 lines) owns the venue-vs-ledger fill comparison, timestamp completeness, strike accumulation and explicit blindness warnings. Guardian (1,570 → 1,450 lines) passes the ledger path and fetch callback explicitly from its HTTP edge; no new network client, default row or second authority was introduced. The detector still warns only, and unknown/incomplete feeds cannot count as healthy evidence. Offline baseline parity 14 constructed cases passed, network calls 0. This remains a partial A3 separation, with the main Guardian controller and A5 single-Observer authority outstanding.
 
+### A3: guardian diagnostic decisions (COPYBOT-3)
+
+`deploy/guardian_diagnostics.py` (162 lines) owns the warning, severity, digest and halt-notification text decisions, without mutating operator state. Guardian now calls those decisions from its single observation/persistence coordinator and passes the scorecard path explicitly. The digest retry constants are imported from their sole definition rather than copied. Guardian decreased from 1,450 to 1,300 lines; 19 constructed baseline parity cases passed without live inputs. One runtime coordinator remains, and the 1,000-line target and unified A5 Observer are not yet satisfied.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
