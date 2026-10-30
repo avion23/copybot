@@ -1,6 +1,19 @@
 use crate::signal_guard::Progress;
 use std::collections::HashMap;
 pub const CLAIM_GRACE_SECS: i64 = 60;
+/// Calldata amount legs use micro-units but the decoded price ratio is f64.
+/// This tiny bound accepts one-ULP rounding (e.g. 1000.0000000000001
+/// against 1000.0) while refusing an actual excess approaching 1 microshare.
+pub fn signal_fill_size_is_valid(fill: f64, ordered: f64) -> bool {
+    if !fill.is_finite() || !ordered.is_finite()
+        || fill <= 0.0 || ordered <= 0.0
+    {
+        return false;
+    }
+    let floating_slack = (ordered * (8.0 * f64::EPSILON))
+        .max(1e-12).min(1e-6);
+    fill <= ordered + floating_slack
+}
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 use crate::calldata::Decoded;
@@ -489,8 +502,7 @@ impl Router {
         let _admission = self.admission.enter()?;
         if d.side != 0 && d.side != 1
             || !d.price.is_finite() || !(0.0..=1.0).contains(&d.price)
-            || !d.fill_size.is_finite() || d.fill_size <= 0.0
-            || !d.order_size.is_finite() || d.order_size < d.fill_size
+            || !signal_fill_size_is_valid(d.fill_size, d.order_size)
         {
             return Err(Skip::InvalidSignalEvidence);
         }
@@ -822,5 +834,28 @@ impl Lane {
             .read()
             .map(|g| g.clone())
             .unwrap_or_else(|e| e.into_inner().clone())
+    }
+}
+
+#[cfg(test)]
+mod signal_tolerance_tests {
+    use super::signal_fill_size_is_valid;
+    #[test]
+    fn f64_rounding_of_a_full_leader_fill_is_not_invalid_evidence() {
+        assert!(signal_fill_size_is_valid(1000.0000000000001, 1000.0));
+        assert!(signal_fill_size_is_valid(1000.0, 1000.0));
+        assert!(!signal_fill_size_is_valid(1000.000001, 1000.0),
+            "a real microshare beyond order is not a rounding artifact");
+        assert!(!signal_fill_size_is_valid(1.1, 1.0));
+    }
+    #[test]
+    fn malformed_signal_amounts_still_fail_closed() {
+        for (fill, ordered) in [
+            (f64::NAN, 1000.0), (1.0, f64::INFINITY),
+            (0.0, 1.0), (-1.0, 1.0), (1.0, 0.0),
+            (1.0, f64::NAN),
+        ] {
+            assert!(!signal_fill_size_is_valid(fill, ordered));
+        }
     }
 }

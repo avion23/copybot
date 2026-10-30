@@ -137,6 +137,21 @@ pub fn buy_fits_aged(
 /// A buy fee is withheld in outcome shares, not debited as extra USDC.
 /// Reserve its USDC-equivalent for strategy limits but require only the
 /// order's notional from the physical cash balance.
+/// Hypothetical dry-run affordability. The configured virtual bankroll
+/// is an economic/risk budget, not custody proof. Never use this for POST:
+/// real execution must use buy_fits_aged_with_cash_cost with a fresh wallet.
+pub fn buy_fits_virtual(
+    available_budget: f64,
+    reserved_budget: f64,
+    cash_notional: f64,
+) -> bool {
+    let eps = 1e-6;
+    available_budget.is_finite() && available_budget >= 0.0
+        && reserved_budget.is_finite() && reserved_budget > 0.0
+        && cash_notional.is_finite() && cash_notional > 0.0
+        && reserved_budget + eps >= cash_notional
+        && available_budget + eps >= reserved_budget
+}
 pub fn buy_fits_aged_with_cash_cost(
     available_budget: f64,
     free_cash: Option<f64>,
@@ -296,6 +311,22 @@ pub fn target_shares(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dry_virtual_budget_evaluates_strategy_without_wallet_cash() {
+        assert!(super::buy_fits_virtual(100.0, 9.879975, 9.45),
+            "dry virtual bankroll permits cap-compliant hypothetical copy");
+        assert!(!super::buy_fits_virtual(8.0, 9.879975, 9.45),
+            "virtual bankroll is still a strict strategy budget");
+        assert!(!super::buy_fits_virtual(100.0, 9.0, 9.45),
+            "fee inclusive reservation must exceed notional");
+        assert!(!super::buy_fits_virtual(100.0, f64::NAN, 9.45));
+        assert!(!super::buy_fits_aged_with_cash_cost(
+            100.0, Some(4.32), 9.879975, 9.45, Some(0),
+        ), "actual live cash of 4.32 cannot fund a 9.45 order");
+        assert!(!super::buy_fits_aged_with_cash_cost(
+            100.0, None, 9.879975, 9.45, None,
+        ), "an unavailable live wallet snapshot must never authorize a POST");
+    }
     use super::*;
     const EPS: f64 = 1e-6;
     #[test]

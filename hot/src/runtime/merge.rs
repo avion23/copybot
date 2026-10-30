@@ -221,6 +221,7 @@ pub(crate) fn spawn_reconcile(
     creds: &Arc<Option<copybot_hot::auth::ApiCreds>>,
     order_paths: &Arc<Vec<(String, reqwest::Client)>>,
     sweep_tx: &Arc<tokio::sync::mpsc::UnboundedSender<String>>,
+    fak_journal: &Option<Arc<copybot_hot::order_commit::AtomicFakJournal>>,
 ) {
     const MERGE_MATERIAL_USD: f64 = 1.0;
         let execute = std::env::var("MERGE_RECONCILE").ok().as_deref() == Some("1");
@@ -228,6 +229,7 @@ pub(crate) fn spawn_reconcile(
             "[merge] reconciliation task up — execute={execute} (set MERGE_RECONCILE=1 to act)"
         );
         let pend5 = pending_log.clone();
+        let fak5 = fak_journal.clone();
         let inc5 = incidents.clone();
         let mc5 = merge_claims.clone();
         let rpc_url5 = std::env::var("FILLWATCH_RPC")
@@ -796,6 +798,7 @@ naked exposure and is flattened regardless of the merge outcome"
                                             &wake5,
                                             &pend5,
                                             &inc5,
+                                            fak5.as_ref(),
                                         )
                                         .await;
                                 }

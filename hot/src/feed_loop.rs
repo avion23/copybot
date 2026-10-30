@@ -231,13 +231,20 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                                     w.fetched_at.map(|t| copybot_hot::ledger::now_secs() - t),
                                 ))
                                 .unwrap_or((None, None));
-                            if !copybot_hot::budget::buy_fits_aged_with_cash_cost(
-                                available,
-                                free_cash,
-                                cost,
-                                cash_cost,
-                                cash_age,
-                            ) {
+                            // Dry is a *counterfactual* $100-budget
+                            // detection/strategy test, not a wallet-cash gate.
+                            // Live POST eligibility still requires fresh real
+                            // cash and is never inferred from that bankroll.
+                            let affordable = if live {
+                                copybot_hot::budget::buy_fits_aged_with_cash_cost(
+                                    available, free_cash, cost, cash_cost, cash_age,
+                                )
+                            } else {
+                                copybot_hot::budget::buy_fits_virtual(
+                                    available, cost, cash_cost,
+                                )
+                            };
+                            if !affordable {
                                 *control
                                     .lock()
                                     .unwrap()
@@ -254,7 +261,10 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                                             pol.seed_usd, "lane_deployed_usd" : deployed,
                                             "fee_reserve_usd" : cost - cash_cost,
                                             "physical_cash_required_usd" : cash_cost,
-                                            "physical_cash" : free_cash, }
+                                            "physical_cash" : free_cash,
+                                            "cash_basis": if live {"fresh_physical"} else {"virtual_bankroll"},
+                                            "physical_cash_verdict": if live {"refused"} else {"not_evaluated"},
+                                            }
                                         ),
                                     );
                                 continue;
@@ -390,7 +400,8 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                             10000.0).round() / 100.0, "his_fill" : d.fill_size,
                             "his_order" : d.order_size, "his_remaining" : intent
                             .his_remaining, "exec" : format!("{:?}", intent.execution),
-                            "signal_to_ready_us" : elapsed_us, "queue_us" : queue_us, }
+                            "signal_to_ready_us" : elapsed_us, "queue_us" : queue_us,
+                            "cash_basis": if live {"fresh_physical"} else {"virtual_bankroll"}, }
                         );
                         if !live {
                             emitter.emit(fire_ev.clone());
@@ -839,6 +850,7 @@ not release {unfilled} unfilled shares: {e:?} — this order stays under-copied"
                                                     &wake_c,
                                                     &pend_c,
                                                     &inc_c,
+                                                    fak_journal_c.as_ref(),
                                                 )
                                                 .await;
                                             serde_json::json!(

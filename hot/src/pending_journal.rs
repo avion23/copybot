@@ -219,6 +219,42 @@ impl PendingLog {
         }
         true
     }
+    /// Shared serialized order admission for every HTTP writer. Hold the
+    /// PendingLog mutex while checking conflicting token exposure AND
+    /// durable-reserving the new digest; a second concurrent submitter cannot
+    /// sneak between the check and fsync.
+    pub fn reserve_for_submit(
+        &mut self, p: Pending, already_durable: bool,
+    ) -> Result<(), String> {
+        if self.unreadable_sources > 0 || !self.persistence_ok()
+            || !self.durable_path_configured()
+        {
+            return Err("pending journal unavailable for exclusive token admission".into());
+        }
+        if self.open.values().any(|other|
+            other.token == p.token && other.order_hash != p.order_hash
+        ) {
+            return Err("token already has another unresolved signed order".into());
+        }
+        if let Some(old) = self.open.get(&p.order_hash) {
+            if old.lane != p.lane || old.token != p.token
+                || old.side != p.side || old.shares != p.shares
+                || old.limit != p.limit || old.resting != p.resting
+            {
+                return Err("signed digest conflicts with a different pending identity".into());
+            }
+            // Only the original WAL-committed send may use this row. Other
+            // callers must not retry a still-unresolved signed hash.
+            if !already_durable {
+                return Err("signed order digest is already unresolved".into());
+            }
+            return Ok(());
+        }
+        if already_durable {
+            return Err("caller claims durable reservation but order row is missing".into());
+        }
+        self.record(p)
+    }
     pub fn record(&mut self, p: Pending) -> Result<(), String> {
         if p.lane.is_empty() || p.token.is_empty() || p.order_hash.is_empty()
             || p.side > 1 || !p.shares.is_finite() || p.shares <= 0.0
@@ -464,6 +500,64 @@ mod owner_lifecycle_tests {
         assert_eq!(owner.stage_of("invalid"), None);
         assert!(owner.is_open("valid"));
         assert!(!owner.is_open("invalid"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn exclusive_submit_admission_refuses_cross_lane_token_collision() {
+        let (dir,path) = fixture_path("crosslane");
+        let mut owner = PendingLog::open(path.to_str().unwrap());
+        owner.reserve_for_submit(pending("first"), false).unwrap();
+        let mut second = pending("second");
+        second.lane = "another_lane".into();
+        second.side = 1;
+        assert!(owner.reserve_for_submit(second, false).is_err());
+        assert!(owner.reserve_for_submit(pending("first"), false).is_err(),
+            "same hash cannot be retransmitted unless it was WAL-committed");
+        assert!(owner.reserve_for_submit(pending("first"), true).is_ok());
+        assert!(owner.is_open("first"));
+        assert_eq!(owner.len(), 1);
+        drop(owner);
+        let reload = PendingLog::open(path.to_str().unwrap());
+        assert_eq!(reload.len(), 1);
+        assert!(reload.is_open("first"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn claimed_wal_identity_must_be_present_and_exact_before_network_submit() {
+        let (dir,path) = fixture_path("walclaim");
+        let mut owner = PendingLog::open(path.to_str().unwrap());
+        assert!(owner.reserve_for_submit(pending("hash"), true).is_err());
+        assert_eq!(owner.len(), 0);
+        owner.apply_record(pending("hash"));
+        assert!(owner.reserve_for_submit(pending("hash"), true).is_ok());
+        let mut wrong = pending("hash");
+        wrong.resting = false;
+        assert!(owner.reserve_for_submit(wrong, true).is_err());
+        owner.unreadable_sources = 1;
+        assert!(owner.reserve_for_submit(pending("hash"), true).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn concurrent_process_threads_share_one_durable_pending_token_owner() {
+        use std::sync::{Arc, Mutex};
+        let (dir,path) = fixture_path("parallel");
+        let shared = Arc::new(Mutex::new(PendingLog::open(path.to_str().unwrap())));
+        let mut handles = Vec::new();
+        for n in 0..12 {
+            let log = shared.clone();
+            handles.push(std::thread::spawn(move || {
+                log.lock().unwrap().reserve_for_submit(
+                    pending(&format!("hash-{n}")), false
+                ).is_ok()
+            }));
+        }
+        let success = handles.into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok).count();
+        assert_eq!(success, 1);
+        assert_eq!(shared.lock().unwrap().len(), 1);
+        drop(shared);
+        assert_eq!(PendingLog::open(path.to_str().unwrap()).len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

@@ -887,13 +887,14 @@ still be holding something, check that the funder address is right."
         runtime::flatten_task::spawn(
             &root.bot.control_path, &pending_log, &incidents, &control, &router,
             &emitter, &funder, pk, &signer_addr, sig_type, &clob, &creds,
-            &order_paths, &sweep_tx, &registry, &errors_path,
+            &order_paths, &sweep_tx, &registry, &errors_path, &fak_journal,
         );
     }
     if live {
         runtime::merge::spawn_reconcile(
             &pending_log, &incidents, &merge_claims, &control, &router, &emitter,
             &funder, pk, &signer_addr, sig_type, &clob, &creds, &order_paths, &sweep_tx,
+            &fak_journal,
         );
     }
     let latency = Arc::new(copybot_hot::latency::Latency::new());

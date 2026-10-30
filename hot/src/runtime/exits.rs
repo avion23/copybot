@@ -1,6 +1,7 @@
 //! Rest-cancellation settlement and the existing bounded exit-rescue loop.
 
-use super::accounting::book_and_resolve;
+use super::accounting::{book_and_resolve, book_matched_fak_race, fak_owner_submit_ready};
+use super::control::latch_buys;
 use super::execution::submit_tracked;
 use super::telemetry::{now_ms, Emitter};
 use copybot_hot::control::Control;
@@ -278,6 +279,7 @@ pub(crate) async fn rescue_exit(
     wake: &tokio::sync::mpsc::UnboundedSender<String>,
     pend: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
     incidents: &Arc<std::sync::Mutex<copybot_hot::incidents::Incidents>>,
+    fak_journal: Option<&Arc<copybot_hot::order_commit::AtomicFakJournal>>,
 ) -> bool {
     use copybot_hot::exit_rescue as er;
     use copybot_hot::order::{amounts, json_body};
@@ -303,6 +305,23 @@ pub(crate) async fn rescue_exit(
         );
         if shares <= 0.0 {
             break;
+        }
+        if order_type == "FAK" {
+            // An exit rescue must not become another unsigned/unsourced
+            // money writer. Refuse before POST if the journal is unavailable,
+            // revoked or poisoned, leaving the original exposure for review.
+            if let Err(reason) = fak_owner_submit_ready(fak_journal) {
+                for item in router.snapshot().iter() {
+                    latch_buys(item, incidents, "fak_owner_unavailable",
+                        "exit rescue FAK journal owner invalid; pending exposure remains");
+                }
+                emitter.emit(serde_json::json!({
+                    "t": now_ms(), "ev":"exit_rescue_FAILED",
+                    "lane":lane, "token":token, "why":"fak_owner_unavailable",
+                    "detail":format!("{reason:?}"), "attempts":attempt,
+                }));
+                return false;
+            }
         }
         let mut o = ord.clone();
         o.salt = copybot_hot::order::safe_salt(er::retry_salt_seed(now_ms(), attempt));
@@ -346,7 +365,7 @@ pub(crate) async fn rescue_exit(
             None => break,
         };
         let retry_hash = hex::encode(o.digest());
-        let Ok((outcome, _)) = submit_tracked(
+        let Ok((outcome, results)) = submit_tracked(
                 pend,
                 emitter,
                 &copybot_hot::provenance::Provenance::own(
@@ -382,21 +401,21 @@ pub(crate) async fn rescue_exit(
         attempt += 1;
         match &outcome {
             Outcome::Matched { body, .. } => {
-                let (booked, _) = book_and_resolve(
-                    control,
-                    pend,
-                    router,
-                    incidents,
-                    emitter,
-                    lane,
-                    token,
-                    1,
-                    limit,
-                    body,
-                    None,
-                    &retry_hash,
-                    false,
-                );
+                let (booked, _) = if order_type == "FAK" {
+                    book_matched_fak_race(
+                        fak_journal, control, pend, router, incidents,
+                        emitter, &retry_hash, lane, &outcome, &results,
+                        paths.len(),
+                    )
+                } else {
+                    // Preserve the existing legacy GTC rescue semantics.
+                    // The retry reservation is non-resting; GTC exits remain
+                    // outside this FAK-only journal migration.
+                    book_and_resolve(
+                        control, pend, router, incidents, emitter, lane, token,
+                        1, limit, body, None, &retry_hash, false,
+                    )
+                };
                 if !booked {
                     emitter.emit(serde_json::json!({
                         "ev": "exit_rescue_FAILED", "lane": lane, "token": token,

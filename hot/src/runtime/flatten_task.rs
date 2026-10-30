@@ -28,7 +28,9 @@ pub(crate) fn spawn(
     sweep_tx: &Arc<tokio::sync::mpsc::UnboundedSender<String>>,
     registry: &copybot_hot::wallets::WalletRegistry,
     errors_path: &String,
+    fak_journal: &Option<Arc<copybot_hot::order_commit::AtomicFakJournal>>,
 ) {
+        let fak4 = fak_journal.clone();
         let flatten_path = format!("{control_path}.flatten");
         let pend4 = pending_log.clone();
         let inc4 = incidents.clone();
@@ -351,6 +353,7 @@ SOLD — the wallet still holds everything it held before.",
                                     &wake4,
                                     &pend4,
                                     &inc4,
+                                    fak4.as_ref(),
                                 )
                                 .await;
                             if booked {

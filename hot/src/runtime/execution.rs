@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn submit_tracked(
     pend: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
     em: &Emitter,
@@ -35,6 +34,18 @@ pub(crate) async fn submit_tracked(
         why: prov.why(),
         resting,
     };
+    if prov.is_oversell() {
+        eprintln!(
+            "[{}] ⚠️ {} would sell {:.4} sh of …{} while the ledger holds {:.4}",
+            prov.lane, prov.origin.label(), prov.shares, & prov.token[prov.token.len()
+            .saturating_sub(8)..], prov.held_before
+        );
+    }
+    {
+        let mut owner = pend.lock().map_err(|_| "pending owner mutex poisoned")?;
+        owner.reserve_for_submit(p, already_durable)?;
+    }
+    // Record order_submit only after token admission was durably confirmed.
     {
         let mut row = prov.to_json();
         if let Some(m) = row.as_object_mut() {
@@ -44,16 +55,6 @@ pub(crate) async fn submit_tracked(
             m.insert("resting".into(), resting.into());
         }
         em.emit(row);
-    }
-    if prov.is_oversell() {
-        eprintln!(
-            "[{}] ⚠️ {} would sell {:.4} sh of …{} while the ledger holds {:.4}",
-            prov.lane, prov.origin.label(), prov.shares, & prov.token[prov.token.len()
-            .saturating_sub(8)..], prov.held_before
-        );
-    }
-    if !already_durable {
-        pend.lock().unwrap().record(p)?;
     }
     let (outcome, results) = copybot_hot::race_send::race_submit(
             paths,
