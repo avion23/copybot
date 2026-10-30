@@ -40,6 +40,10 @@ one serialized background audit worker. No trading key is used.
   real fill/order identity exists. Anonymous token sightings never dedup.
   Corrupt or unwritable evidence refuses startup or marks a check
   `UNVERIFIABLE`; it is never treated as confirmed evidence.
+- A graceful SIGTERM joins the current audit before closing the three
+  Observer evidence/alert/notification sinks and releasing the exclusive
+  owner lease. The opt-in service allows up to 120 seconds for that join;
+  systemd may still terminate an indefinitely stuck process afterward.
 - The observer-owner exclusive file lock refuses a second Observer process.
   The legacy Guardian, watcher, fillwatch and buywatch CLI entrypoints now
   take **shared** locks on the same file, allowing legacy sensors to run

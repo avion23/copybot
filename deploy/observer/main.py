@@ -5,10 +5,12 @@ unit conflicts with all legacy sensor services/timers. Run no live audits
 unless that cutover has been explicitly carried out.
 """
 import argparse
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 import time
 
@@ -38,6 +40,26 @@ WATCH_INTERVAL_SECS = 15.0
 def report_event(event):
     """Only the scheduler emits these health records; no halt is inferred."""
     print(json.dumps(event, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+class ObserverStop(Exception):
+    """A requested, orderly stop of the single Observer owner."""
+
+
+def _request_stop(_signum, _frame):
+    # A second stop request cannot interrupt the in-flight audit's join.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise ObserverStop("SIGTERM")
+
+
+@contextmanager
+def graceful_stop():
+    previous = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, _request_stop)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 class ObserverScheduler:
@@ -139,7 +161,9 @@ class ObserverScheduler:
                     })
 
     def close(self):
-        self.executor.shutdown(wait=False, cancel_futures=False)
+        # Do not release journals or the exclusive owner lease while the
+        # sole audit worker can still write or request a conservative halt.
+        self.executor.shutdown(wait=True, cancel_futures=False)
 
 
 def main(argv=None):
@@ -175,13 +199,20 @@ def main(argv=None):
             previous_notify = notify.configure_send_sink(notifications.send)
             try:
                 owner = ObserverScheduler(watcher.WatchSession(45))
-                try:
-                    owner.start()
-                    while True:
-                        owner.step()
-                        time.sleep(1)
-                finally:
-                    owner.close()
+                with graceful_stop():
+                    try:
+                        owner.start()
+                        while True:
+                            owner.step()
+                            time.sleep(1)
+                    except ObserverStop:
+                        report_event({
+                            "ev": "observer_stopping",
+                            "reason": "termination_requested",
+                            "observed_at": time.time(),
+                        })
+                    finally:
+                        owner.close()
             finally:
                 notify.configure_send_sink(previous_notify)
                 buywatch.configure_alert_sink(previous_buywatch)
