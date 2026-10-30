@@ -1,7 +1,7 @@
 //! Feed input setup, shared book-cache socket workers and scored socket recycle.
 use super::telemetry::{now_ms, Emitter};
 use copybot_hot::book::{BookCache, Levels, TradePrints};
-use copybot_hot::config::Root;
+use copybot_hot::config::{BootProfile, Root};
 use copybot_hot::feeds::{FeedConfig, FeedRegistry, FeedStats, RawTx, WatchedAddresses};
 use copybot_hot::lanes::Router;
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,7 @@ pub(crate) fn configure(
     emitter: &Arc<Emitter>,
     shadow: bool,
     live: bool,
+    boot_profile: BootProfile,
 ) -> Vec<FeedConfig> {
     let feeds: Vec<FeedConfig> = root
         .feed
@@ -36,7 +37,9 @@ pub(crate) fn configure(
                 .execution), "daily_usd" : l.policy().caps.daily_usd, })).collect::< Vec
                 < _ >> (), "feeds" : feeds.iter().map(| f | format!("{}x{}", f.name, f
                 .sockets)).collect::< Vec < _ >> (), "sockets" : total_sockets, "note" :
-                if shadow {
+                if boot_profile == BootProfile::DryObserveOnly {
+                    "DRY OBSERVE ONLY — no enabled lanes; feed and auth inspection; no orders"
+                } else if shadow {
                 "SHADOW — full live path, credentials forced OFF, every \
                              order will be rejected 401"
                 } else if live { "LIVE — lanes still need arming in the control file" }

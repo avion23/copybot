@@ -1,10 +1,12 @@
 use crate::lanes::{Execution, Lane, LaneConfig, Sizing};
+use crate::order::SignatureType;
 use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 pub struct Root {
     pub bot: Bot,
     #[serde(default)]
     pub feed: Vec<Feed>,
+    #[serde(default)]
     pub lane: Vec<LaneToml>,
 }
 #[derive(Debug, Deserialize)]
@@ -15,8 +17,8 @@ pub struct Bot {
     pub clob_host: String,
     pub funder: String,
     pub signer: String,
-    #[serde(default = "sig2")]
-    pub signature_type: u8,
+    #[serde(default)]
+    pub signature_type: Option<SignatureType>,
     pub events_path: String,
     pub control_path: String,
     #[serde(default = "dflt_ledger")]
@@ -39,9 +41,6 @@ fn dflt_signal_guard() -> String {
 }
 fn yes() -> bool {
     true
-}
-fn sig2() -> u8 {
-    2
 }
 #[derive(Debug, Deserialize)]
 pub struct Feed {
@@ -351,7 +350,26 @@ pub fn addr20(s: &str) -> Result<[u8; 20], String> {
     o.copy_from_slice(&b);
     Ok(o)
 }
+/// Only dry mode may boot without an enabled copy lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootProfile {
+    DryObserveOnly,
+    DryCopySimulation,
+    Execution,
+}
 impl Root {
+    pub fn boot_profile(&self) -> Result<BootProfile, String> {
+        let has_enabled = self.lane.iter().any(|lane| lane.enabled);
+        match (self.bot.mode.as_str(), has_enabled) {
+            ("dry", false) => Ok(BootProfile::DryObserveOnly),
+            ("dry", true) => Ok(BootProfile::DryCopySimulation),
+            ("live" | "shadow", true) => Ok(BootProfile::Execution),
+            ("live" | "shadow", false) => {
+                Err("execution mode requires at least one enabled lane".into())
+            }
+            (other, _) => Err(format!("unsupported bot.mode {other:?}")),
+        }
+    }
     pub fn load(path: &str) -> Result<Root, String> {
         let raw = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         toml::from_str(&raw).map_err(|e| format!("{path}: {e}"))
@@ -395,6 +413,9 @@ impl Root {
             .collect()
     }
     pub fn build_lanes(&self) -> Result<Vec<Lane>, String> {
+        if self.boot_profile()? == BootProfile::DryObserveOnly {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         let mut seen_wallets = Vec::new();
         let mut seen_names = Vec::new();
@@ -525,9 +546,6 @@ impl Root {
                 Lane::new(cfg)
             };
             out.push(lane);
-        }
-        if out.is_empty() {
-            return Err("no enabled lanes — nothing to copy".into());
         }
         Ok(out)
     }

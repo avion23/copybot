@@ -13,6 +13,34 @@ uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
 const DOMAIN_TYPE: &str = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
 const DOMAIN_NAME: &str = "Polymarket CTF Exchange";
 const DOMAIN_VERSION: &str = "2";
+/// Wallet signature contract at the configuration boundary. Unknown wire
+/// values are errors, never a default to an incompatible custody mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "u8")]
+#[repr(u8)]
+pub enum SignatureType {
+    Eoa = 0,
+    PolyProxy = 1,
+    GnosisSafe = 2,
+    Poly1271 = 3,
+}
+impl TryFrom<u8> for SignatureType {
+    type Error = &'static str;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Eoa),
+            1 => Ok(Self::PolyProxy),
+            2 => Ok(Self::GnosisSafe),
+            3 => Ok(Self::Poly1271),
+            _ => Err("unsupported wallet signature_type (expected 0, 1, 2, or 3)"),
+        }
+    }
+}
+impl SignatureType {
+    pub const fn wire(self) -> u8 {
+        self as u8
+    }
+}
 /// Order identity only: L1/L2 authentication still uses the owner EOA.
 /// POLY_1271 verifies the contract wallet, so its maker and signer must match.
 pub fn order_signer<'a>(signature_type: u8, funder: &'a str, owner: &'a str) -> &'a str {

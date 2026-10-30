@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let startup::Identity {
-        operator_access, root, lanes, shadow, live,
+        operator_access, root, lanes, shadow, live, boot_profile,
         funder, sig_type, pk, signer_addr, _execution_lease,
     } = startup::load();
     let emitter = Arc::new(Emitter::new(root.bot.events_path.clone(), !live || shadow));
@@ -65,7 +65,7 @@ async fn main() {
     let router = Arc::new(Router::new(lanes));
     let book = Arc::new(RaceBook::new());
     let stats = Arc::new(FeedStats::default());
-    let feeds = runtime::feed_inputs::configure(&root, &router, &emitter, shadow, live);
+    let feeds = runtime::feed_inputs::configure(&root, &router, &emitter, shadow, live, boot_profile);
     let resting_book = Arc::new(copybot_hot::resting::RestingBook::new());
     let sell_tranches = Arc::new(copybot_hot::lanes::TrancheLedger::new(4096));
     let fire_rate = Arc::new(
