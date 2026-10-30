@@ -318,6 +318,10 @@ The Guardian liveness watcher moved from the binary into `runtime::control::spaw
 
 `runtime/orphan_sweep.rs` (252 lines) now owns the optional orphan-exit task, including the 90-second scan, orphan classifications, 3,600-second warning suppression, read-only complete-page check, existing optional `ORPHAN_SWEEP` fire switch, signed tracked submission and outcome telemetry. `main.rs` retains the original `live` gate and worker spawn order, passing concrete control, router, pending, signer and route dependencies; the extraction does not add a second writer or background feed. The entrypoint shrank from 4,615 to 4,393 lines. The extracted worker still defaults missing price to 0.02 and `negativeRisk` to false and still has an untimed fallback HTTP client: those are **unresolved A4 money-path errors**, explicitly left unchanged in this mechanical A3 slice rather than covertly altering order semantics. No live operation or new test was added.
 
+### A3: wallet registry synchronization worker (COPYBOT-3)
+
+`runtime/wallet_sync.rs` (317 lines) now owns the existing 2-second registry reload/repricing/activation/retirement and pair-ledger seeding/retry worker. The binary supplies its concrete registry, router, control, physical-wallet read model, emitter, watched-address set and pair-ledger dependencies; it keeps the original live gate and spawn order, and the task still uses the same ledger/lane state, seed backoff and typed reactivation refusal. `main.rs` shrinks from 4,393 to 4,103 lines without creating another task, changing risk policy, or adding tests. The worker's fallback HTTP client construction is unchanged and remains an A4 typed-error candidate; this slice is mechanical A3 ownership separation, not an assertion of complete single-state ownership.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.

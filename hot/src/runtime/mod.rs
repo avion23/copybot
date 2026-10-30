@@ -15,3 +15,4 @@ pub(crate) mod position_reconciliation;
 pub(crate) mod reconcile;
 pub(crate) mod signal;
 pub(crate) mod telemetry;
+pub(crate) mod wallet_sync;
