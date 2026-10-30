@@ -12,7 +12,7 @@ use runtime::reconcile::recovery_target_shares;
 use runtime::accounting::{book_and_resolve, halt_buys_on_persistence_fault_with};
 use runtime::telemetry::{now_ms, Emitter};
 use runtime::execution::submit_tracked;
-use runtime::control::{control_task, latch_buys};
+use runtime::control::latch_buys;
 use runtime::operator::{actor_of, handle_arm_post, handle_flatten_post, handle_wallet_patch, seed_operator_file};
 use runtime::exits::{rescue_exit, rest_verdict};
 use runtime::http::{mutation_refusal, route_refusal};
@@ -994,119 +994,12 @@ still be holding something, check that the funder address is right."
         }
     }
     if shadow {
-        let (c2, r2, e2, f2) = (
-            control.clone(),
-            router.clone(),
-            emitter.clone(),
-            funder.clone(),
-        );
-        tokio::spawn(async move {
-            let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default();
-            loop {
-                tokio::time::sleep(Duration::from_secs(300)).await;
-                let snap = copybot_hot::positions::fetch(
-                        &http,
-                        "https://data-api.polymarket.com",
-                        &f2,
-                        "0.01",
-                        "",
-                        copybot_hot::ledger::now_secs(),
-                    )
-                    .await;
-                if !snap.may_act_destructively() {
-                    continue;
-                }
-                let chain = &snap.rows;
-                for lane in r2.snapshot().iter() {
-                    let name = lane.cfg.name.clone();
-                    let held = c2.lock().unwrap().ledger.holdings(&name);
-                    let his = c2
-                        .lock()
-                        .unwrap()
-                        .his_pos
-                        .get(&name)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut adopted = 0usize;
-                    for p in chain {
-                        let tok = p["asset"].as_str().unwrap_or("").to_string();
-                        if tok.is_empty() || !his.contains_key(&tok) {
-                            continue;
-                        }
-                        let sz = p["size"]
-                            .as_f64()
-                            .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
-                            .unwrap_or(0.0);
-                        let diff = sz - held.get(&tok).copied().unwrap_or(0.0);
-                        if diff <= 0.01 {
-                            continue;
-                        }
-                        let px = p["avgPrice"]
-                            .as_f64()
-                            .or_else(|| {
-                                p["avgPrice"].as_str().and_then(|x| x.parse().ok())
-                            })
-                            .unwrap_or(0.0);
-                        if px <= 0.0 {
-                            continue;
-                        }
-                        c2.lock()
-                            .unwrap()
-                            .ledger
-                            .record_fill(&name, &tok, 0, diff, px, 0.0);
-                        adopted += 1;
-                    }
-                    if adopted > 0 {
-                        e2.emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "recon", "lane" : name, "adopted" :
-                                adopted, "periodic" : true }
-                            ),
-                        );
-                    }
-                }
-            }
-        });
+        runtime::position_reconciliation::spawn_shadow(&control, &router, &emitter, &funder);
     }
-    {
-        let supervised = tokio::spawn(
-            control_task(
-                control.clone(),
-                router.clone(),
-                pending_log.clone(),
-                emitter.clone(),
-                watch_tokens.clone(),
-                resting_book.clone(),
-                levels.clone(),
-                prints.clone(),
-            ),
-        );
-        let em_sup = emitter.clone();
-        tokio::spawn(async move {
-            let outcome = supervised.await;
-            let why = match &outcome {
-                Err(e) if e.is_panic() => "control task PANICKED".to_string(),
-                Err(e) => format!("control task ended abnormally: {e}"),
-                Ok(()) => "control task returned, which it must never do".to_string(),
-            };
-            eprintln!(
-                "[CRITICAL] {why} — the only writer of `armed` is gone, so the \
-kill switch is inert. Aborting so systemd restarts a coherent process."
-            );
-            em_sup
-                .emit(
-                    serde_json::json!(
-                        { "t" : now_ms(), "ev" : "control_task_died", "why" : why,
-                        "action" : "abort" }
-                    ),
-                );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            std::process::abort();
-        });
-    }
+    runtime::control::spawn_supervised(
+        &control, &router, &pending_log, &emitter, &watch_tokens,
+        &resting_book, &levels, &prints,
+    );
     let creds_slot: Arc<std::sync::Mutex<Option<copybot_hot::auth::ApiCreds>>> = Arc::new(
         std::sync::Mutex::new(None),
     );
@@ -1144,141 +1037,10 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
     runtime::telemetry::spawn_feed_status(
         &stats, &emitter, &books, &watch_tokens, &feed_registry, &book, &resting_book,
     );
-    let mk_client = |h2: bool| {
-        let b = reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(30))
-            .tcp_nodelay(true)
-            .pool_max_idle_per_host(4)
-            .timeout(Duration::from_secs(10));
-        if h2 { b.build() } else { b.http1_only().build() }
-    };
-    let http = mk_client(false).expect("h1 client");
-    let mut order_paths: Vec<(String, reqwest::Client)> = vec![
-        ("h1".into(), http.clone())
-    ];
-    if root.bot.race_h2 {
-        match mk_client(true) {
-            Ok(c) => order_paths.push(("h2".into(), c)),
-            Err(e) => eprintln!("[transport] h2 unavailable: {e}"),
-        }
-        match mk_client(false) {
-            Ok(c) => order_paths.push(("h1b".into(), c)),
-            Err(e) => eprintln!("[transport] third path unavailable: {e}"),
-        }
-    }
-    eprintln!(
-        "[transport] racing {} paths: {}", order_paths.len(), order_paths.iter().map(|
-        (n, _) | n.as_str()).collect::< Vec < _ >> ().join(", ")
-    );
-    let order_paths = Arc::new(order_paths);
-    let clob = root.bot.clob_host.clone();
-    let creds: Arc<Option<copybot_hot::auth::ApiCreds>> = if shadow {
-        eprintln!(
-            "[auth] SHADOW — credentials deliberately NOT derived. Every order \
-will be rejected 401 by the venue. This process cannot place an order."
-        );
-        Arc::new(None)
-    } else {
-        use copybot_hot::auth::derive_or_create_creds;
-        match pk {
-            Some(pk) => {
-                match derive_or_create_creds(&http, &clob, &pk, &signer_addr, 0).await {
-                    Ok(c) => {
-                        eprintln!("[auth] L2 credentials derived — {}", c.redacted());
-                        *creds_slot.lock().unwrap() = Some(c.clone());
-                        Arc::new(Some(c))
-                    }
-                    Err(e) => {
-                        eprintln!("[auth] FAILED to obtain L2 credentials: {e}");
-                        Arc::new(None)
-                    }
-                }
-            }
-            None => {
-                eprintln!(
-                    "[auth] no PRIVATE_KEY in env — L2 auth UNAVAILABLE (paper mode only)"
-                );
-                Arc::new(None)
-            }
-        }
-    };
-    if let Some(cr) = creds.as_ref() {
-        let path = "/data/orders";
-        let ts = copybot_hot::auth::now_secs();
-        match copybot_hot::auth::l2_headers(&signer_addr, cr, ts, "GET", path, None) {
-            Ok(h) => {
-                let mut rb = http.get(format!("{clob}{path}"));
-                for (k, v) in &h {
-                    rb = rb.header(*k, v);
-                }
-                match rb.send().await {
-                    Ok(r) if r.status().is_success() => {
-                        eprintln!(
-                            "[auth] self-check OK — {path} accepted our L2 headers"
-                        );
-                        match r.json::<serde_json::Value>().await {
-                            Ok(v) => {
-                                let n = (v.as_array().map(|a| a.len()))
-                                    .or_else(|| v["data"].as_array().map(|a| a.len()))
-                                    .unwrap_or(0);
-                                if n > 0 {
-                                    eprintln!(
-                                        "[resting] venue holds {n} live order(s); attribution deferred to the open-orders reconcile (~60s)"
-                                    );
-                                    emitter
-                                        .emit(
-                                            serde_json::json!(
-                                                { "t" : now_ms(), "ev" : "resting_seen_at_boot", "orders" :
-                                                n }
-                                            ),
-                                        );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[resting] could not read the open-order list ({e}); a GTC order the venue still holds would be unmanaged"
-                                )
-                            }
-                        }
-                    }
-                    Ok(r) => {
-                        eprintln!(
-                            "[auth] ⛔ SELF-CHECK FAILED: {path} -> {}. Credentials \
-derived but are NOT accepted; every order would be refused. Refusing to continue.",
-                            r.status()
-                        );
-                        if live && !shadow {
-                            std::process::exit(2);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[auth] ⛔ self-check could not run ({e}); auth is UNVERIFIED"
-                        );
-                        if live && !shadow {
-                            std::process::exit(2);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[auth] ⛔ self-check header build failed: {e}");
-                if live && !shadow {
-                    std::process::exit(2);
-                }
-            }
-        }
-    }
-    if live && !shadow && creds.is_none() {
-        eprintln!(
-            "[auth] ⛔ REFUSING TO ARM: mode=live but there are no L2 credentials.\n\
-                   [auth]    Every /order POST would be rejected 401 by the venue.\n\
-                   [auth]    Set PRIVATE_KEY, or run mode=paper."
-        );
-        std::process::exit(2);
-    }
-    let auth_addr = signer_addr.clone();
+    let runtime::transport::Transport { http, order_paths, clob, creds, auth_addr } =
+        runtime::transport::init(
+            &root, shadow, pk, &signer_addr, &creds_slot, live, &emitter,
+        ).await;
     runtime::exits::spawn_cancellation_sweep(
         &resting_book, &http, &clob, &auth_addr, &creds, &router, &emitter,
         &signal_guard, &levels, &prints,
@@ -1358,7 +1120,7 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
         );
     }
     if live && !shadow {
-        let hc = mk_client(false).expect("seed-check client");
+        let hc = runtime::transport::mk_client(false).expect("seed-check client");
         runtime::equity_monitor::spawn(
             &creds_slot, &clob, &auth_addr, &funder, &physical_wallet,
             &registry, sig_type, hc,
@@ -1369,7 +1131,7 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
     let politics: runtime::politics::PoliticsBook =
         Arc::new(std::sync::RwLock::new(None));
     if live {
-        match mk_client(false) {
+        match runtime::transport::mk_client(false) {
             Ok(hc) => runtime::politics::spawn(&politics, &registry, &emitter, hc),
             Err(_) => {
                 eprintln!("[politics] REFUSED: cannot construct timed activity client");

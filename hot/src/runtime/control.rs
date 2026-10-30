@@ -83,6 +83,54 @@ pub(crate) fn latch_buys(
     }
 }
 
+/// Only one control task; exit or panic aborts the process to preserve the kill switch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_supervised(
+    control: &Arc<std::sync::Mutex<Control>>,
+    router: &Arc<Router>,
+    pending_log: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
+    emitter: &Arc<Emitter>,
+    watch_tokens: &Arc<std::sync::Mutex<Vec<String>>>,
+    resting_book: &Arc<copybot_hot::resting::RestingBook>,
+    levels: &Arc<copybot_hot::book::Levels>,
+    prints: &Arc<copybot_hot::book::TradePrints>,
+) {
+        let supervised = tokio::spawn(
+            control_task(
+                control.clone(),
+                router.clone(),
+                pending_log.clone(),
+                emitter.clone(),
+                watch_tokens.clone(),
+                resting_book.clone(),
+                levels.clone(),
+                prints.clone(),
+            ),
+        );
+        let em_sup = emitter.clone();
+        tokio::spawn(async move {
+            let outcome = supervised.await;
+            let why = match &outcome {
+                Err(e) if e.is_panic() => "control task PANICKED".to_string(),
+                Err(e) => format!("control task ended abnormally: {e}"),
+                Ok(()) => "control task returned, which it must never do".to_string(),
+            };
+            eprintln!(
+                "[CRITICAL] {why} — the only writer of `armed` is gone, so the \
+kill switch is inert. Aborting so systemd restarts a coherent process."
+            );
+            em_sup
+                .emit(
+                    serde_json::json!(
+                        { "t" : now_ms(), "ev" : "control_task_died", "why" : why,
+                        "action" : "abort" }
+                    ),
+                );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            std::process::abort();
+        });
+}
+
 pub(crate) async fn control_task(
     ctl: Arc<std::sync::Mutex<Control>>,
     router: Arc<Router>,

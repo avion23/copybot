@@ -23,4 +23,5 @@ pub(crate) mod politics;
 pub(crate) mod reconcile;
 pub(crate) mod signal;
 pub(crate) mod telemetry;
+pub(crate) mod transport;
 pub(crate) mod wallet_sync;

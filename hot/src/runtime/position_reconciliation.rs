@@ -7,6 +7,91 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Existing shadow-only periodic ledger observation; never launched on live.
+pub(crate) fn spawn_shadow(
+    control: &Arc<Mutex<Control>>,
+    router: &Arc<Router>,
+    emitter: &Arc<Emitter>,
+    funder: &str,
+) {
+        let (c2, r2, e2, f2) = (
+            control.clone(),
+            router.clone(),
+            emitter.clone(),
+            funder.to_owned(),
+        );
+        tokio::spawn(async move {
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_default();
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                let snap = copybot_hot::positions::fetch(
+                        &http,
+                        "https://data-api.polymarket.com",
+                        &f2,
+                        "0.01",
+                        "",
+                        copybot_hot::ledger::now_secs(),
+                    )
+                    .await;
+                if !snap.may_act_destructively() {
+                    continue;
+                }
+                let chain = &snap.rows;
+                for lane in r2.snapshot().iter() {
+                    let name = lane.cfg.name.clone();
+                    let held = c2.lock().unwrap().ledger.holdings(&name);
+                    let his = c2
+                        .lock()
+                        .unwrap()
+                        .his_pos
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut adopted = 0usize;
+                    for p in chain {
+                        let tok = p["asset"].as_str().unwrap_or("").to_string();
+                        if tok.is_empty() || !his.contains_key(&tok) {
+                            continue;
+                        }
+                        let sz = p["size"]
+                            .as_f64()
+                            .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
+                            .unwrap_or(0.0);
+                        let diff = sz - held.get(&tok).copied().unwrap_or(0.0);
+                        if diff <= 0.01 {
+                            continue;
+                        }
+                        let px = p["avgPrice"]
+                            .as_f64()
+                            .or_else(|| {
+                                p["avgPrice"].as_str().and_then(|x| x.parse().ok())
+                            })
+                            .unwrap_or(0.0);
+                        if px <= 0.0 {
+                            continue;
+                        }
+                        c2.lock()
+                            .unwrap()
+                            .ledger
+                            .record_fill(&name, &tok, 0, diff, px, 0.0);
+                        adopted += 1;
+                    }
+                    if adopted > 0 {
+                        e2.emit(
+                            serde_json::json!(
+                                { "t" : now_ms(), "ev" : "recon", "lane" : name, "adopted" :
+                                adopted, "periodic" : true }
+                            ),
+                        );
+                    }
+                }
+            }
+        });
+}
+
 pub(crate) fn spawn(
     control: &Arc<Mutex<Control>>,
     router: &Arc<Router>,
