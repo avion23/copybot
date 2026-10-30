@@ -63,14 +63,30 @@ pub fn looks_matched(body: &str) -> bool {
         || b.contains("\"status\":\"filled\"") || b.contains("\"status\": \"filled\""))
         && !b.contains("\"success\": false") && !b.contains("\"success\":false")
 }
-pub fn resolve(results: &[PathResult]) -> Outcome {
+/// A rejection releases the pending reservation only when every attempted
+/// path returned a definitive refusal. Silent, missing, throttled or 2xx
+/// unclassified replies mean an order may exist at the venue.
+pub fn definitive_refusal(r: &PathResult) -> bool {
+    if (400..500).contains(&r.http) && !matches!(r.http, 408 | 409 | 425 | 429) {
+        return true;
+    }
+    if !(200..300).contains(&r.http) { return false; }
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&r.body) else {
+        return false;
+    };
+    body["success"].as_bool() == Some(false)
+        || ["error", "errorMsg"].iter().any(|key| {
+            body[*key].as_str().is_some_and(|msg| !msg.trim().is_empty())
+        })
+}
+pub fn resolve_with_expected(results: &[PathResult], expected_paths: usize) -> Outcome {
     if results.is_empty() {
         return Outcome::NoResponse;
     }
     if let Some(r) = results
         .iter()
-        .filter(|r| looks_matched(&r.body))
-        .min_by(|a, b| a.ms.partial_cmp(&b.ms).unwrap())
+        .filter(|r| (200..300).contains(&r.http) && looks_matched(&r.body))
+        .min_by(|a, b| a.ms.total_cmp(&b.ms))
     {
         return Outcome::Matched {
             body: r.body.clone(),
@@ -80,8 +96,8 @@ pub fn resolve(results: &[PathResult]) -> Outcome {
     }
     if let Some(r) = results
         .iter()
-        .filter(|r| looks_resting(&r.body).is_some())
-        .min_by(|a, b| a.ms.partial_cmp(&b.ms).unwrap())
+        .filter(|r| (200..300).contains(&r.http) && looks_resting(&r.body).is_some())
+        .min_by(|a, b| a.ms.total_cmp(&b.ms))
     {
         return Outcome::Resting {
             order_id: looks_resting(&r.body).unwrap(),
@@ -100,31 +116,29 @@ pub fn resolve(results: &[PathResult]) -> Outcome {
             .find(|r| !looks_duplicate(&r.body) && r.http != 0 && r.http < 500)
         {
             eprintln!(
-                "[race] duplicate alongside a real error — treating as DUPLICATE \
-                       (the order exists); sibling said: {}",
-                other.body.chars().take(160).collect::< String > ()
+                "[race] duplicate alongside another response — keeping reservation \
+                       for reconciliation; sibling HTTP {}", other.http
             );
         }
         return Outcome::DuplicateOnly {
             winner: dupes[0].path.clone(),
         };
     }
-    if results.iter().all(|r| r.http == 0 || r.http >= 500) {
-        let detail = results
-            .iter()
+    if results.len() != expected_paths || !results.iter().all(definitive_refusal) {
+        let mut detail = results.iter()
             .map(|r| format!("{}:{}", r.path, r.http))
-            .collect::<Vec<_>>()
-            .join(",");
+            .collect::<Vec<_>>().join(",");
+        if results.len() != expected_paths {
+            detail.push_str(&format!(",missing_paths={}", expected_paths.saturating_sub(results.len())));
+        }
         return Outcome::Ambiguous { detail };
     }
-    if let Some(r) = results.iter().find(|r| !looks_duplicate(&r.body)) {
-        return Outcome::Rejected {
-            body: r.body.clone(),
-        };
-    }
-    Outcome::Rejected {
-        body: results[0].body.clone(),
-    }
+    Outcome::Rejected { body: results[0].body.clone() }
+}
+/// Pure classifier assumes all paths given; venue execution uses the expected
+/// socket count to prevent a dropped task from releasing its reservation.
+pub fn resolve(results: &[PathResult]) -> Outcome {
+    resolve_with_expected(results, results.len())
 }
 pub async fn race_submit(
     clients: &[(String, reqwest::Client)],
@@ -171,14 +185,16 @@ pub async fn race_submit(
     let mut results = Vec::new();
     while let Some(r) = set.join_next().await {
         let Ok(pr) = r else { continue };
-        let decisive = looks_matched(&pr.body);
+        // A 5xx error body can echo an earlier matched payload; only an
+        // actual successful HTTP response may end the race before all paths.
+        let decisive = (200..300).contains(&pr.http) && looks_matched(&pr.body);
         results.push(pr);
         if decisive && !set.is_empty() {
             tokio::spawn(async move { while set.join_next().await.is_some() {} });
-            return (resolve(&results), results);
+            return (resolve_with_expected(&results, clients.len()), results);
         }
     }
-    (resolve(&results), results)
+    (resolve_with_expected(&results, clients.len()), results)
 }
 #[cfg(test)]
 mod tests {
@@ -258,10 +274,10 @@ mod tests {
         assert!(matches!(o, Outcome::Resting { .. }), "got {o:?}");
     }
     #[test]
-    fn a_resting_reply_without_an_order_id_is_NOT_trusted() {
+    fn a_resting_reply_without_an_order_id_is_UNVERIFIABLE_not_terminal() {
         let body = r#"{"success":true,"status":"live"}"#;
         assert!(looks_resting(body).is_none());
-        assert!(matches!(resolve(& [pr("h1", body, 10.0)]), Outcome::Rejected { .. }));
+        assert!(matches!(resolve(& [pr("h1", body, 10.0)]), Outcome::Ambiguous { .. }));
     }
     #[test]
     fn a_FAILED_order_is_never_read_as_resting() {
@@ -299,7 +315,7 @@ mod tests {
         assert!(matches!(resolve(& rs), Outcome::Ambiguous { .. }));
     }
     #[test]
-    fn a_REAL_venue_refusal_is_still_a_reject() {
+    fn one_4xx_cannot_release_reservation_if_a_sibling_did_not_reply() {
         let rs = vec![
             PathResult { path : "h1".into(), http : 400, ms : 5.0, body :
             "{\"error\":\"not enough balance / allowance\"}".into() }, PathResult { path
@@ -307,8 +323,8 @@ mod tests {
             "{\"transport_error\":\"timeout\"}".into() },
         ];
         assert!(
-            matches!(resolve(& rs), Outcome::Rejected { .. }),
-            "one real 4xx verdict makes the outcome known"
+            matches!(resolve(& rs), Outcome::Ambiguous { .. }),
+            "one real 4xx cannot prove a silent sibling was rejected"
         );
     }
     #[test]
@@ -367,6 +383,56 @@ mod tests {
             Outcome::Rejected { body } => assert!(body.contains("not enough balance")),
             o => panic!("a lone real error is a reject — got {o:?}"),
         }
+    }
+    #[test]
+    fn an_all_path_refusal_is_required_before_releasing_a_reservation() {
+        let reject = PathResult {
+            path: "h1".into(), http: 400, ms: 2.0,
+            body: r#"{"error":"insufficient allowance"}"#.into(),
+        };
+        assert!(matches!(
+            resolve_with_expected(&[reject.clone()], 2),
+            Outcome::Ambiguous { .. }
+        ), "a disappeared submit task is not a negative venue verdict");
+        let second = PathResult {
+            path: "h2".into(), http: 403, ms: 3.0,
+            body: r#"{"error":"unauthorized"}"#.into(),
+        };
+        assert!(matches!(
+            resolve_with_expected(&[reject, second], 2),
+            Outcome::Rejected { .. }
+        ), "both explicit refusals mean the venue cannot hold that order");
+    }
+    #[test]
+    fn throttles_transport_failures_and_unclassified_successes_retain_reservations() {
+        for (http, body) in [
+            (0, ""),
+            (502, "temporary"),
+            (408, "timeout"),
+            (409, "conflict without known identity"),
+            (429, "rate limited"),
+            (200, r#"{"success":true}"#),
+            (202, r#"{"accepted":true}"#),
+        ] {
+            let result = PathResult {
+                path:"unknown".into(), http, body:body.into(), ms:3.0,
+            };
+            let reject = PathResult {
+                path:"reject".into(), http:400,
+                body:r#"{"error":"allowance"}"#.into(), ms:2.0,
+            };
+            assert!(matches!(
+                resolve(&[reject, result]), Outcome::Ambiguous { .. }
+            ), "HTTP {http} with unproven sibling cannot release an order");
+        }
+    }
+    #[test]
+    fn a_5xx_echoing_matched_does_not_prove_a_fill() {
+        let echoed = PathResult {
+            path:"bad_gateway".into(), http:503,
+            body: r#"{"status":"matched","success":true}"#.into(), ms:1.0,
+        };
+        assert!(matches!(resolve(&[echoed]), Outcome::Ambiguous { .. }));
     }
     #[test]
     fn no_responses_at_all_is_not_a_reject() {
