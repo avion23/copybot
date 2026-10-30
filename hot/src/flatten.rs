@@ -75,6 +75,70 @@ pub fn should_sell(mode: Mode, mark: f64, avg_cost: f64) -> bool {
         Mode::Graceful => false,
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarketTerms {
+    pub mark: f64,
+    pub negative_risk: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarketEvidenceError {
+    Snapshot(crate::position_evidence::PositionError),
+    InvalidHolding(String),
+    MissingHeldAsset(String),
+    InvalidMark(String),
+    MissingRiskDomain(String),
+}
+
+impl std::fmt::Display for MarketEvidenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Snapshot(error) => write!(f, "incomplete or invalid position snapshot: {error}"),
+            Self::InvalidHolding(token) => write!(f, "invalid ledger holding for {token}"),
+            Self::MissingHeldAsset(token) => write!(f, "missing venue position for held {token}"),
+            Self::InvalidMark(token) => write!(f, "invalid venue mark for held {token}"),
+            Self::MissingRiskDomain(token) => {
+                write!(f, "missing negativeRisk domain for held {token}")
+            }
+        }
+    }
+}
+impl std::error::Error for MarketEvidenceError {}
+
+/// Validate all visible positions before treating a missing holding as real.
+/// No default price or exchange domain is permitted for a held token.
+pub fn market_terms_for_held(
+    snapshot: &crate::positions::Positions,
+    held: &std::collections::HashMap<String, f64>,
+) -> Result<std::collections::HashMap<String, MarketTerms>, MarketEvidenceError> {
+    crate::position_evidence::complete_balances(snapshot)
+        .map_err(MarketEvidenceError::Snapshot)?;
+
+    let rows: std::collections::HashMap<&str, &serde_json::Value> = snapshot.rows
+        .iter()
+        .filter_map(|row| row["asset"].as_str().map(|asset| (asset, row)))
+        .collect();
+    let mut terms = std::collections::HashMap::with_capacity(held.len());
+    for (token, size) in held {
+        if !size.is_finite() || *size < 0.0 {
+            return Err(MarketEvidenceError::InvalidHolding(token.clone()));
+        }
+        if *size <= 1e-9 {
+            continue;
+        }
+        let row = rows.get(token.as_str())
+            .ok_or_else(|| MarketEvidenceError::MissingHeldAsset(token.clone()))?;
+        let mark = row["curPrice"].as_f64()
+            .or_else(|| row["curPrice"].as_str().and_then(|text| text.parse().ok()))
+            .filter(|price| price.is_finite() && *price > 0.0 && *price <= 1.0)
+            .ok_or_else(|| MarketEvidenceError::InvalidMark(token.clone()))?;
+        let negative_risk = row["negativeRisk"].as_bool()
+            .ok_or_else(|| MarketEvidenceError::MissingRiskDomain(token.clone()))?;
+        terms.insert(token.clone(), MarketTerms { mark, negative_risk });
+    }
+    Ok(terms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

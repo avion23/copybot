@@ -48,10 +48,19 @@ pub(crate) fn spawn(
         );
         let err4 = errors_path.clone();
         tokio::spawn(async move {
-            let http = reqwest::Client::builder()
+            let http = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .unwrap_or_default();
+            {
+                Ok(client) => client,
+                Err(_) => {
+                    e4.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "flatten_unavailable",
+                        "reason": "http_client_initialization",
+                    }));
+                    return;
+                }
+            };
             let mut done: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -165,31 +174,32 @@ SOLD — the wallet still holds everything it held before.",
                     continue;
                 }
                 let (Some(cr), Some(key)) = (creds4.as_ref(), pk4.as_ref()) else {
-                    continue
-                };
-                let url = format!(
-                    "https://data-api.polymarket.com/positions?user={f4}\
-&sizeThreshold=0.0001&limit=500"
-                );
-                let ours: Vec<serde_json::Value> = match http.get(&url).send().await {
-                    Ok(r) if r.status().is_success() => {
-                        r.json().await.unwrap_or_default()
-                    }
-                    _ => Vec::new(),
-                };
-                let mark_of = |tok: &str| -> f64 {
-                    ours.iter()
-                        .find(|p| p["asset"].as_str() == Some(tok))
-                        .and_then(|p| {
-                            p["curPrice"]
-                                .as_f64()
-                                .or_else(|| {
-                                    p["curPrice"].as_str().and_then(|x| x.parse().ok())
-                                })
-                        })
-                        .unwrap_or(0.0)
+                    e4.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "flatten_unavailable",
+                        "lane": lane.cfg.name, "reason": "signing_credentials_unavailable",
+                    }));
+                    continue;
                 };
                 let held = c4.lock().unwrap().ledger.holdings(&lane.cfg.name);
+                let snapshot = copybot_hot::positions::fetch(
+                    &http,
+                    "https://data-api.polymarket.com",
+                    &f4,
+                    "0.0001",
+                    "",
+                    copybot_hot::ledger::now_secs(),
+                ).await;
+                let quotes = match copybot_hot::flatten::market_terms_for_held(&snapshot, &held) {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        e4.emit(serde_json::json!({
+                            "t": now_ms(), "ev": "flatten_unavailable",
+                            "lane": lane.cfg.name,
+                            "reason": error.to_string(),
+                        }));
+                        continue;
+                    }
+                };
                 let mut sold = 0usize;
                 let mut attempted = 0usize;
                 let mut unconfirmed = 0usize;
@@ -197,12 +207,21 @@ SOLD — the wallet still holds everything it held before.",
                     if *sz <= 1e-9 {
                         continue;
                     }
-                    let mark = mark_of(tok);
+                    let Some(quote) = quotes.get(tok) else {
+                        e4.emit(serde_json::json!({
+                            "t": now_ms(), "ev": "flatten_unavailable",
+                            "lane": lane.cfg.name, "token": tok,
+                            "reason": "validated_market_quote_missing",
+                        }));
+                        unconfirmed += 1;
+                        continue;
+                    };
+                    let mark = quote.mark;
                     let avg = c4.lock().unwrap().ledger.avg_cost(&lane.cfg.name, tok);
                     if !copybot_hot::flatten::should_sell(mode, mark, avg) {
                         continue;
                     }
-                    let px = if mark > 0.0 { mark } else { 0.02 };
+                    let px = mark;
                     let (shares, limit) = if mode == copybot_hot::flatten::Mode::Panic {
                         copybot_hot::venue::dust_fak_terms(*sz, px)
                     } else {
@@ -212,11 +231,7 @@ SOLD — the wallet still holds everything it held before.",
                         continue;
                     }
                     attempted += 1;
-                    let neg = ours
-                        .iter()
-                        .find(|p| p["asset"].as_str() == Some(tok.as_str()))
-                        .and_then(|p| p["negativeRisk"].as_bool())
-                        .unwrap_or(false);
+                    let neg = quote.negative_risk;
                     let (ma, ta) = copybot_hot::order::amounts(limit, shares, 1);
                     let ord = copybot_hot::order::Order {
                         salt: copybot_hot::order::safe_salt(now_ms()),
