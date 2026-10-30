@@ -20,51 +20,11 @@ from guardian_checks import (
     conservation_breaches, net_chain_for_lane, check_share_drift,
     check_fire_patterns, worthless_orphan, check_unattributed,
 )
-try:
-    import resolution
-except ImportError:
-
-    class resolution:
-        is_resolved = staticmethod(lambda c: None)
-        settled_payout = staticmethod(lambda c, t, fetch=None: None)
-try:
-    import scorecard
-except ImportError:
-
-    class scorecard:
-        _read = staticmethod(lambda p: [])
-        open_case = staticmethod(lambda *a, **k: None)
-        close_case = staticmethod(lambda *a, **k: None)
-        adjudicate = staticmethod(lambda *a, **k: [])
-        summarise = staticmethod(lambda *a, **k: {'precision_pct': None, 'true': 0, 'false': 0, 'unknown': 0, 'cases': 0, 'buys_lost_to_false_halts': 0})
-        summary_line = staticmethod(lambda s: 'scoring unavailable')
-try:
-    import preflight
-except ImportError:
-
-    class preflight:
-        run = staticmethod(lambda *a, **k: [])
-        failures = staticmethod(lambda r: [])
-        summary = staticmethod(lambda r: 'preflight unavailable')
-try:
-    import corroborate
-except ImportError:
-
-    class corroborate:
-        CONFIRMED = 'CONFIRMED'
-        REFUTED = 'REFUTED'
-        UNVERIFIABLE = 'UNVERIFIABLE'
-        Ctx = staticmethod(lambda *a, **k: None)
-        check = staticmethod(lambda *a, **k: ('CONFIRMED', 'corroboration unavailable'))
-        halts = staticmethod(lambda v: True)
-try:
-    import notify
-except ImportError:
-
-    class notify:
-        configured = staticmethod(lambda: False)
-        why_not_configured = staticmethod(lambda: 'deploy/notify.py not importable')
-        send = staticmethod(lambda *a, **k: False)
+import resolution
+import scorecard
+import preflight
+import corroborate
+import notify
 import os
 import sys
 import time
