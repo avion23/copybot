@@ -469,13 +469,25 @@ impl Root {
                     &caps,
                     &leader,
                 ) {
-                    if derived {
+                    if derived && self.bot.mode != "dry" {
+                        // Execution must never enter a strategy that cannot
+                        // size the leader's largest documented order.
                         return Err(e);
                     }
-                    eprintln!(
-                        "[{}] ⚠️  BUDGET WARNING (absolute caps, not enforced): {e}",
-                        l.name
-                    );
+                    if self.bot.mode == "dry" {
+                        // The operator may explicitly inspect a *capped*
+                        // hypothetical 5% copy with zero order submission.
+                        // This does NOT establish faithful live copyability.
+                        eprintln!(
+                            "[{}] DRY CAPPED OBSERVATION ONLY: {e}; individual                              hypothetical orders remain bounded by the fill cap",
+                            l.name
+                        );
+                    } else {
+                        eprintln!(
+                            "[{}] BUDGET WARNING (absolute caps): {e}",
+                            l.name
+                        );
+                    }
                 }
                 if let Some(adv) = crate::budget::open_cap_advisory(
                     &l.name,

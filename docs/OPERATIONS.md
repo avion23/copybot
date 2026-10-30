@@ -5,7 +5,7 @@
 1. **Inputs:** use an isolated local worktree, a private ignored config, an owner-only signer key source, a pending-transaction Polygon WSS, and a bounded HTTP RPC for position evidence; never copy credentials into Git or logs.
 2. **Mode:** set `[bot] mode = "dry"` in `deploy/copybot2.toml`; `shadow` and `live` are order-submitting modes, not dry runs.
 3. **Wallet:** set the deposit-wallet contract as `funder`, owner EOA as `signer`, and `signature_type = 3` for POLY_1271; confirm they match the local key without printing it.
-4. **Leader:** with no leader selected, keep all lanes disabled; the typed `DryObserveOnly` profile validates auth/feed but cannot exercise copy decisions or order reservations.
+4. **Leader:** without a leader, disable all lanes (`DryObserveOnly`); with an approved leader, dry mode can model a 5% copy clipped to explicit per-fill/per-market/open/daily caps, but this capped observation is not an admissible live-copy strategy.
 5. **Feed and auth:** configure one proven full-object pending-tx WSS and `clob_host`; dry mode may GET existing CLOB API credentials and GET `/data/orders`, never POST `/order` or create an API key.
 6. **Safety:** isolate `events_path`, `control_path`, `ledger_path` and `signal_guard_path`; retain owner-only permissions and do not run the systemd live service concurrently.
 7. **Start (180-second smoke test):** from the repo root after building, run `env -i PATH="$PATH" HOME="$HOME" PRIVATE_KEY="${PRIVATE_KEY:?load key locally}" timeout 180 hot/target/release/copybot-hot deploy/copybot2.toml`; prior agent-specific environment assignments were not supplied.
