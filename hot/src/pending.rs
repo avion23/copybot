@@ -76,6 +76,12 @@ pub fn stale_after_kind(p: &Pending, corroborated: bool) -> i64 {
         (false, _) => STALE_SECS,
     }
 }
+/// Recovery snapshots here carry shares and sometimes price, but NOT
+/// independently verified fee. A non-resting FAK fill may not be booked
+/// with an invented zero fee or provisional limit; hold its reservation.
+pub fn unproven_fak_money(resting: bool, price_verified: bool, fee_verified: bool) -> bool {
+    !resting && !(price_verified && fee_verified)
+}
 pub const SETTLE_SECS: i64 = 5;
 #[path = "pending_verdict.rs"]
 mod verdict;
@@ -95,6 +101,15 @@ pub struct PendingLog {
 mod journal;
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_FAK_recovery_never_books_without_both_price_and_fee_proof() {
+        for (px, fee) in [(false, false), (true, false), (false, true)] {
+            assert!(super::unproven_fak_money(false, px, fee));
+        }
+        assert!(!super::unproven_fak_money(false, true, true));
+        assert!(!super::unproven_fak_money(true, false, false),
+            "GTC is still a separately unmigrated legacy path");
+    }
     #[test]
     fn a_RESTING_order_absent_from_the_trades_list_has_not_filled_YET() {
         assert_eq!(

@@ -29,6 +29,7 @@ pub(crate) struct Context {
     pub(crate) signer_addr: String,
     pub(crate) sig_type: u8,
     pub(crate) pending_log: Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
+    pub(crate) fak_journal: Option<Arc<copybot_hot::order_commit::AtomicFakJournal>>,
     pub(crate) wal: Arc<copybot_hot::wal::Wal>,
     pub(crate) latency: Arc<copybot_hot::latency::Latency>,
     pub(crate) levels: Arc<copybot_hot::book::Levels>,
@@ -45,7 +46,7 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
         errors_path, politics, watch_tokens, resting_book, creds,
         http, clob, auth_addr, signal_guard, book,
         control, incidents, physical_wallet, fire_rate, order_paths,
-        pk, funder, signer_addr, sig_type, pending_log,
+        pk, funder, signer_addr, sig_type, pending_log, fak_journal,
         wal, latency, levels, prints, sweep_tx,
         books, response_times, sell_tranches
     } = ctx;
@@ -395,6 +396,19 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                             emitter.emit(fire_ev.clone());
                         }
                         if live {
+                            // FAK submissions may never use legacy limit/zero-fee
+                            // accounting. Without a successfully replayed owner,
+                            // refuse BEFORE HTTP POST and latch the buy side.
+                            if order_type == "FAK" && fak_journal.is_none() {
+                                latch_buys(&lane, &incidents, "fak_owner_unavailable",
+                                    "FAK execution needs a durable money journal before POST");
+                                emitter.emit(serde_json::json!({
+                                    "t":now_ms(), "ev":"submit_precondition_failed",
+                                    "lane":lane_name, "tok":intent.token_id,
+                                    "why":"FAK journal unavailable", "buys_halted":true,
+                                }));
+                                continue;
+                            }
                             let Some(sig) = sig else {
                                 latch_buys(
                                     &lane,
@@ -598,6 +612,7 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                             let prov_his_filled = progress.his_filled;
                             let prov_our_copied = progress.our_copied;
                             let pend_c = pending_log.clone();
+                            let fak_journal_c = fak_journal.clone();
                             let sg_c = signal_guard.clone();
                             let inc_c = incidents.clone();
                             let salt_c = d.salt;
@@ -657,21 +672,22 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                                 };
                                 let booked = match &outcome {
                                     Outcome::Matched { body, winner, ms } => {
-                                        let (durable, filled) = book_and_resolve(
-                                            &c2,
-                                            &pend_c,
-                                            &router_c,
-                                            &inc_c,
-                                            &e2,
-                                            &ln,
-                                            &tok_for_resp,
-                                            side_for_resp,
-                                            limit_for_resp,
-                                            body,
-                                            Some(his_price_for_resp),
-                                            &hash_c,
-                                            otype_c == "GTC",
-                                        );
+                                        let (durable, filled) = if otype_c == "FAK" {
+                                            runtime::accounting::book_matched_fak_race(
+                                                fak_journal_c.as_ref(),
+                                                &c2, &pend_c, &router_c, &inc_c, &e2,
+                                                &hash_c, &ln, &outcome, &results, paths.len(),
+                                            )
+                                        } else {
+                                            // GTC/resting follow-on paths are not yet
+                                            // journal-migrated. Do not mislabel them as A4.
+                                            book_and_resolve(
+                                                &c2, &pend_c, &router_c, &inc_c, &e2,
+                                                &ln, &tok_for_resp, side_for_resp,
+                                                limit_for_resp, body,
+                                                Some(his_price_for_resp), &hash_c, true,
+                                            )
+                                        };
                                         if side_for_resp == 0 && durable && otype_c != "GTC" {
                                             let unfilled = shares_for_resp - filled;
                                             if unfilled > 1e-9 {
@@ -763,19 +779,12 @@ not release {unfilled} unfilled shares: {e:?} — this order stays under-copied"
                                         )
                                     }
                                     Outcome::Rejected { body } => {
-                                        let _ = c2
-                                            .lock()
-                                            .unwrap()
-                                            .book_response(
-                                                &ln,
-                                                &tok_for_resp,
-                                                side_for_resp,
-                                                limit_for_resp,
-                                                body,
-                                                Some(his_price_for_resp),
-                                                &hash_c,
-                                                otype_c == "GTC",
-                                            );
+                                        // A refused HTTP outcome is never an inventory
+                                        // booking source. Old book_response could book a
+                                        // 4xx proxy body that echoed matched fields.
+                                        if let Some(book) = c2.lock().unwrap().ledger.lanes.get_mut(&ln) {
+                                            book.rejected += 1;
+                                        }
                                         if side_for_resp == 0 {
                                             if let Some(g) = sg_c.as_ref() {
                                                 if let Err(e) = g

@@ -435,6 +435,11 @@ the rescue ladder. Attribute it, or flatten by hand, rather than leaving it."
             );
         }
     }
+    // Dry never creates a money journal; live FAK requires verified replay.
+    let fak_journal = runtime::accounting::open_fak_journal_for_live(
+        live && !shadow, &root.bot.control_path,
+        &control, &pending_log, &router, &incidents,
+    );
     runtime::accounting::recover_booked_pending_at_boot(
         &control, &pending_log, &router, &incidents, &emitter,
     );
@@ -971,7 +976,7 @@ still be holding something, check that the funder address is right."
         errors_path, politics, watch_tokens, resting_book, creds,
         http, clob, auth_addr, signal_guard, book,
         control, incidents, physical_wallet, fire_rate, order_paths,
-        pk, funder, signer_addr, sig_type, pending_log,
+        pk, funder, signer_addr, sig_type, pending_log, fak_journal,
         wal, latency, levels, prints, sweep_tx,
         books, response_times, sell_tranches
     }).await;

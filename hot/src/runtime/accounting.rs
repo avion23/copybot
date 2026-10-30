@@ -85,6 +85,20 @@ pub(crate) async fn resolve_pending(
         }
         match verdict {
             Verdict::Filled { shares, price } => {
+                // The order-status/trades recovery API here has NO verified
+                // per-fill fee. An unfilled FAK journal row therefore cannot
+                // be booked at fee=0 (nor at a provisional limit price).
+                // Keep it reserved for independently proven money evidence.
+                if copybot_hot::pending::unproven_fak_money(
+                    p.resting, price.is_finite() && price > 0.0, false,
+                ) {
+                    emitter.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "pending_fak_money_unverified",
+                        "lane": p.lane, "order_hash": p.order_hash,
+                        "reason": "venue recovery lacks proven fee; booking deferred",
+                    }));
+                    continue;
+                }
                 // A verified venue match advances the durable reservation
                 // before any ledger booking. Unknown outcomes stay reserved.
                 if let Err(error) = log.lock().unwrap().advance(
@@ -319,6 +333,105 @@ BUY lanes halted; exits remain enabled",
     }
 }
 
+/// Bootstrap the canonical FAK owner only for actual non-shadow live mode.
+/// Dry observation has zero journal side effects. Failed ownership/recovery
+/// visibly latches buys and refuses subsequent FAK submission before POST.
+pub(crate) fn open_fak_journal_for_live(
+    enabled: bool,
+    control_path: &str,
+    control: &Arc<std::sync::Mutex<Control>>,
+    pending: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
+    router: &Arc<Router>,
+    incidents: &Arc<std::sync::Mutex<copybot_hot::incidents::Incidents>>,
+) -> Option<Arc<copybot_hot::order_commit::AtomicFakJournal>> {
+    if !enabled { return None; }
+    let path = format!("{control_path}.fak_commit");
+    let result = copybot_hot::order_commit::AtomicFakJournal::open(&path)
+        .and_then(|journal| {
+            let repaired = {
+                let mut ctl = control.lock().map_err(|_| {
+                    copybot_hot::order_commit::JournalRefusal::Unsafe(
+                        "ledger owner mutex poisoned".into(),
+                    )
+                })?;
+                let mut pend = pending.lock().map_err(|_| {
+                    copybot_hot::order_commit::JournalRefusal::Unsafe(
+                        "pending owner mutex poisoned".into(),
+                    )
+                })?;
+                journal.repair_legacy(&mut ctl.ledger, &mut pend)
+            }?;
+            Ok((journal, repaired))
+        });
+    match result {
+        Ok((journal, repaired)) => {
+            eprintln!("[fak_owner] boot replay: {} fills, {} closed, {} already closed",
+                repaired.fills_booked, repaired.pending_closed, repaired.already_closed);
+            Some(Arc::new(journal))
+        }
+        Err(error) => {
+            eprintln!("[fak_owner] boot ownership/replay REFUSED: {error:?}");
+            for lane in router.snapshot().iter() {
+                latch_buys(lane, incidents, "fak_owner_unavailable",
+                    "FAK journal lock/replay cannot be verified; new buys halted");
+            }
+            None
+        }
+    }
+}
+
+/// The one migrated runtime matched-FAK booking edge. A venue HTTP race
+/// has ALREADY happened: failure here must keep the durable reservation and
+/// halt new buys instead of silently trying legacy limit/zero-fee booking.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn book_matched_fak_race(
+    journal: Option<&Arc<copybot_hot::order_commit::AtomicFakJournal>>,
+    control: &Arc<std::sync::Mutex<Control>>,
+    pending: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
+    router: &Arc<Router>,
+    incidents: &Arc<std::sync::Mutex<copybot_hot::incidents::Incidents>>,
+    emitter: &Arc<Emitter>,
+    hash: &str,
+    lane: &str,
+    outcome: &copybot_hot::race_send::Outcome,
+    results: &[copybot_hot::race_send::PathResult],
+    attempted_paths: usize,
+) -> (bool, f64) {
+    let attempt = journal
+        .ok_or(copybot_hot::venue_fak::StrictFakRefusal::DurableStateUnavailable)
+        .and_then(|owner| {
+            // Same lock order as D614 boot replay. The only FAK journal owner
+            // is process-exclusive; no concurrent Ledger/PendingLog release.
+            let mut ctl = control.lock()
+                .map_err(|_| copybot_hot::venue_fak::StrictFakRefusal::DurableStateUnavailable)?;
+            let mut pend = pending.lock()
+                .map_err(|_| copybot_hot::venue_fak::StrictFakRefusal::DurableStateUnavailable)?;
+            copybot_hot::venue_fak::commit_matched_fak_from_race(
+                owner, &mut ctl.ledger, &mut pend, hash, outcome, results,
+                attempted_paths,
+            )
+        });
+    let (booked, shares, reason) = match attempt {
+        Ok(done) => (true, done.receipt.shares, None),
+        Err(refusal) => {
+            let why = format!("{refusal:?}");
+            eprintln!("[{lane}] FAK money proof REFUSED: {why}; pending remains reserved");
+            for item in router.snapshot().iter() {
+                latch_buys(item, incidents, "fak_money_unverified",
+                    "matched FAK monetary evidence/journal unavailable; retained reservation");
+            }
+            (false, 0.0, Some(why))
+        }
+    };
+    emitter.emit(serde_json::json!({
+        "t": now_ms(), "ev": "strict_fak_book",
+        "lane": lane, "order_hash": hash, "booked": booked,
+        "shares": shares, "reason": reason,
+    }));
+    halt_buys_on_persistence_fault_with(control, router, Some(pending), incidents);
+    (booked, shares)
+}
+
 pub(crate) fn book_and_resolve(
     control: &Arc<std::sync::Mutex<Control>>,
     pend: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
@@ -385,6 +498,140 @@ pub(crate) fn book_and_resolve(
         );
     halt_buys_on_persistence_fault_with(control, router, Some(pend), incidents);
     (booked, filled_shares)
+}
+
+
+#[cfg(test)]
+mod d619_tests {
+    use super::*;
+    use copybot_hot::pending::{Pending, PendingLog};
+    use copybot_hot::ledger::Ledger;
+    use copybot_hot::risk::RiskConfig;
+    use copybot_hot::race_send::{Outcome, PathResult};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    type Fixture = (
+        PathBuf, Arc<std::sync::Mutex<Control>>,
+        Arc<std::sync::Mutex<PendingLog>>, Arc<Router>,
+        Arc<std::sync::Mutex<copybot_hot::incidents::Incidents>>, Arc<Emitter>,
+        String,
+    );
+    fn fixture(label: &str) -> Fixture {
+        let dir = std::env::temp_dir().join(format!(
+            "cb-d619-{label}-{}-{}", std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let control_path = dir.join("ctl").to_string_lossy().into_owned();
+        let ledger = Ledger::new(
+            dir.join("ledger.jsonl").to_str().unwrap(),
+            &[("alpha".into(), RiskConfig::default())],
+        );
+        let control = Arc::new(std::sync::Mutex::new(Control::new(
+            ledger, dir.join("operator.json").to_str().unwrap(),
+        )));
+        let pending = Arc::new(std::sync::Mutex::new(PendingLog::open(
+            dir.join("pending.jsonl").to_str().unwrap(),
+        )));
+        pending.lock().unwrap().record(Pending {
+            lane: "alpha".into(), token: "tok".into(), side: 0,
+            order_hash: "h1".into(), shares: 10.0, limit: 0.6,
+            ts: 12, why: "offline_fixture".into(), resting: false,
+        }).unwrap();
+        let router = Arc::new(Router::new(vec![]));
+        let incidents = Arc::new(std::sync::Mutex::new(
+            copybot_hot::incidents::Incidents::open(dir.join("incidents.jsonl")),
+        ));
+        let emitter = Arc::new(Emitter::new(
+            dir.join("events.jsonl").to_string_lossy().into_owned(), false,
+        ));
+        (dir, control, pending, router, incidents, emitter, control_path)
+    }
+    fn matched(fee: bool) -> String {
+        format!(
+            r#"{{"status":"matched","success":true,"orderID":"0xh1","takingAmount":"9","makingAmount":"4.05"{}}}"#,
+            if fee { r#","feeAmount":"0.015""# } else { "" },
+        )
+    }
+    #[test]
+    fn dry_and_shadow_never_open_a_durable_fak_owner_file() {
+        let (dir, c, p, r, i, _e, path) = fixture("dry");
+        assert!(open_fak_journal_for_live(false, &path, &c, &p, &r, &i).is_none());
+        assert!(!dir.join("ctl.fak_commit").exists());
+        assert!(!dir.join("ctl.fak_commit.owner.lock").exists());
+        assert!(p.lock().unwrap().is_open("h1"));
+        assert!(!c.lock().unwrap().ledger.was_order_booked("h1"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn prepared_owner_routes_matched_fak_through_one_journal_then_ledger() {
+        let (dir, c, p, r, i, e, path) = fixture("match");
+        let journal = open_fak_journal_for_live(true, &path, &c, &p, &r, &i)
+            .expect("valid empty owner must open");
+        let body = matched(true);
+        let outcome = Outcome::Matched {
+            body: body.clone(), winner: "p".into(), ms: 1.0,
+        };
+        let results = [PathResult {
+            path: "p".into(), http: 200, body, ms: 1.0,
+        }];
+        let (booked, shares) = book_matched_fak_race(
+            Some(&journal), &c, &p, &r, &i, &e, "h1", "alpha",
+            &outcome, &results, 1,
+        );
+        assert!(booked);
+        assert_eq!(shares, 9.0);
+        assert!(!p.lock().unwrap().is_open("h1"));
+        assert_eq!(journal.commits().unwrap().len(), 1);
+        let guard = c.lock().unwrap();
+        assert_eq!(guard.ledger.recorded_order("h1").unwrap().fee, 0.015);
+        drop(guard);
+        drop(journal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn matched_without_fee_latches_result_and_keeps_pending_unchanged() {
+        let (dir, c, p, r, i, e, path) = fixture("unknown");
+        let journal = open_fak_journal_for_live(true, &path, &c, &p, &r, &i).unwrap();
+        let body = matched(false);
+        let outcome = Outcome::Matched {
+            body: body.clone(), winner: "p".into(), ms: 1.0,
+        };
+        let results = [PathResult {
+            path: "p".into(), http: 200, body, ms: 1.0,
+        }];
+        let (booked, shares) = book_matched_fak_race(
+            Some(&journal), &c, &p, &r, &i, &e, "h1", "alpha",
+            &outcome, &results, 1,
+        );
+        assert!(!booked);
+        assert_eq!(shares, 0.0);
+        assert!(p.lock().unwrap().is_open("h1"));
+        assert!(!c.lock().unwrap().ledger.was_order_booked("h1"));
+        assert!(journal.commits().unwrap().is_empty());
+        drop(journal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn journal_only_crash_is_recovered_at_boot_without_network_or_post() {
+        let (dir, c, p, r, i, _e, path) = fixture("restart");
+        let journal = copybot_hot::order_commit::AtomicFakJournal::open(
+            dir.join("ctl.fak_commit"),
+        ).unwrap();
+        let fact = copybot_hot::venue_fak::parse_matched_fak(
+            &p.lock().unwrap().open_rows()[0], &matched(true),
+        ).unwrap();
+        journal.append(fact).unwrap();
+        drop(journal);
+        let recovered = open_fak_journal_for_live(true, &path, &c, &p, &r, &i).unwrap();
+        assert_eq!(recovered.commits().unwrap().len(), 1);
+        assert!(!p.lock().unwrap().is_open("h1"));
+        assert_eq!(c.lock().unwrap().ledger.recorded_order("h1").unwrap().fee, 0.015);
+        drop(recovered);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 pub(crate) fn spawn_settlement_booking(

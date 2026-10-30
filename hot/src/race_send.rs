@@ -68,7 +68,10 @@ pub fn looks_matched(body: &str) -> bool {
 /// unclassified replies mean an order may exist at the venue.
 pub fn definitive_refusal(r: &PathResult) -> bool {
     if (400..500).contains(&r.http) && !matches!(r.http, 408 | 409 | 425 | 429) {
-        return true;
+        // Some proxies echo a previous matched JSON body in an error reply.
+        // A 4xx carrying an apparent match is NOT proof that this or every
+        // sibling path definitively refused the signed order.
+        return !looks_matched(&r.body);
     }
     if !(200..300).contains(&r.http) { return false; }
     let Ok(body) = serde_json::from_str::<serde_json::Value>(&r.body) else {
@@ -206,6 +209,16 @@ mod tests {
             body: body.into(),
             ms,
         }
+    }
+    #[test]
+    fn a_400_that_echoes_a_matched_body_is_not_proven_rejection() {
+        let row = PathResult {
+            path: "edge".into(), http: 400, body:
+            r#"{"status":"matched","success":true,"takingAmount":"9"}"#.into(),
+            ms: 1.0,
+        };
+        assert!(!definitive_refusal(&row));
+        assert!(matches!(resolve_with_expected(&[row], 1), Outcome::Ambiguous { .. }));
     }
     #[test]
     fn a_LONE_MATCH_resolves_without_its_siblings() {
