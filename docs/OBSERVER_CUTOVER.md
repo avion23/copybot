@@ -58,6 +58,53 @@ one serialized background audit worker. No trading key is used.
   legacy sensor services/timers; explicit stop/disable is still required
   for a reliable boot-time cutover.
 
+## Offline preflight — no service changes
+
+Before considering a cutover, the staged unit inventory can be checked without
+contacting the host's service manager or reading `copybot.env`:
+
+```sh
+python3 deploy/observer/preflight.py --phase staged --unit-dir deploy
+```
+
+The output must report `status=OFFLINE_SNAPSHOT_PASS`, `errors=[]`, and
+`live_parity=UNKNOWN`. This **only** checks the checked-in service contracts:
+all seven legacy conflicts, execution user, signing-key exclusion, permissions,
+network order and legacy timer intervals.
+
+For the later `ready` (old units stopped, new Observer not yet started)
+and `cutover` (old units stopped, new Observer started) phases, an operator
+must explicitly supply a **real**, recently collected (at most five minutes
+old) JSON snapshot containing `captured_at` (Unix seconds),
+`source="operator-collected-systemctl"`, and exactly nine entries in
+`units`. Each entry must have the service-manager's actual `active`
+(`active`, `inactive` or `failed`, etc.) and `unit_file`
+(`enabled`, `disabled`, `static`, etc.) strings. The nine units are:
+`copybot-observer.service`, `copybot-hot.service`, all four legacy
+Guardian/watcher/fillwatch/buywatch services, and all three
+Guardian/fillwatch/buywatch timers. No secrets belong in the snapshot.
+
+An explicitly authorized operator can then run, **as the intended service
+user**, from the staged deployment directory (not from this migration task):
+
+```sh
+python3 deploy/observer/preflight.py --phase ready --unit-dir deploy \
+  --state-snapshot /path/to/operator-collected-service-states.json \
+  --run-dir /opt/copybot/run
+# After an explicitly authorized systemd cutover and fresh state collection:
+python3 deploy/observer/preflight.py --phase cutover --unit-dir deploy \
+  --state-snapshot /path/to/new-service-states.json \
+  --run-dir /opt/copybot/run
+```
+
+The checker **does not** collect, authenticate, or modify those unit states.
+It verifies the supplied evidence, the expected engine state, and read-only
+run-directory/owner-lock metadata, and refuses stale, missing or
+contradictory snapshots. Even a passing supplied snapshot reports
+`live_parity=UNKNOWN`; actual feed coverage, provider delivery, halt
+accuracy, order safety and operating equivalence require separate authorized
+observations. Do not fabricate unit-state evidence to satisfy the gate.
+
 ## Explicit operator cutover, on a deployment host only
 
 Do **not** run the following during offline migration or until evidence
