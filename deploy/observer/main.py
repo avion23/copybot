@@ -18,8 +18,10 @@ if _DEPLOY not in sys.path:
     sys.path.insert(0, _DEPLOY)
 
 import corroborate
+import notify
 from observer.adapters import AUDITS, AuditResult
 from observer.alerts import ObservationJournal, AlertRouter
+from observer.delivery import NotificationDelivery
 from observer.lease import ObserverLease
 
 
@@ -156,7 +158,11 @@ def main(argv=None):
     path = Path(bot_dir) / "run" / "observer.owner.lock"
     with ObserverLease(path):
         journal_path = Path(bot_dir) / "run" / "observer_observations.jsonl"
-        with ObservationJournal(journal_path) as journal:
+        delivery_path = Path(bot_dir) / "run" / "observer_notifications.jsonl"
+        with ObservationJournal(journal_path) as journal, NotificationDelivery(
+            delivery_path, notify._send_direct,
+            source=corroborate.current_sensor_source,
+        ) as notifications:
             alerts = AlertRouter(
                 Path(bot_dir) / "run",
                 watcher_path=watcher.ALERTS_PATH,
@@ -166,6 +172,7 @@ def main(argv=None):
             previous_watcher = watcher.configure_alert_sink(alerts.record)
             previous_fillwatch = fillwatch.configure_alert_sink(alerts.record)
             previous_buywatch = buywatch.configure_alert_sink(alerts.record)
+            previous_notify = notify.configure_send_sink(notifications.send)
             try:
                 owner = ObserverScheduler(watcher.WatchSession(45))
                 try:
@@ -176,6 +183,7 @@ def main(argv=None):
                 finally:
                     owner.close()
             finally:
+                notify.configure_send_sink(previous_notify)
                 buywatch.configure_alert_sink(previous_buywatch)
                 fillwatch.configure_alert_sink(previous_fillwatch)
                 watcher.configure_alert_sink(previous_watcher)

@@ -6,6 +6,18 @@ import urllib.request
 API = 'https://api.resend.com/emails'
 TIMEOUT_SECS = 8
 ALERT_TZ = os.environ.get('ALERT_TZ', 'America/Los_Angeles')
+_SEND_SINK = None
+
+
+def configure_send_sink(sink):
+    """Install the single Observer's notification writer, opt-in only."""
+    global _SEND_SINK
+    if sink is not None and not callable(sink):
+        raise TypeError('notification sink must be callable')
+    previous = _SEND_SINK
+    _SEND_SINK = sink
+    return previous
+
 
 def local_stamp(t=None):
     t = time.time() if t is None else t
@@ -31,6 +43,13 @@ def why_not_configured():
     return 'missing %s' % ', '.join(missing) if missing else ''
 
 def send(subject, text, log=print):
+    """Preserve the legacy API; Observer delivery is serialized if enabled."""
+    if _SEND_SINK is not None:
+        return _SEND_SINK(subject, text, log=log)
+    return _send_direct(subject, text, log=log)
+
+
+def _send_direct(subject, text, log=print):
     key, to, frm = _cfg()
     if not (key and to):
         log('  ALERT NOT SENT (%s): %s' % (why_not_configured(), subject))

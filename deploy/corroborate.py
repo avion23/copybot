@@ -98,6 +98,11 @@ def configure_observation_sink(sink):
     return previous
 
 
+def current_sensor_source():
+    """Source for the single Observer notification/evidence owner."""
+    return getattr(_SENSOR, "source", None)
+
+
 @contextmanager
 def sensor_source(name):
     """Thread-local provenance for Guardian, watcher and fillwatch evidence."""
