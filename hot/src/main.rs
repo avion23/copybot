@@ -3194,44 +3194,7 @@ positions); still disarmed, arm it in the operator file",
         });
     }
     if live {
-        let gate = control.lock().unwrap().guardian_stale.clone();
-        let gpath = std::path::Path::new(&root.bot.control_path)
-            .parent()
-            .map(|d| d.join("guardian_state.json"))
-            .unwrap_or_else(|| std::path::PathBuf::from("run/guardian_state.json"));
-        eprintln!(
-            "[guardwatch] watching {} (buys gate after {}s without a completed                    guardian pass; exits are never gated)",
-            gpath.display(), copybot_hot::guardwatch::MAX_AGE_SECS
-        );
-        tokio::spawn(async move {
-            let mut w = copybot_hot::guardwatch::Watch::new(
-                copybot_hot::ledger::now_secs(),
-            );
-            let mut tick = tokio::time::interval(Duration::from_secs(15));
-            let mut was_gated = false;
-            let mut warned_unarmed = false;
-            loop {
-                tick.tick().await;
-                let mtime = std::fs::metadata(&gpath)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64);
-                let v = w.observe(mtime, copybot_hot::ledger::now_secs());
-                let gated = v.buys_gated();
-                gate.store(gated, Ordering::Relaxed);
-                if gated != was_gated {
-                    eprintln!("[guardwatch] {}", v.describe());
-                    was_gated = gated;
-                }
-                if matches!(v, copybot_hot::guardwatch::Verdict::Warmup { .. })
-                    && !warned_unarmed
-                {
-                    eprintln!("[guardwatch] {}", v.describe());
-                    warned_unarmed = true;
-                }
-            }
-        });
+        runtime::control::spawn_guardian_liveness(&control, &root.bot.control_path);
     }
     if live {
         runtime::reconcile::spawn_reanchor(&control, &router, &emitter, &registry, &reanchor_pulse);

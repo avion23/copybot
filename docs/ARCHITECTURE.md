@@ -310,6 +310,10 @@ The 300-second leader position reanchor worker has moved from `main.rs` into the
 
 `reanchor::plan_complete_snapshot` is a pure, all-or-error boundary: the shared `position_evidence::complete_balances` parser rejects truncated/unavailable pages and missing, malformed or duplicate asset/size rows *before* a single modeled balance is changed. The periodic caller uses the typed `PositionError`: it emits `reanchor_unavailable`, skips the entire tick, and retains its previous holdings, leader book and last-complete pulse on error rather than treating a malformed row as absent. A complete valid empty snapshot is still permitted; the existing planner refuses zeroing tokens with follower holdings. The reanchor HTTP client now refuses initialization on a build error rather than losing its 30-second timeout to a default client. This changes only error/refusal behavior at the reanchor input edge. The standalone evidence probe covers 15 constructed valid/error cases without live network calls, in addition to the existing locked regression gates; market sample count remains zero.
 
+### A3: guardian heartbeat buy gate (COPYBOT-3)
+
+The Guardian liveness watcher moved from the binary into `runtime::control::spawn_guardian_liveness`, preserving its original live-only startup, Guardian-state path, 15-second interval, warmup warning and `guardian_stale` atomic buy gate. The binary passes the existing `Control` and control-file path explicitly, and the task retains all state within one spawned worker; no second halt writer or watcher process was introduced. `main.rs` shrinks from 4,652 to 4,615 lines and `runtime/control.rs` grows from 106 to 151. This A3 extraction does not claim a unified A5 Observer, change alert thresholds or alter any exit behavior.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
