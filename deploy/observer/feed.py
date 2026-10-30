@@ -1,4 +1,3 @@
-import argparse
 import base64
 import collections
 import json
@@ -42,8 +41,6 @@ his_fills = collections.deque(maxlen=FILLS_MAX)
 fills_dropped = 0
 _dropped_alerted = 0
 lock = threading.Lock()
-ALERTS_PATH = os.environ.get('WATCHER_ALERTS', os.path.join(BOT_DIR, 'run', 'watcher_alerts.jsonl'))
-_alert_seq = [0]
 _ALERT_SINK = None
 
 
@@ -58,21 +55,12 @@ def configure_alert_sink(sink):
 
 
 def append_alert(level, kind, msg, lanes=None):
-    _alert_seq[0] += 1
-    row = {'seq': _alert_seq[0], 't': time.time(), 'level': level, 'kind': kind, 'msg': msg}
+    row = {'t': time.time(), 'level': level, 'kind': kind, 'msg': msg}
     if lanes:
         row['lanes'] = sorted({str(x) for x in lanes if x})
-    if _ALERT_SINK is not None:
-        _ALERT_SINK('watcher', row)
-        return
-    try:
-        os.makedirs(os.path.dirname(ALERTS_PATH), exist_ok=True)
-        with open(ALERTS_PATH, 'a') as f:
-            f.write(json.dumps(row) + '\n')
-            f.flush()
-            os.fsync(f.fileno())
-    except OSError as e:
-        print('%s [WARN] cannot persist alert to %s: %s' % (time.strftime('%H:%M:%S'), ALERTS_PATH, e), flush=True)
+    if _ALERT_SINK is None:
+        raise RuntimeError('Observer alert router is not configured')
+    _ALERT_SINK('watcher', row)
 
 def recv_exact(s, n):
     buf = b''
@@ -752,22 +740,3 @@ class WatchSession:
                 write_heartbeat(who, problem)
             except OSError as e:
                 self.alert('CRITICAL', 'HEARTBEAT', f'cannot persist watcher heartbeat: {e}')
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--grace', type=int, default=45, help='seconds to allow between his fill and our fire')
-    ap.add_argument('--once', action='store_true')
-    a = ap.parse_args()
-    session = WatchSession(a.grace)
-    session.start()
-    if a.once:
-        time.sleep(a.grace + 15)
-        session.poll(propagate_heartbeat_errors=True)
-        return session.worst
-    while True:
-        time.sleep(15)
-        session.poll()
-if __name__ == '__main__':
-    from observer.lease import legacy_entrypoint
-    sys.exit(legacy_entrypoint(main, 'watcher', BOT_DIR, 2))

@@ -1,4 +1,3 @@
-import argparse
 import collections
 from contextvars import ContextVar
 import glob
@@ -24,7 +23,7 @@ from guardian_diagnostics import (
 )
 from guardian_foreign_writer import FOREIGN_PAGE_LIMIT, FOREIGN_EVERY_SECS, foreign_writer_check
 from guardian_watcher_evidence import (
-    event_ts, recent_fires, read_new_lines, read_new_alerts,
+    event_ts, recent_fires,
     reconnect_trend, resumable_halt, plan_resume, stale_halts, human_secs,
     check_watcher_criticals, scoped_lanes_from_marker, critical_scope,
     watcher_health_issues, reverse_lines,
@@ -37,6 +36,7 @@ from guardian_checks import (
     conservation_breaches, net_chain_for_lane, check_share_drift,
     check_fire_patterns, worthless_orphan, check_unattributed,
 )
+from observer.alerts import read_alerts
 import resolution
 import scorecard
 import preflight
@@ -56,11 +56,8 @@ WINDOW_SECS = 15 * 60
 FRONTEND_LEDGER_TOLERANCE_USD = 0.011
 GUARDIAN_DIR = os.path.join(BOT_DIR, 'run')
 STATE_PATH = os.path.join(GUARDIAN_DIR, 'guardian_state.json')
-LOG_PATH = os.path.join(GUARDIAN_DIR, 'guardian.log')
-WATCHER_LOG = os.path.join(GUARDIAN_DIR, 'watcher.log')
 WATCHER_HEARTBEAT = os.path.join(GUARDIAN_DIR, 'watcher_heartbeat.json')
-WATCHER_ALERTS = os.path.join(GUARDIAN_DIR, 'watcher_alerts.jsonl')
-BUYWATCH_ALERTS = os.path.join(BOT_DIR, 'run', 'buywatch_alerts.jsonl')
+OBSERVATIONS = os.path.join(GUARDIAN_DIR, 'observer_observations.jsonl')
 UNATTRIBUTED_ALLOW = {t.strip() for t in os.environ.get('GUARDIAN_UNATTRIBUTED_ALLOW', '').split(',') if t.strip()}
 CONFIRM_REQUIRED_CHECKS = 2
 GUARDIAN_PERIOD_SECS = 11
@@ -70,12 +67,6 @@ CONFIRM_PATH = os.path.join(GUARDIAN_DIR, 'guardian_confirmation.json')
 def log(msg):
     line = '%s %s' % (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), msg)
     print(line, flush=True)
-    try:
-        os.makedirs(GUARDIAN_DIR, exist_ok=True)
-        with open(LOG_PATH, 'a') as f:
-            f.write(line + '\n')
-    except OSError as e:
-        print('GUARDIAN LOG WRITE FAILED: %s' % e, file=sys.stderr, flush=True)
 
 def http_json(url, headers=None, timeout=20):
     req = urllib.request.Request(url, headers=headers or {'User-Agent': 'guardian'})
@@ -188,10 +179,8 @@ def find_armed():
     if wanted:
         return ('DEAD', BOT_DIR, wanted, None)
     return (None, None, None, None)
-_ALLOW_ERROR_LOG = True
-
 def record_error(lane, kind, detail):
-    return append_error(lane, kind, detail, os.path.join(BOT_DIR, 'run', 'errors.jsonl'), _ALLOW_ERROR_LOG)
+    return append_error(lane, kind, detail, os.path.join(BOT_DIR, 'run', 'errors.jsonl'), True)
 ADVISORY_STATE_PATH = os.path.join(GUARDIAN_DIR, 'guardian_advisories.json')
 
 EQUITY_HISTORY_PATH = os.path.join(BOT_DIR, 'run', 'equity_history.jsonl')
@@ -472,83 +461,44 @@ CHAIN_BLIND_WARN_RUNS = 20
 _OBSERVER_FULL_AUDIT = ContextVar("guardian_observer_full_audit", default=None)
 
 def process_watcher_criticals(state, dry_run):
-    immediate = []
-    prev_offset = state.get('watcher_offset')
-    new_lines, new_offset = read_new_lines(WATCHER_LOG, prev_offset)
-    prev_seq = state.get('watcher_alert_seq')
-    alert_lines, new_seq = read_new_alerts(WATCHER_ALERTS, prev_seq, log)
-    _ok, r = check_watcher_criticals(new_lines + alert_lines)
-    watcher_reasons = list(r)
-    halted_ok = True
-    if watcher_reasons:
-        scope = critical_scope(watcher_reasons, all_lane_names())
-        halted_ok = halt_buy_lanes(scope, '; '.join(watcher_reasons), dry_run)
-    if halted_ok:
-        state['watcher_offset'] = new_offset
-        state['watcher_alert_seq'] = new_seq
-    else:
-        state['watcher_offset'] = prev_offset
-        state['watcher_alert_seq'] = prev_seq
-        immediate.append('watcher CRITICAL could not be acted on (the operator file could not be written) — the alert is DELIBERATELY UNCONSUMED so the next run retries it')
-    return (immediate, bool(watcher_reasons))
+    """Consume watcher/fill alerts from the one journal, advancing on success."""
+    prior = state.get('observer_alert_cursor', 0)
+    rows, hi = read_alerts(OBSERVATIONS, prior)
+    lines = [r['reason'] for r in rows if r['source'].split(':')[1]
+             in ('watcher', 'fillwatch')]
+    _ok, reasons = check_watcher_criticals(lines)
+    if reasons:
+        scope = critical_scope(reasons, all_lane_names())
+        if not halt_buy_lanes(scope, '; '.join(reasons), dry_run):
+            return (['Observer CRITICAL halt request failed; alert remains unconsumed'], True)
+    state['observer_alert_cursor'] = hi
+    return ([], bool(reasons))
 
 def check_buywatch_alerts(state, now, log=None):
     log = log or globals()['log']
-    last_t = int(state.get('buywatch_alert_t') or 0)
-    try:
-        with open(BUYWATCH_ALERTS) as f:
-            raw = f.readlines()
-    except FileNotFoundError:
-        return []
-    except OSError as e:
-        return ['buywatch alert sidecar unavailable: %s' % e]
-    fresh, hi = ([], last_t)
-    for line in raw:
-        try:
-            r = json.loads(line)
-        except ValueError:
-            continue
-        t = int(r.get('t') or 0)
-        if t <= last_t:
-            continue
-        hi = max(hi, t)
-        fresh.append(r)
-    if not fresh:
-        return []
-    msgs = []
-    for r in fresh[-5:]:
-        msgs.append('buywatch UNSEEN: %d leader buy(s) reached NO decision (lanes: %s) — the decode may be silent; check the feed and leader addresses' % (int(r.get('count') or 0), ','.join(r.get('lanes') or [])))
-    for m in msgs:
-        log('WARN: ' + m)
-    if notify.configured():
-        try:
-            notify.send('Abomination81 Copybot: buywatch UNSEEN leader buys', '\n'.join(msgs) + '\n\n(Nothing was halted — buywatch reports, a human decides.)\n' + notify.local_stamp(now) + '\n', log=log)
-        except Exception as e:
-            log('WARN: buywatch alert email failed: %r' % (e,))
-    state['buywatch_alert_t'] = hi
+    rows, hi = read_alerts(OBSERVATIONS, state.get('buywatch_alert_cursor', 0), source='buywatch')
+    msgs = ['buywatch UNSEEN: ' + r['reason'] for r in rows[-5:]]
+    for msg in msgs:
+        log('WARN: ' + msg)
+    if msgs and notify.configured():
+        notify.send('Abomination81 Copybot: unseen leader buys',
+                    '\n'.join(msgs) + '\n' + notify.local_stamp(now), log=log)
+    state['buywatch_alert_cursor'] = hi
     return msgs
 
 def baseline_watcher_log():
-    state = {}
     try:
         with open(STATE_PATH) as f:
             state = json.load(f)
     except (OSError, ValueError):
-        pass
+        state = {}
     try:
-        size = os.path.getsize(WATCHER_LOG)
-        state['watcher_offset'] = size
-        os.makedirs(GUARDIAN_DIR, exist_ok=True)
-        tmp = tmp_path(STATE_PATH)
-        with open(tmp, 'w') as f:
-            json.dump(state, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, STATE_PATH)
-        fsync_parent(STATE_PATH)
-        return None
-    except OSError as e:
-        return 'cannot baseline watcher log while disarmed: %s' % e
+        _, hi = read_alerts(OBSERVATIONS)
+        state['observer_alert_cursor'] = hi
+        state['buywatch_alert_cursor'] = hi
+        return None if save_guardian_state(state, STATE_PATH, log) else 'cannot persist Guardian cursor'
+    except (OSError, ValueError) as error:
+        return 'cannot baseline Observer alerts: %s' % error
 
 def gather_and_check(dry_run):
     port, bot_dir, active_lanes, st = find_armed()
@@ -940,37 +890,3 @@ def gather_and_check(dry_run):
     _OBSERVER_FULL_AUDIT.set(persisted is True)
     log('PASS: armed_slot=%d lanes=%d %s' % (port, len(lane_summaries), detail))
     return 0
-
-def redirect_state_for_dry_run():
-    global STATE_PATH, CONFIRM_PATH, LOG_PATH, _ALLOW_ERROR_LOG
-    _ALLOW_ERROR_LOG = False
-    for live, name in ((STATE_PATH, 'STATE_PATH'), (CONFIRM_PATH, 'CONFIRM_PATH')):
-        shadow = live + '.dryrun'
-        try:
-            if os.path.exists(live):
-                with open(live) as src, open(shadow, 'w') as dst:
-                    dst.write(src.read())
-            elif os.path.exists(shadow):
-                os.unlink(shadow)
-        except OSError:
-            pass
-        globals()[name] = shadow
-    LOG_PATH = LOG_PATH + '.dryrun'
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--once', action='store_true', help='ignored; guardian always runs once per invocation')
-    ap.add_argument('--dry-run', action='store_true')
-    a = ap.parse_args()
-    if a.dry_run:
-        redirect_state_for_dry_run()
-    try:
-        return gather_and_check(a.dry_run)
-    except Exception as e:
-        log('GUARDIAN ITSELF FAILED: %s — disarming out of caution' % e)
-        if not a.dry_run:
-            disarm_all('guardian crashed: %s' % e, dry_run=False)
-        return 3
-if __name__ == '__main__':
-    from observer.lease import legacy_entrypoint
-    sys.exit(legacy_entrypoint(main, 'guardian', BOT_DIR, 3))

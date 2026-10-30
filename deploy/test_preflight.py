@@ -98,5 +98,55 @@ class RunTests(unittest.TestCase):
         for s in P.SENSORS:
             self.assertTrue(s.alarm and s.why, '%s has no stated purpose' % s.name)
             self.assertTrue(s.source or s.intersects, '%s checks nothing' % s.name)
+class ObserverOneOwnerTests(unittest.TestCase):
+    def test_unit_inventory_has_only_one_observer(self):
+        from observer.preflight import check_unit_inventory
+        self.assertEqual(check_unit_inventory(os.path.dirname(__file__)), [])
+
+    def test_local_dry_journal_is_unverifiable_without_independent_sources(self):
+        from observer.checks import Snapshot, Source, Verdict, evaluate
+        result = evaluate(Snapshot(now=123.0, events=()))
+        self.assertEqual({x.source for x in result}, set(Source))
+        self.assertTrue(all(x.verdict == Verdict.UNVERIFIABLE for x in result))
+
+    def test_all_constructed_fault_categories_are_observed(self):
+        from observer.checks import evaluate, Verdict
+        from observer.offline import EXPECTED_FAULTS, constructed_faults
+        result = evaluate(constructed_faults((), 1000.0))
+        self.assertEqual({x.code for x in result if x.verdict == Verdict.ALERT},
+                         EXPECTED_FAULTS)
+
+    def test_one_health_receipt_tracks_all_four_sensor_completions(self):
+        import tempfile
+        from observer.health import ObserverHealth
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, 'observer_health.json')
+            health = ObserverHealth(path, output=lambda _: None)
+            health.record({'ev': 'observer_started', 'observed_at': 10.0})
+            for source in ('watcher', 'guardian', 'fillwatch', 'buywatch'):
+                health.record({'ev': 'observer_audit', 'source': source,
+                               'status': 'UNVERIFIABLE', 'exit_code': 3,
+                               'observed_at': 11.0})
+            self.assertEqual(len(health.snapshot()['audits']), 4)
+            with open(path) as stream:
+                receipt = __import__('json').load(stream)
+            self.assertEqual(set(receipt['audits']),
+                             {'watcher', 'guardian', 'fillwatch', 'buywatch'})
+
+    def test_single_alert_router_commits_to_observation_journal_only(self):
+        import tempfile
+        from observer.alerts import AlertRouter, ObservationJournal, read_alerts
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'observer_observations.jsonl')
+            with ObservationJournal(path) as journal:
+                router = AlertRouter(journal, error_path=os.path.join(tmp, 'errors.jsonl'))
+                router.emit('watcher', 10.0, 'CRITICAL', 'MISS',
+                            'synthetic leader fill missed', ['lane'])
+            rows, count = read_alerts(path, after=0, source='watcher')
+            self.assertEqual(count, os.path.getsize(path))
+            self.assertEqual(rows[0]['source'], 'alert:watcher:MISS')
+            self.assertEqual(rows[0]['lane'], 'lane')
+            self.assertEqual(os.listdir(tmp), ['observer_observations.jsonl'])
+
 if __name__ == '__main__':
     unittest.main()

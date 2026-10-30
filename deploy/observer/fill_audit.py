@@ -1,4 +1,3 @@
-import argparse
 from contextlib import closing
 import http.client
 import json
@@ -11,9 +10,6 @@ import corroborate
 BOT_DIR = os.environ.get('BOT_DIR', '/opt/copybot')
 BOT_PORT = int(os.environ.get('BOT_PORT', '8807'))
 RUN_DIR = os.path.join(BOT_DIR, 'run')
-STATE_PATH = os.path.join(RUN_DIR, 'fillwatch_state.json')
-LOG_PATH = os.path.join(RUN_DIR, 'fillwatch.log')
-ALERTS_PATH = os.environ.get('WATCHER_ALERTS', os.path.join(RUN_DIR, 'watcher_alerts.jsonl'))
 RPC = os.environ.get('FILLWATCH_RPC', 'https://polygon.drpc.org')
 CHUNK_BLOCKS = int(os.environ.get('FILLWATCH_CHUNK', '100'))
 UA = 'Mozilla/5.0 (X11; Linux aarch64) fillwatch/1.0'
@@ -51,12 +47,6 @@ DUST_USD = float(os.environ.get('FILLWATCH_DUST_USD', str(corroborate.STRANDED_M
 def log(msg):
     line = '%s %s' % (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), msg)
     print(line, flush=True)
-    try:
-        os.makedirs(RUN_DIR, exist_ok=True)
-        with open(LOG_PATH, 'a') as f:
-            f.write(line + '\n')
-    except OSError:
-        pass
 
 class Unverifiable(Exception):
     pass
@@ -257,31 +247,12 @@ def configure_alert_sink(sink):
 
 
 def record_alert(kind, msg):
-    if _ALERT_SINK is not None:
-        _ALERT_SINK('fillwatch', {
-            't': time.time(), 'level': 'CRITICAL',
-            'kind': kind, 'msg': msg, 'src': 'fillwatch',
-        })
-        return
-    seq = 0
-    try:
-        with open(ALERTS_PATH) as f:
-            for line in f:
-                try:
-                    seq = max(seq, int(json.loads(line).get('seq') or 0))
-                except ValueError:
-                    continue
-    except OSError:
-        pass
-    row = {'seq': seq + 1, 't': time.time(), 'level': 'CRITICAL', 'kind': kind, 'msg': msg, 'src': 'fillwatch'}
-    try:
-        os.makedirs(RUN_DIR, exist_ok=True)
-        with open(ALERTS_PATH, 'a') as f:
-            f.write(json.dumps(row) + '\n')
-            f.flush()
-            os.fsync(f.fileno())
-    except OSError as e:
-        log('  WARN: cannot persist alert: %s' % e)
+    if _ALERT_SINK is None:
+        raise RuntimeError('Observer alert router is not configured')
+    _ALERT_SINK('fillwatch', {
+        't': time.time(), 'level': 'CRITICAL',
+        'kind': kind, 'msg': msg, 'src': 'fillwatch',
+    })
 
 def stranded_ctx(marks):
     funder = os.environ.get('FILLWATCH_FUNDER', '').lower() or None
@@ -435,21 +406,3 @@ def run(window_secs, dry_run):
         log('⛔ halt was attempted but Observer alert persistence failed — this pass is UNVERIFIABLE and will retry')
         return 2
     return 1
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--once', action='store_true', help='ignored; always one pass')
-    ap.add_argument('--dry-run', action='store_true')
-    ap.add_argument('--window-secs', type=int, default=WINDOW_SECS)
-    a = ap.parse_args()
-    try:
-        return run(a.window_secs, a.dry_run)
-    except Unverifiable as e:
-        log('UNVERIFIED (no conclusion drawn, nothing halted): %s' % e)
-        return 2
-    except Exception as e:
-        log('FILLWATCH ITSELF FAILED: %r — nothing halted' % e)
-        return 2
-if __name__ == '__main__':
-    from observer.lease import legacy_entrypoint
-    sys.exit(legacy_entrypoint(main, 'fillwatch', BOT_DIR, 2))

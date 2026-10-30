@@ -4,7 +4,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
-import watcher
+from observer import feed as watcher
 
 class WatcherSafetyTests(unittest.TestCase):
 

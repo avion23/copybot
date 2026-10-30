@@ -54,9 +54,49 @@ sudo systemctl is-active copybot-hot.service
 <li>Intended mode and lane state; startup can restore existing operator intent.</li>
 <li>Ledger/custody agreement and unresolved or ambiguous execution.</li>
 <li>Correct funding basis before interpreting P&amp;L.</li>
-<li>Guardian and watcher journals, notification delivery, and writable state paths.</li>
+<li>Observer observation journal (<code>run/observer_observations.jsonl</code>), health receipt (<code>run/observer_health.json</code>), audited notification delivery (<code>run/observer_notifications.jsonl</code>), and writable state paths.</li>
 <li>Venue-resting orders independently of dashboard connection status.</li>
 </ul>
+<h2>One Observer: local mode=dry</h2>
+<p>The four standalone monitoring CLIs (<code>guardian.py</code>, <code>watcher.py</code>, <code>fillwatch.py</code>, <code>buywatch.py</code>), their four services and three timers have been removed. The sole Observer entrypoint is <code>deploy/observer/main.py</code>; <code>deploy/copybot-observer.service</code> is a template, not enabled or installed by this repository change. Its <strong>one persistent process</strong> polls the fill feed every 15 s and serializes Guardian (first at 30 s, then 11 s after each completion), fillwatch (first 300 s, then every 900 s), and buywatch (first 420 s, then every 900 s). It retains the original source-grade RPC, feed, ledger and risk-audit kernels. A failing or stale external source is not a clean PASS. Observer does not require <code>PRIVATE_KEY</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>Independent evidence</th>
+<th>Cadence / alert channel</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Runtime/dead arm intent; feed freshness, decoding, dropped fill, unmatched leader fill, rejected orders, Guardian audit liveness</td>
+<td>Operator intent, engine event journal, leader fill WebSocket, runtime status, observer health</td>
+<td>15 s / Observer journal and notification sink</td>
+</tr>
+<tr>
+<td>Signal guard, ledger/chain/custody drift, foreign writer, fire-pattern caps, operator changes, stale halts, alert escalation and audit preflight</td>
+<td>Runtime dashboard, ledger, chain positions, operator state, observation journal</td>
+<td>11 s after prior audit / Observer journal, authenticated halt capability, notification sink</td>
+</tr>
+<tr>
+<td>Missed leader exits and follower purchases without a leader fill</td>
+<td>CTF transfer logs, independently queried leader balances, follower positions</td>
+<td>900 s after audit / Observer journal and conservative authenticated buy halt</td>
+</tr>
+<tr>
+<td>Leader purchases unseen by copybot decision journal</td>
+<td>CTF transfers, durable <code>fire</code>/<code>skip</code>/<code>signal_guard_skip</code> events</td>
+<td>900 s after audit / Observer journal, notification sink; no halt</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Local journal-only verification</strong> (no network, no order API, and no writes to the dry-run instance):</p>
+<pre><code class="language-sh">mkdir -p /home/admin/worktrees/copybot-evidence/COPYBOT-A5/{baseline,fault}
+python3 deploy/observer/main.py --dry-offline-events /home/admin/worktrees/copybot-dryrun-s1/data --output-dir /home/admin/worktrees/copybot-evidence/COPYBOT-A5/baseline
+python3 deploy/observer/main.py --dry-offline-events /home/admin/worktrees/copybot-dryrun-s1/data --output-dir /home/admin/worktrees/copybot-evidence/COPYBOT-A5/fault --fault-fixture
+python3 deploy/observer/preflight.py --unit-dir deploy
+</code></pre>
+<p>The first run reads the existing engine journal and reports <code>UNVERIFIABLE</code> for missing chain, watcher and fill evidence; it must not call these absent observations healthy. The second deliberately injects <strong>synthetic</strong> stale feed, lost fills, reject, unacknowledged armed intent, duplicate inventory, drift, missed exit, unattributed purchase and unseen leader buy. Do not mistake these generated alerts for real incidents. The local runs save only to the explicitly chosen evidence directory. The persistent Observer is <strong>not</strong> started by these commands; do not start a live service or modify a funded operator state to test monitoring.</p>
 <p>Engine logs go to journald through the service template. Configure bounded journal retention on the host. The provided logrotate template covers file-based observer logs; adjust paths before installing it. Never commit logs, screenshots, backup archives, or portfolio exports to report a bug. Use a synthetic reproduction.</p>
 </article></main>
 <footer class="wrap"><a href="index.html">Abomination81 Copybot</a><span>Independent software. Not affiliated with Polymarket.</span><a href="https://x.com/Abomination81">X @Abomination81 ↗</a></footer></body></html>

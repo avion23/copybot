@@ -1,13 +1,8 @@
-"""One cross-process Observer/legacy sensor lease; no network or credentials.
-
-The new Observer takes an exclusive lock. Legacy sensors take shared locks,
-allowing the old independent schedules to coexist until explicit cutover.
-"""
+"""One exclusive Observer-owner lease; no other monitoring process exists."""
 import fcntl
 import os
 from pathlib import Path
 import stat
-import sys
 
 
 def owner_lock_path(bot_dir):
@@ -66,27 +61,3 @@ class _Lease:
 class ObserverLease(_Lease):
     """Exclusive single-Observer process owner."""
     _mode = fcntl.LOCK_EX
-
-
-class LegacyLease(_Lease):
-    """Shared legacy-script lease; incompatible with active Observer."""
-    _mode = fcntl.LOCK_SH
-
-
-def legacy_entrypoint(entrypoint, source, bot_dir, unavailable_exit):
-    """Refuse a CLI monitor if the new Observer currently owns the lock.
-
-    Does not catch exceptions inside the audit: legacy fail-closed handling
-    and exit codes stay owned by the original entrypoint.
-    """
-    lease = LegacyLease(owner_lock_path(bot_dir))
-    try:
-        lease.acquire()
-    except (OSError, RuntimeError) as error:
-        print("%s UNVERIFIABLE: observer owner active or lease unavailable (%s)" %
-              (source, type(error).__name__), file=sys.stderr, flush=True)
-        return unavailable_exit
-    try:
-        return entrypoint() or 0
-    finally:
-        lease.close()

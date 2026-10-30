@@ -1,15 +1,12 @@
 import json
 import os
-import sys
 import time
 import glob
 import collections
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import fillwatch as fw
+from observer import fill_audit as fw
 BOT_DIR = os.environ.get('BOT_DIR', '/opt/copybot')
 WINDOW_SECS = int(os.environ.get('BUYWATCH_WINDOW', '1260'))
 JOIN_SECS = int(os.environ.get('BUYWATCH_JOIN', '900'))
-ALERT_PATH = os.path.join(BOT_DIR, 'run', 'buywatch_alerts.jsonl')
 _ALERT_SINK = None
 
 
@@ -24,15 +21,9 @@ def configure_alert_sink(sink):
 
 
 def record_unseen_alert(record):
-    if _ALERT_SINK is not None:
-        _ALERT_SINK('buywatch', record)
-        return
-    try:
-        os.makedirs(os.path.dirname(ALERT_PATH), exist_ok=True)
-        with open(ALERT_PATH, 'a') as f:
-            f.write(json.dumps(record) + '\n')
-    except OSError as error:
-        log('could not write the alert file: %s' % error)
+    if _ALERT_SINK is None:
+        raise RuntimeError('Observer alert router is not configured')
+    _ALERT_SINK('buywatch', record)
 
 
 def log(msg):
@@ -162,22 +153,3 @@ def run(window_secs, dry_run=False):
         return 1
     log('PASS: every leader buy in the window reached a decision')
     return 0
-
-def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--once', action='store_true', help='ignored; always one pass')
-    ap.add_argument('--dry-run', action='store_true')
-    ap.add_argument('--window-secs', type=int, default=WINDOW_SECS)
-    a = ap.parse_args()
-    try:
-        return run(a.window_secs, a.dry_run)
-    except fw.Unverifiable as e:
-        log('UNVERIFIED (nothing halted, nothing concluded): %s' % e)
-        return 3
-    except Exception as e:
-        log('BUYWATCH ITSELF FAILED: %r — nothing halted' % (e,))
-        return 3
-if __name__ == '__main__':
-    from observer.lease import legacy_entrypoint
-    sys.exit(legacy_entrypoint(main, 'buywatch', BOT_DIR, 3))

@@ -32,6 +32,7 @@ class ObserverHealth:
             "owner_state": "INIT",
             "started_at": None,
             "guardian": None,
+            "audits": {},
             "updated_at": time.time(),
         }
         self._persist()
@@ -99,6 +100,7 @@ class ObserverHealth:
                     self._state["owner_state"] = "STARTED"
                     self._state["started_at"] = stamp
                     self._state["guardian"] = None
+                    self._state["audits"] = {}
                 elif kind == "observer_stopping":
                     if self._state["owner_state"] != "STARTED":
                         raise RuntimeError("Observer cannot stop without starting")
@@ -108,17 +110,18 @@ class ObserverHealth:
                         raise RuntimeError("audit cannot complete outside active Observer")
                     if stamp < self._state["started_at"]:
                         raise ValueError("audit result predates current owner process")
-                    if event.get("source") == "guardian":
-                        status = event.get("status")
-                        code = event.get("exit_code")
-                        if (status not in ("PASS", "ALERT", "UNVERIFIABLE")
-                                or type(code) is not int):
-                            raise ValueError("invalid Guardian audit completion status")
-                        self._state["guardian"] = {
-                            "completed_at": stamp,
-                            "status": status,
-                            "exit_code": code,
-                        }
+                    source = event.get("source")
+                    status = event.get("status")
+                    code = event.get("exit_code")
+                    if (source not in ("guardian", "watcher", "fillwatch", "buywatch")
+                            or status not in ("PASS", "ALERT", "UNVERIFIABLE")
+                            or type(code) is not int):
+                        raise ValueError("invalid Observer audit completion record")
+                    result = {"completed_at": stamp, "status": status,
+                              "exit_code": code}
+                    self._state["audits"][source] = result
+                    if source == "guardian":
+                        self._state["guardian"] = result
                 self._state["updated_at"] = stamp
                 self._persist()
             self.output(event)

@@ -68,7 +68,7 @@ class ObserverScheduler:
     """One watcher plus one serialized, never-overlapping audit worker."""
 
     def __init__(self, watcher, *, audits=None, executor=None,
-                 clock=None, report=None, cadences=None):
+                 clock=None, report=None, cadences=None, watch_health=None):
         self.watcher = watcher
         self.audits = AUDITS if audits is None else audits
         self.cadences = CADENCES if cadences is None else cadences
@@ -82,6 +82,9 @@ class ObserverScheduler:
         )
         self.clock = clock or time.monotonic
         self.report = report or report_event
+        if watch_health is not None and not callable(watch_health):
+            raise TypeError('watch health reader must be callable')
+        self.watch_health = watch_health
         self.started = False
         self.next_due = {}
         self.watch_due = None
@@ -132,6 +135,24 @@ class ObserverScheduler:
             try:
                 with corroborate.sensor_source("watcher"):
                     self.watcher.poll()
+                    if self.watch_health is not None:
+                        snapshot = self.watch_health()
+                        if not isinstance(snapshot, dict):
+                            raise ValueError('watcher health snapshot is not an object')
+                        if snapshot.get('connected') is not True or snapshot.get('useful') is not True:
+                            status, code = 'UNVERIFIABLE', 3
+                            reason = 'leader feed not independently verified useful'
+                        elif self.watcher.worst >= 2:
+                            status, code = 'ALERT', 2
+                            reason = 'watcher recorded a critical incident'
+                        else:
+                            status, code = 'PASS', 0
+                            reason = 'fresh decoded feed and watcher sweep completed'
+                        self.report({
+                            'ev': 'observer_audit', 'source': 'watcher',
+                            'status': status, 'exit_code': code, 'reason': reason,
+                            'observed_at': time.time(),
+                        })
             except Exception as error:
                 self.watcher.alert(
                     "CRITICAL", "OBSERVER",
@@ -172,14 +193,24 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="single-owner COPYBOT observer")
     parser.add_argument("--once", action="store_true",
                         help="not supported: this is a persistent owner, not an audit timer")
+    parser.add_argument("--dry-offline-events", type=Path,
+                        help="read local dry-run event journals without network or live service")
+    parser.add_argument("--output-dir", type=Path,
+                        help="existing local evidence directory, never the dry-run instance")
+    parser.add_argument("--fault-fixture", action="store_true",
+                        help="offline only: inject explicit synthetic monitoring faults")
     args = parser.parse_args(argv)
-    if args.once:
-        parser.error("one-shot audits are owned by the persistent Observer scheduler")
     # Monitoring never needs the order-signing key, even if the caller exported it.
     os.environ.pop("PRIVATE_KEY", None)
-    import watcher
-    import fillwatch
-    import buywatch
+    if args.dry_offline_events is not None:
+        if args.once or args.output_dir is None:
+            parser.error("offline observer requires an evidence output dir, not --once")
+        from observer.offline import run
+        return run(args.dry_offline_events, args.output_dir,
+                   fault_fixture=args.fault_fixture)
+    if args.once or args.output_dir is not None or args.fault_fixture:
+        parser.error("persistent Observer does not accept one-shot or offline-only options")
+    from observer import feed, fill_audit, buy_audit
     bot_dir = os.environ.get("BOT_DIR", "/opt/copybot")
     path = Path(bot_dir) / "run" / "observer.owner.lock"
     with ObserverLease(path):
@@ -190,25 +221,22 @@ def main(argv=None):
             delivery_path, notify._send_direct,
             source=corroborate.current_sensor_source,
         ) as notifications:
-            alerts = AlertRouter(
-                Path(bot_dir) / "run",
-                watcher_path=watcher.ALERTS_PATH,
-                buywatch_path=buywatch.ALERT_PATH,
-            )
+            alerts = AlertRouter(journal, error_path=Path(bot_dir) / "run" / "errors.jsonl")
             # Reset the previous process's health receipt while this new
             # process still holds the exclusive owner lock.
             health = ObserverHealth(health_path, output=report_event)
             previous = corroborate.configure_observation_sink(journal.record)
-            previous_watcher = watcher.configure_alert_sink(alerts.record)
-            previous_fillwatch = fillwatch.configure_alert_sink(alerts.record)
-            previous_buywatch = buywatch.configure_alert_sink(alerts.record)
+            previous_watcher = feed.configure_alert_sink(alerts.record)
+            previous_fillwatch = fill_audit.configure_alert_sink(alerts.record)
+            previous_buywatch = buy_audit.configure_alert_sink(alerts.record)
             previous_guardian = guardian_state_store.configure_error_sink(
                 alerts.record_guardian_error
             )
             previous_notify = notify.configure_send_sink(notifications.send)
             try:
                 owner = ObserverScheduler(
-                    watcher.WatchSession(45), report=health.record,
+                    feed.WatchSession(45), report=health.record,
+                    watch_health=feed.feed_snapshot,
                 )
                 with graceful_stop():
                     try:
@@ -231,9 +259,9 @@ def main(argv=None):
             finally:
                 notify.configure_send_sink(previous_notify)
                 guardian_state_store.configure_error_sink(previous_guardian)
-                buywatch.configure_alert_sink(previous_buywatch)
-                fillwatch.configure_alert_sink(previous_fillwatch)
-                watcher.configure_alert_sink(previous_watcher)
+                buy_audit.configure_alert_sink(previous_buywatch)
+                fill_audit.configure_alert_sink(previous_fillwatch)
+                feed.configure_alert_sink(previous_watcher)
                 corroborate.configure_observation_sink(previous)
 
 

@@ -43,7 +43,7 @@ def guardian_once():
 
 def _guardian_once():
     """Preserve Guardian halt behavior; do not call a partial check PASS."""
-    import guardian
+    from observer import guardian_audit as guardian
     receipt = guardian._OBSERVER_FULL_AUDIT.set(None)
     try:
         try:
@@ -69,7 +69,7 @@ def fillwatch_once():
 
 def _fillwatch_once():
     """Same result and error semantics as fillwatch.main with --once."""
-    import fillwatch as fw
+    from observer import fill_audit as fw
     try:
         code = fw.run(fw.WINDOW_SECS, False)
     except fw.Unverifiable as error:
@@ -87,7 +87,7 @@ def buywatch_once():
 
 def _buywatch_once():
     """Same result and error semantics as buywatch.main with --once."""
-    import buywatch as bw
+    from observer import buy_audit as bw
     try:
         code = bw.run(bw.WINDOW_SECS, False)
     except bw.fw.Unverifiable as error:

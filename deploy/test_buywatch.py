@@ -6,8 +6,9 @@ import time
 import unittest
 from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import buywatch
-import fillwatch
+from observer import buy_audit as buywatch
+from observer import fill_audit as fillwatch
+from observer import adapters
 TOKEN = '12345678901234567890'
 
 def lanes(leader='0xleader'):
@@ -145,13 +146,13 @@ class RunTests(unittest.TestCase):
 
     def test_a_leader_buy_with_no_decision_is_NOT_PASS_and_writes_an_alert(self):
         buys = [a_buy()]
-        with mock.patch.object(fillwatch, 'bot_state', return_value=lanes()), mock.patch.object(fillwatch, 'rpc', side_effect=self._rpc()), mock.patch.object(fillwatch, 'fills_in_range', return_value=[{'e': 1}]), mock.patch.object(fillwatch, 'decode_fill', return_value=buys):
+        rows = []
+        with mock.patch.object(fillwatch, 'bot_state', return_value=lanes()), mock.patch.object(fillwatch, 'rpc', side_effect=self._rpc()), mock.patch.object(fillwatch, 'fills_in_range', return_value=[{'e': 1}]), mock.patch.object(fillwatch, 'decode_fill', return_value=buys), mock.patch.object(buywatch, '_ALERT_SINK', lambda source, row: rows.append((source, row))):
             rc = buywatch.run(1260, dry_run=False)
         self.assertEqual(rc, 1)
-        with open(buywatch.ALERT_PATH) as f:
-            row = json.loads(f.read().strip())
-        self.assertEqual(row['kind'], 'unseen_leader_buys')
-        self.assertEqual(row['count'], 1)
+        self.assertEqual(rows[0][0], 'buywatch')
+        self.assertEqual(rows[0][1]['kind'], 'unseen_leader_buys')
+        self.assertEqual(rows[0][1]['count'], 1)
 
     def test_a_QUIET_window_passes_without_touching_the_alert_file(self):
         with mock.patch.object(fillwatch, 'bot_state', return_value=lanes()), mock.patch.object(fillwatch, 'rpc', side_effect=self._rpc()), mock.patch.object(fillwatch, 'fills_in_range', return_value=[]), mock.patch.object(fillwatch, 'decode_fill', return_value=[]):
@@ -169,19 +170,15 @@ class RunTests(unittest.TestCase):
 
     def test_it_NEVER_halts_a_lane(self):
         buys = [a_buy()]
-        with mock.patch.object(fillwatch, 'bot_state', return_value=lanes()), mock.patch.object(fillwatch, 'rpc', side_effect=self._rpc()), mock.patch.object(fillwatch, 'fills_in_range', return_value=[{'e': 1}]), mock.patch.object(fillwatch, 'decode_fill', return_value=buys), mock.patch.object(fillwatch, 'halt_buys') as halt:
+        with mock.patch.object(fillwatch, 'bot_state', return_value=lanes()), mock.patch.object(fillwatch, 'rpc', side_effect=self._rpc()), mock.patch.object(fillwatch, 'fills_in_range', return_value=[{'e': 1}]), mock.patch.object(fillwatch, 'decode_fill', return_value=buys), mock.patch.object(fillwatch, 'halt_buys') as halt, mock.patch.object(buywatch, '_ALERT_SINK', lambda *_: None):
             buywatch.run(1260, dry_run=False)
         halt.assert_not_called()
 
-    def test_a_broken_chain_read_is_UNVERIFIED_not_a_crash(self):
-
+    def test_a_broken_chain_read_is_UNVERIFIABLE_in_observer(self):
         def boom(*_a, **_k):
             raise fillwatch.Unverifiable('rpc down')
         with mock.patch.object(fillwatch, 'bot_state', return_value=lanes()), mock.patch.object(fillwatch, 'measure_block_secs', side_effect=boom):
-            self.assertEqual(buywatch.main.__wrapped__(1260, False) if hasattr(buywatch.main, '__wrapped__') else _main_rc(), 3)
-
-def _main_rc():
-    with mock.patch.object(sys, 'argv', ['buywatch.py']):
-        return buywatch.main()
+            outcome = adapters.buywatch_once()
+        self.assertEqual((outcome.status, outcome.exit_code), ('UNVERIFIABLE', 3))
 if __name__ == '__main__':
     unittest.main()
