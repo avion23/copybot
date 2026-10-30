@@ -9,6 +9,7 @@ pub(crate) mod exits;
 pub(crate) mod exit_sweep;
 pub(crate) mod flatten_task;
 pub(crate) mod http;
+pub(crate) mod leader_pnl;
 pub(crate) mod merge;
 pub(crate) mod operator;
 pub(crate) mod orphan_sweep;

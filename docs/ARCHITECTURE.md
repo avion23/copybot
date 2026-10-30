@@ -330,6 +330,10 @@ The optional `runtime/orphan_sweep.rs` now uses the already-gated `flatten::mark
 
 The existing 60-second custody comparison task now lives in `runtime/custody_monitor.rs` (129 lines), with explicit `Control`, `Router`, `Emitter`, funder, pending journal and custody-report read-model dependencies. The binary retains the original live gate and spawn position. The worker still compares physical venue balances to ledger position claims, accounts for pending sell and buy reservations, updates the same custody snapshot, and emits the same first-alarm and clearance events. `main.rs` shrinks from 4,101 to 3,994 lines. This is mechanical A3 separation: the worker still filters malformed venue rows and uses a default HTTP client on builder error, so those A4 evidence issues are **not** claimed fixed. No new authority, feed or test is added.
 
+### A3: read-only leader P&L windows (COPYBOT-3)
+
+`runtime/leader_pnl.rs` (49 lines) now owns the existing dashboard leader P&L read task. The binary supplies its live-only start gate, `Router`, wallet registry and the single dashboard P&L cache. The worker retains the same 900-second cadence, 1d/7d/30d profit windows, response parsing, rounding, and update-only-on-nonempty behavior; no trading logic or alert authority was introduced. This reduces `main.rs` from 3,994 to 3,957 lines. HTTP-client fallback and missing-value handling are unchanged in this A3 move and remain reviewable as distinct A4 concerns; no claim is made that all error boundaries are closed.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
