@@ -97,6 +97,21 @@ python3 deploy/observer/preflight.py --phase cutover --unit-dir deploy \
   --run-dir /opt/copybot/run
 ```
 
+For the `cutover` phase, the Observer must already have produced its owner
+lock and the owner-controlled `observer_observations.jsonl`,
+`observer_notifications.jsonl`, `observer_alerts.jsonl`,
+`errors.jsonl` and `watcher.log` records/files. In addition, a Guardian
+state file must have been refreshed within the past 90 seconds, and the
+watcher's `watcher_heartbeat.json` must be recent (at most 90 seconds),
+owned mode `0600`, and explicitly report a useful feed with a decoded
+message, a known leader registry, and zero unjudged fill evictions. A
+just-started Observer may not yet have completed its first Guardian audit or
+watcher decode; a failed readiness result then means **wait for actual
+coverage**, never synthesize these artifacts or bypass the checks. Pre-start
+`ready` checks intentionally allow an absent owner lock and all of these
+not-yet-produced files. Passing this metadata/readiness gate still does **not**
+establish independent market-data truth or production parity.
+
 The checker **does not** collect, authenticate, or modify those unit states.
 It verifies the supplied evidence, the expected engine state, and read-only
 run-directory/owner-lock metadata, and refuses stale, missing or

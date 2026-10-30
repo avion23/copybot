@@ -6,6 +6,7 @@ real market safety. A passing snapshot is not production attestation.
 """
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -28,6 +29,8 @@ OBSERVER = "copybot-observer.service"
 HOT = "copybot-hot.service"
 ALL_STATES = frozenset((*LEGACY, OBSERVER, HOT))
 MAX_SNAPSHOT_AGE = 300
+WATCHER_HEARTBEAT_MAX_AGE = 90
+MAX_HEARTBEAT_BYTES = 65536
 START_DELAYS = {
     "copybot-guardian.timer": ("30s", "11s", "copybot-guardian.service"),
     "copybot-fillwatch.timer": ("5min", "15min", "copybot-fillwatch.service"),
@@ -136,7 +139,7 @@ def check_unit_inventory(unit_dir):
     return errors
 
 
-def check_run_ownership(run_dir, service_uid):
+def check_run_ownership(run_dir, service_uid, *, require_lock=False):
     """Read-only filesystem metadata; never chmod, create, or open secrets."""
     errors = []
     path = Path(run_dir)
@@ -157,10 +160,99 @@ def check_run_ownership(run_dir, service_uid):
                 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
             errors.append("owner lock must be single-link owned regular mode-0600")
     except FileNotFoundError:
-        # Startup under the real service UID creates this file if absent.
-        pass
+        # A pre-start check may legitimately have no lock yet; an active
+        # Observer cannot claim an owner lease without its lock inode.
+        if require_lock:
+            errors.append("active Observer owner lock is missing")
     except OSError as exc:
         errors.append("owner lock unavailable: %s" % type(exc).__name__)
+    return errors
+
+
+def check_cutover_artifacts(run_dir, service_uid, *, now):
+    """Verify readable, owner-controlled Observer artifacts, not live parity.
+
+    This is an explicit path supplied by an operator. No systemctl, provider,
+    signing key, hostname or environment-file access occurs here.
+    """
+    errors = []
+    root = Path(run_dir)
+    for name in ("observer_observations.jsonl", "observer_notifications.jsonl",
+                 "observer_alerts.jsonl", "errors.jsonl", "watcher.log"):
+        path = root / name
+        try:
+            info = os.stat(path, follow_symlinks=False)
+            mode = stat.S_IMODE(info.st_mode)
+            exact = name != "watcher.log"
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != service_uid
+                    or info.st_nlink != 1
+                    or (mode != 0o600 if exact else bool(mode & 0o022))):
+                errors.append("Observer artifact has unsafe ownership or mode: " + name)
+        except OSError as exc:
+            errors.append("Observer artifact unavailable: %s (%s)" %
+                          (name, type(exc).__name__))
+
+    # The Guardian must have completed a recent audit. An old state file from
+    # the disabled timer cannot establish cutover health indefinitely.
+    guardian_path = root / "guardian_state.json"
+    try:
+        guardian = os.stat(guardian_path, follow_symlinks=False)
+        if (not stat.S_ISREG(guardian.st_mode)
+                or guardian.st_uid != service_uid
+                or guardian.st_nlink != 1
+                or stat.S_IMODE(guardian.st_mode) & 0o022):
+            errors.append("Guardian state inode is unsafe")
+        if not 0 <= now - guardian.st_mtime <= WATCHER_HEARTBEAT_MAX_AGE:
+            errors.append("Guardian state has not been refreshed recently")
+    except OSError as exc:
+        errors.append("Guardian state unavailable: %s" % type(exc).__name__)
+
+    # A fresh file alone does not prove the watcher can decode leader fills.
+    # Read one bounded heartbeat from a verified, non-symlink regular inode.
+    hb_path = root / "watcher_heartbeat.json"
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        fd = os.open(hb_path, flags)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != service_uid
+                    or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_size > MAX_HEARTBEAT_BYTES):
+                raise ValueError("watcher heartbeat inode is unsafe or oversized")
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                data = stream.read(MAX_HEARTBEAT_BYTES + 1)
+            if len(data) > MAX_HEARTBEAT_BYTES:
+                raise ValueError("watcher heartbeat exceeds bounded read")
+            heartbeat = json.loads(data)
+        finally:
+            os.close(fd)
+        if not isinstance(heartbeat, dict):
+            raise ValueError("watcher heartbeat is not an object")
+        stamp = heartbeat.get("t")
+        if (type(stamp) not in (int, float)
+                or not math.isfinite(stamp)
+                or not 0 <= now - stamp <= WATCHER_HEARTBEAT_MAX_AGE):
+            errors.append("watcher heartbeat is missing, future or stale")
+        feed = heartbeat.get("feed")
+        if (not isinstance(feed, dict)
+                or feed.get("useful") is not True
+                or feed.get("decoded_ever") is not True):
+            errors.append("watcher feed cannot prove useful decoded activity")
+        if heartbeat.get("leaders_error"):
+            errors.append("watcher cannot verify its leader registry")
+        leaders = heartbeat.get("leaders")
+        if (not isinstance(leaders, list) or not leaders
+                or any(not isinstance(n, str) or not n for n in leaders)):
+            errors.append("watcher heartbeat has no verified leader coverage")
+        fills = heartbeat.get("fills")
+        if (not isinstance(fills, dict)
+                or type(fills.get("dropped_unjudged")) is not int
+                or fills["dropped_unjudged"] != 0):
+            errors.append("watcher reports missing or dropped unjudged fill evidence")
+    except (OSError, ValueError, TypeError) as exc:
+        errors.append("watcher heartbeat unreadable or invalid: %s" %
+                      type(exc).__name__)
     return errors
 
 
@@ -225,7 +317,13 @@ def evaluate(unit_dir, *, phase="staged", snapshot=None, run_dir=None,
         if run_dir is None or service_uid is None:
             errors.append("run directory and service UID required for phase %s" % phase)
         else:
-            errors.extend(check_run_ownership(run_dir, service_uid))
+            errors.extend(check_run_ownership(
+                run_dir, service_uid, require_lock=phase == "cutover"
+            ))
+            if phase == "cutover":
+                errors.extend(check_cutover_artifacts(
+                    run_dir, service_uid, now=time.time() if now is None else now,
+                ))
     return {
         "phase": phase,
         "status": "BLOCKED" if errors else "OFFLINE_SNAPSHOT_PASS",
