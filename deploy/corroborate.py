@@ -1,3 +1,6 @@
+from observer.contract import from_corroboration
+from observer.policy import halts_legacy
+
 CONFIRMED = 'CONFIRMED'
 REFUTED = 'REFUTED'
 UNVERIFIABLE = 'UNVERIFIABLE'
@@ -78,17 +81,29 @@ def _stranded(fact, ctx):
     return (CONFIRMED, 'the venue agrees we are still holding %.2f sh worth $%.2f of a market he has left' % (venue, value))
 CORROBORATORS = {'exposure': _exposure, 'stranded': _stranded}
 
-def check(family, fact, ctx):
+def inspect(family, fact, ctx, *, observed_at=None):
+    """One typed observation, with no extra alert or operator writer."""
     fn = CORROBORATORS.get(family)
     if fn is None:
-        return (UNVERIFIABLE, 'no independent check exists for %r — halting conservatively without confirmation' % family)
-    try:
-        verdict, evidence = fn(fact, ctx)
-    except Exception as e:
-        return (UNVERIFIABLE, 'the independent check itself failed (%r)' % (e,))
+        verdict, evidence = (UNVERIFIABLE, 'no independent check exists for %r — halting conservatively without confirmation' % family)
+    else:
+        try:
+            verdict, evidence = fn(fact, ctx)
+        except Exception as e:
+            verdict, evidence = (UNVERIFIABLE, 'the independent check itself failed (%r)' % (e,))
     if verdict not in (CONFIRMED, REFUTED, UNVERIFIABLE, LAGGING):
-        return (UNVERIFIABLE, 'the independent check returned %r' % (verdict,))
-    return (verdict, evidence)
+        verdict, evidence = (UNVERIFIABLE, 'the independent check returned %r' % (verdict,))
+    return from_corroboration(
+        family, fact, verdict, evidence,
+        supported=fn is not None, observed_at=observed_at,
+    )
+
+
+def check(family, fact, ctx):
+    """Keep existing callers' verdict and reason while validating the envelope."""
+    observation = inspect(family, fact, ctx)
+    return observation.legacy_verdict, observation.reason
+
 
 def halts(verdict):
-    return verdict != REFUTED
+    return halts_legacy(verdict)
