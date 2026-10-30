@@ -25,10 +25,20 @@ pub(crate) fn spawn(
             custody_report.clone(),
         );
         tokio::spawn(async move {
-            let http = reqwest::Client::builder()
+            let http = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .unwrap_or_default();
+            {
+                Ok(client) => client,
+                Err(_) => {
+                    eprintln!("[custody] REFUSED: cannot initialize timed position client");
+                    em_ca.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "custody_unavailable",
+                        "reason": "http_client_initialization",
+                    }));
+                    return;
+                }
+            };
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             let mut alarm_since: Option<i64> = None;
             loop {
@@ -42,20 +52,20 @@ pub(crate) fn spawn(
                         copybot_hot::ledger::now_secs(),
                     )
                     .await;
-                let complete = snap.may_act_destructively();
-                let venue: std::collections::HashMap<String, f64> = snap
-                    .rows
-                    .iter()
-                    .filter_map(|p| {
-                        let t = p["asset"].as_str()?.to_string();
-                        let sz = p["size"]
-                            .as_f64()
-                            .or_else(|| {
-                                p["size"].as_str().and_then(|x| x.parse().ok())
-                            })?;
-                        Some((t, sz))
-                    })
-                    .collect();
+                let (venue, complete) =
+                    match copybot_hot::position_evidence::complete_balances(&snap) {
+                        Ok(balances) => (balances, true),
+                        Err(error) => {
+                            eprintln!("[custody] REFUSED: invalid venue positions: {error}");
+                            em_ca.emit(serde_json::json!({
+                                "t": now_ms(), "ev": "custody_unavailable",
+                                "reason": error.to_string(),
+                            }));
+                            // The audit below marks every holding Unknown. An invalid read
+                            // cannot certify custody agreement or clear an existing alarm.
+                            (std::collections::HashMap::new(), false)
+                        }
+                    };
                 let flight = pend_ca.lock().unwrap().in_flight();
                 let (in_flight, in_flight_buys) = (
                     flight.sell_shares_by_token,
@@ -115,7 +125,7 @@ pub(crate) fn spawn(
                                 ),
                             );
                     }
-                } else if alarm_since.take().is_some() {
+                } else if complete && alarm_since.take().is_some() {
                     em_ca
                         .emit(
                             serde_json::json!(
