@@ -238,6 +238,10 @@ The HTTP edge recognizes `EditWallets`, `SetArmState`, `Flatten` and `ClearIncid
 
 The browser requests the capability in a password dialog per mutation, keeps it out of persistent storage and URLs, refuses non-HTTPS/non-loopback use, and disables redirects for authenticated requests. The existing fillwatch halt client forwards `COPYBOT_OPERATOR_TOKEN` from its service environment over a concrete loopback connection without proxies or redirects; missing credentials or unconfirmed responses retain the fault and return failure, never a claimed halt. No live environment file, token, service or deployment was changed. The supplied environment example remains read-only. Operator authorization is implemented; A3 remainder, A4 remaining snapshot/flatten candidates and A5 Observer consolidation remain open.
 
+### A3: guardian pure-check extraction (COPYBOT-3)
+
+`deploy/guardian_checks.py` now owns the deterministic conservation, chain-allocation, drift, fire-exposure, orphan, sizing and numerical kernels; `guardian.py` imports them explicitly and keeps operator actions, polling, persistence, ledger I/O, alert delivery and scheduling at the edge. This removes 204 net lines from `guardian.py` (2,077 → 1,873) without adding a second authority, generic framework, alternate path or behavior fallback; the new kernel module has 217 lines. All numeric thresholds are defined once in `guardian_checks.py` and re-exported through the original imports. It is an A3 boundary step, **not** a completed A5 Observer contract. Neither guardian's remaining size nor the other oversized runtime files yet meets the 1,000-line constraint.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
