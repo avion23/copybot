@@ -266,6 +266,10 @@ Guardian now imports its five checked-in monitoring dependencies (`resolution`, 
 
 `deploy/guardian_state_store.py` (185 lines) owns the filesystem-backed error journal, advisory/equity history, refutation/lag evidence deduplication, durable Guardian snapshot writing, and the shared scoped `tmp_path`/parent fsync helper. Callers supply absolute paths, the writer's enabled flag, and callbacks explicitly; dry-run still disables the error journal and redirects Guardian's snapshot path. Guardian drops from 1,134 to **968 lines**, meeting its A3 file-size gate without macros or re-included code. Sixteen constructed parity cases passed with evidence-only filesystem paths; the first test harness had shadowed its own baseline error callback and was corrected without changing runtime code. The four oversized Rust modules and the single Observer contract remain open.
 
+### A3: ledger query ownership (COPYBOT-3)
+
+`hot/src/ledger_queries.rs` owns read-side ledger projection: realised equity series/windows, cross-lane position claims, adoptable/releasable holdings and settlement evidence scanning. The durable booking and replay writer remains in `ledger.rs`; public query names and methods are preserved through one re-export, with no separate ledger state or network adapter. The old 1,125-line `ledger.rs` is now **906 lines** and the focused query module is 226 lines. The query extraction is mechanical: no changed numeric thresholds, write paths, pending admission or order outcomes. A3 size budgets still remain open for `control.rs`, `pending.rs`, `lanes.rs` and `main.rs`.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
