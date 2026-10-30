@@ -19,6 +19,12 @@ one serialized background audit worker. No trading key is used.
   each first overdue sensor emits an observer_deferred record
 - The scheduler emits Observer **health** records. They do not assert an
   independently confirmed market event or imply that a halt was applied
+- When explicitly enabled, checked corroborations from the four sensors
+  use one `run/observer_observations.jsonl` journal (owner-only 0600, fsynced)
+  and durable occurrence dedup across sources and restarts, only where a
+  real fill/order identity exists. Anonymous token sightings never dedup.
+  Corrupt or unwritable evidence refuses startup or marks a check
+  `UNVERIFIABLE`; it is never treated as confirmed evidence.
 - The observer-owner exclusive file lock refuses a second Observer process.
   The legacy Guardian, watcher, fillwatch and buywatch CLI entrypoints now
   take **shared** locks on the same file, allowing legacy sensors to run
@@ -60,7 +66,8 @@ sudo systemctl enable --now copybot-guardian.timer copybot-fillwatch.timer copyb
 ```
 
 The shared Observation schema is wired through the existing corroboration
-path. **Central persistent occurrence deduplication and a single alert
-writer are not yet active**; prior per-sensor alert files and policy
-effects are retained deliberately. Do not mark A5 DONE or claim live
+path. **One persistent corroboration journal and occurrence dedup are now
+active in the opt-in Observer process**; prior per-sensor critical-alert
+files and policy effects are retained deliberately, so a sole downstream
+alert-delivery writer is not yet established. Do not mark A5 DONE or claim live
 equivalence from synthetic probes.

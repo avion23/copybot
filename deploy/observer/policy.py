@@ -45,6 +45,15 @@ class OccurrenceDeduper:
         self.max_keys = max_keys
         self._seen = OrderedDict()
 
+    def contains(self, observation):
+        """Read-only membership; record only after durable journal append."""
+        key = occurrence_key(observation)
+        if key is None:
+            return False
+        previous = self._seen.get(key)
+        return (previous is not None
+                and 0 <= observation.observed_at - previous < self.ttl_seconds)
+
     def duplicate(self, observation):
         key = occurrence_key(observation)
         if key is None:

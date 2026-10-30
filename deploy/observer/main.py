@@ -17,7 +17,9 @@ _DEPLOY = str(Path(__file__).resolve().parent.parent)
 if _DEPLOY not in sys.path:
     sys.path.insert(0, _DEPLOY)
 
+import corroborate
 from observer.adapters import AUDITS, AuditResult
+from observer.alerts import ObservationJournal
 from observer.lease import ObserverLease
 
 
@@ -102,7 +104,8 @@ class ObserverScheduler:
         now = self.clock()
         if now >= self.watch_due:
             try:
-                self.watcher.poll()
+                with corroborate.sensor_source("watcher"):
+                    self.watcher.poll()
             except Exception as error:
                 self.watcher.alert(
                     "CRITICAL", "OBSERVER",
@@ -150,14 +153,20 @@ def main(argv=None):
     bot_dir = os.environ.get("BOT_DIR", "/opt/copybot")
     path = Path(bot_dir) / "run" / "observer.owner.lock"
     with ObserverLease(path):
-        owner = ObserverScheduler(watcher.WatchSession(45))
-        owner.start()
-        try:
-            while True:
-                owner.step()
-                time.sleep(1)
-        finally:
-            owner.close()
+        journal_path = Path(bot_dir) / "run" / "observer_observations.jsonl"
+        with ObservationJournal(journal_path) as journal:
+            previous = corroborate.configure_observation_sink(journal.record)
+            try:
+                owner = ObserverScheduler(watcher.WatchSession(45))
+                try:
+                    owner.start()
+                    while True:
+                        owner.step()
+                        time.sleep(1)
+                finally:
+                    owner.close()
+            finally:
+                corroborate.configure_observation_sink(previous)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,17 @@ def _outcome(name, code, unknown_codes, alert_codes):
     return AuditResult(name, code, "UNVERIFIABLE", "unexpected audit return code")
 
 
+def _scoped(source, fn):
+    import corroborate
+    with corroborate.sensor_source(source):
+        return fn()
+
+
 def guardian_once():
+    return _scoped("guardian", _guardian_once)
+
+
+def _guardian_once():
     """Same exception/halt policy as guardian.main without argparse/sys.argv."""
     import guardian
     try:
@@ -47,6 +57,10 @@ def guardian_once():
 
 
 def fillwatch_once():
+    return _scoped("fillwatch", _fillwatch_once)
+
+
+def _fillwatch_once():
     """Same result and error semantics as fillwatch.main with --once."""
     import fillwatch as fw
     try:
@@ -61,6 +75,10 @@ def fillwatch_once():
 
 
 def buywatch_once():
+    return _scoped("buywatch", _buywatch_once)
+
+
+def _buywatch_once():
     """Same result and error semantics as buywatch.main with --once."""
     import buywatch as bw
     try:

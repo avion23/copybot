@@ -1,3 +1,6 @@
+from contextlib import contextmanager
+from dataclasses import replace
+import threading
 from observer.contract import from_corroboration
 from observer.policy import halts_legacy
 
@@ -81,6 +84,37 @@ def _stranded(fact, ctx):
     return (CONFIRMED, 'the venue agrees we are still holding %.2f sh worth $%.2f of a market he has left' % (venue, value))
 CORROBORATORS = {'exposure': _exposure, 'stranded': _stranded}
 
+_OBSERVATION_SINK = None
+_SENSOR = threading.local()
+
+
+def configure_observation_sink(sink):
+    """Opt-in only for the single Observer process; legacy mode uses no sink."""
+    global _OBSERVATION_SINK
+    if sink is not None and not callable(sink):
+        raise TypeError("Observer sink must be callable")
+    previous = _OBSERVATION_SINK
+    _OBSERVATION_SINK = sink
+    return previous
+
+
+@contextmanager
+def sensor_source(name):
+    """Thread-local provenance for Guardian, watcher and fillwatch evidence."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Observer source must be identified")
+    previous = getattr(_SENSOR, "source", None)
+    _SENSOR.source = name
+    try:
+        yield
+    finally:
+        if previous is None:
+            if hasattr(_SENSOR, "source"):
+                del _SENSOR.source
+        else:
+            _SENSOR.source = previous
+
+
 def inspect(family, fact, ctx, *, observed_at=None):
     """One typed observation, with no extra alert or operator writer."""
     fn = CORROBORATORS.get(family)
@@ -100,8 +134,21 @@ def inspect(family, fact, ctx, *, observed_at=None):
 
 
 def check(family, fact, ctx):
-    """Keep existing callers' verdict and reason while validating the envelope."""
+    """Emit opt-in durable evidence, retaining legacy verdicts on success."""
     observation = inspect(family, fact, ctx)
+    sink = _OBSERVATION_SINK
+    if sink is not None:
+        source = getattr(_SENSOR, "source", None)
+        if source is not None:
+            observation = replace(observation, source=source)
+        try:
+            sink(observation)
+        except Exception as error:
+            # No corroboration can be called confirmed after evidence
+            # persistence fails. Conservative halt policy is unchanged.
+            return (UNVERIFIABLE,
+                    "Observer evidence persistence failed: %s" %
+                    type(error).__name__)
     return observation.legacy_verdict, observation.reason
 
 
