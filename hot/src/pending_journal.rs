@@ -290,6 +290,13 @@ impl PendingLog {
         self.stages.remove(order_hash);
         Ok(())
     }
+    /// A stable, owned view of the still-reserved order identities. Readers
+    /// must not mutate the map without holding the PendingLog's exclusive lock.
+    pub fn open_rows(&self) -> Vec<Pending> {
+        let mut rows: Vec<Pending> = self.open.values().cloned().collect();
+        rows.sort_by(|a, b| a.order_hash.cmp(&b.order_hash));
+        rows
+    }
     pub fn due(&self, now: i64) -> Vec<Pending> {
         let mut out: Vec<Pending> = self
             .open

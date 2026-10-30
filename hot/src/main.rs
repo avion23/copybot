@@ -435,6 +435,9 @@ the rescue ladder. Attribute it, or flatten by hand, rather than leaving it."
             );
         }
     }
+    runtime::accounting::recover_booked_pending_at_boot(
+        &control, &pending_log, &router, &incidents, &emitter,
+    );
     let pending_tokens = pending_log.lock().unwrap().open_tokens();
     if !pending_tokens.is_empty() {
         eprintln!(

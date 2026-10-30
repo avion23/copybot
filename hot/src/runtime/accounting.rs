@@ -236,6 +236,58 @@ pub(crate) async fn resolve_pending(
     Ok(())
 }
 
+/// Repair only already-booked FAK reservations after a crash between ledger
+/// fsync and pending-log resolution. This is one coordinated recovery edge;
+/// both files remain independently durable until the full owner migration.
+pub(crate) fn recover_booked_pending_at_boot(
+    control: &Arc<std::sync::Mutex<Control>>,
+    pending: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
+    router: &Arc<Router>,
+    incidents: &Arc<std::sync::Mutex<copybot_hot::incidents::Incidents>>,
+    emitter: &Arc<Emitter>,
+) {
+    let result = {
+        let ctl = control.lock().unwrap();
+        let mut journal = pending.lock().unwrap();
+        copybot_hot::order_state_owner::OrderStateOwner::new(
+            &ctl.ledger, &mut journal,
+        ).reconcile_restart()
+    };
+    match result {
+        Ok(report) => {
+            if report.recovered > 0 || report.retained_resting > 0 {
+                eprintln!(
+                    "[order_owner] restart: {} booked FAK reservation(s) durably closed; {} resting order(s) still reserved for venue proof",
+                    report.recovered, report.retained_resting
+                );
+                emitter.emit(serde_json::json!({
+                    "t": now_ms(), "ev":"order_owner_restart",
+                    "booked_fak_closed": report.recovered,
+                    "resting_kept": report.retained_resting,
+                    "unverified_kept": report.missing_ledger_receipts,
+                }));
+            }
+        }
+        Err(refusal) => {
+            // Never free outstanding budget if either durable source cannot
+            // prove a coherent full order identity and booked amount.
+            eprintln!(
+                "[order_owner] REFUSING restart reconciliation: {refusal:?}; unresolved reservations remain, new buys halted"
+            );
+            for lane in router.snapshot().iter() {
+                latch_buys(
+                    lane, incidents, "order_owner_restart",
+                    "ledger/pending booking evidence conflicts or cannot persist",
+                );
+            }
+            emitter.emit(serde_json::json!({
+                "t": now_ms(), "ev":"order_owner_restart_refusal",
+                "why": format!("{refusal:?}"),
+            }));
+        }
+    }
+}
+
 pub(crate) fn halt_buys_on_persistence_fault_with(
     control: &Arc<std::sync::Mutex<Control>>,
     router: &Arc<Router>,

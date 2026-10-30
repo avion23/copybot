@@ -101,6 +101,17 @@ pub struct Booked {
     pub shares: f64,
     pub price: f64,
 }
+/// A read-only, durable fill attestation recovered from the ledger on boot.
+/// Its fee is the *booked* fee, not necessarily an independently verified venue fee.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordedOrder {
+    pub lane: String,
+    pub token: String,
+    pub side: u8,
+    pub receipt: Booked,
+    pub fee: f64,
+    pub resting: bool,
+}
 pub struct Ledger {
     pub path: String,
     pub lane_ids: HashMap<String, String>,
@@ -757,6 +768,16 @@ of …{} but only {:.4} tracked — excess IGNORED (replay-safe), investigate th
     }
     pub fn was_order_booked(&self, order_hash: &str) -> bool {
         self.booked_receipts.contains_key(order_hash)
+    }
+    pub fn recorded_order(&self, order_hash: &str) -> Option<RecordedOrder> {
+        self.booked_receipts.get(order_hash).map(|saved| RecordedOrder {
+            lane: saved.lane.clone(),
+            token: saved.token.clone(),
+            side: saved.side,
+            receipt: saved.receipt(),
+            fee: saved.fee,
+            resting: saved.resting,
+        })
     }
     pub fn open_usd(&self, lane: &str) -> f64 {
         self.lanes
