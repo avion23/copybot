@@ -1,9 +1,10 @@
 #![cfg_attr(test, allow(non_snake_case))]
 mod runtime;
-use runtime::dashboard_model::{DashboardLane, PhysicalWallet, marked_position_value, wallet_equity_pnl};
+use runtime::dashboard_model::{DashboardLane, PhysicalWallet, wallet_equity_pnl};
+#[cfg(test)]
+use runtime::dashboard_model::marked_position_value;
 #[cfg(test)]
 use runtime::reconcile::recovery_target_shares;
-use runtime::signal::is_political_title;
 use runtime::accounting::{book_and_resolve, halt_buys_on_persistence_fault_with};
 use runtime::telemetry::{now_ms, Emitter};
 use runtime::execution::submit_tracked;
@@ -2647,99 +2648,12 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
             &control, &router, &emitter, &funder, &pending_log, &errors_path, &drift_by_lane,
         );
     }
-    let seed_registry = registry.clone();
     if live && !shadow {
-        let (cs, cl, ad, wallet, cell) = (
-            creds_slot.clone(),
-            clob.clone(),
-            auth_addr.clone(),
-            funder.clone(),
-            physical_wallet.clone(),
-        );
         let hc = mk_client(false).expect("seed-check client");
-        tokio::spawn(async move {
-            for _ in 0..20 {
-                if cs.lock().unwrap().is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            let mut first = true;
-            loop {
-                let creds = cs.lock().unwrap().clone();
-                let cash = match creds {
-                    Some(cr) => {
-                        copybot_hot::matchup::free_cash(&hc, &cl, &ad, &cr, sig_type)
-                            .await
-                    }
-                    None => None,
-                };
-                let pos_snap = copybot_hot::positions::fetch(
-                        &hc,
-                        "https://data-api.polymarket.com",
-                        &wallet,
-                        "0",
-                        "",
-                        copybot_hot::ledger::now_secs(),
-                    )
-                    .await;
-                let marked = if pos_snap.completeness.is_complete() {
-                    marked_position_value(&serde_json::Value::Array(pos_snap.rows))
-                } else {
-                    None
-                };
-                let equity = copybot_hot::budget::wallet_equity(cash, marked);
-                {
-                    let mut snapshot = cell.lock().unwrap();
-                    if cash.is_some() {
-                        snapshot.cash = cash;
-                    }
-                    if equity.is_some() {
-                        snapshot.equity = equity;
-                    }
-                    if equity.is_some() {
-                        snapshot.fetched_at = Some(copybot_hot::ledger::now_secs());
-                        snapshot.stale_reason = None;
-                    } else {
-                        snapshot.stale_reason = Some(
-                            if cash.is_some() {
-                                "positions could not be valued — equity is the LAST GOOD one \
-and its age is real"
-                            } else {
-                                "balance refresh returned nothing usable"
-                            },
-                        );
-                    }
-                }
-                let total_seed: f64 = seed_registry
-                    .specs()
-                    .iter()
-                    .filter(|w| w.enabled)
-                    .map(|w| w.seed_usd)
-                    .sum();
-                if first && total_seed > 0.0 {
-                    let fc = cash
-                        .map(|c| format!("{c:.2}"))
-                        .unwrap_or_else(|| "?".into());
-                    let dep = marked
-                        .map(|m| format!("{:.2}", m.max(0.0)))
-                        .unwrap_or_else(|| "?".into());
-                    match copybot_hot::budget::seeds_fit_wallet(total_seed, equity) {
-                        Ok(()) => {
-                            eprintln!(
-                                "[seed] free cash ${fc} + deployed ${dep} = equity ${} ; seeds ${total_seed:.2} ; headroom ${}",
-                                equity.map(| e | format!("{e:.2}")).unwrap_or_else(||
-                                "unread".into()), equity.map(| e | format!("{:.2}", e -
-                                total_seed)).unwrap_or_else(|| "?".into())
-                            )
-                        }
-                        Err(e) => eprintln!("[seed] ⚠️  {e}"),
-                    }
-                    first = false;
-                }
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        });
+        runtime::equity_monitor::spawn(
+            &creds_slot, &clob, &auth_addr, &funder, &physical_wallet,
+            &registry, sig_type, hc,
+        );
     }
     runtime::bankroll_monitor::spawn(&control, &router, &emitter, &registry);
     runtime::telemetry::spawn_route_warm_probe(&order_paths, &clob, &emitter);
@@ -2747,54 +2661,8 @@ and its age is real"
         std::sync::RwLock::new(std::collections::HashSet::new()),
     );
     if live {
-        let (pol, reg) = (politics.clone(), registry.clone());
         let hc = mk_client(false).unwrap_or_default();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(600));
-            loop {
-                tick.tick().await;
-                let leaders: Vec<String> = reg
-                    .specs()
-                    .into_iter()
-                    .filter(|w| w.exclude_political)
-                    .map(|w| w.leader)
-                    .collect();
-                if leaders.is_empty() {
-                    continue;
-                }
-                let mut set = std::collections::HashSet::new();
-                for leader in leaders {
-                    let url = format!(
-                        "https://data-api.polymarket.com/activity?\
-user={leader}&limit=500"
-                    );
-                    let rows: Vec<serde_json::Value> = match hc.get(&url).send().await {
-                        Ok(r) if r.status().is_success() => {
-                            r.json().await.unwrap_or_default()
-                        }
-                        _ => continue,
-                    };
-                    for r in &rows {
-                        let ty = r["type"].as_str().unwrap_or("");
-                        let political = ty == "SPLIT" || ty == "MERGE"
-                            || is_political_title(r["title"].as_str().unwrap_or(""));
-                        if political {
-                            if let Some(cid) = r["conditionId"]
-                                .as_str()
-                                .and_then(copybot_hot::merge::condition_id_bytes)
-                            {
-                                set.insert(cid);
-                            }
-                        }
-                    }
-                }
-                let n = set.len();
-                if let Ok(mut g) = pol.write() {
-                    *g = set;
-                }
-                eprintln!("[politics] exclusion set refreshed: {n} conditions");
-            }
-        });
+        runtime::politics::spawn(&politics, &registry, hc);
     }
     let mut tx_seen = copybot_hot::race::SeenTx::new(8192);
     let mut behind = copybot_hot::race::BehindTally::default();
