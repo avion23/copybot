@@ -262,6 +262,10 @@ Guardian now imports its five checked-in monitoring dependencies (`resolution`, 
 
 `deploy/guardian_evidence_inputs.py` (181 lines) now owns the ledger/position/preflight/event read adapters and the leader-book fetch cache. Guardian passes its HTTP read, dashboard read, log writer and heartbeat path explicitly; no new fetchers, shared mutable globals, trading hooks or fallback-success paths were added. The completion signal still distinguishes full, failed and truncated snapshots. Guardian dropped from 1,300 to 1,134 lines; 23 constructed baseline parity cases passed with network calls 0. The module remains at the I/O edge while the deterministic checks remain in `guardian_checks.py`; A3 and the unified A5 Observer remain incomplete.
 
+### A3: Guardian local state and alert journal (COPYBOT-3)
+
+`deploy/guardian_state_store.py` (185 lines) owns the filesystem-backed error journal, advisory/equity history, refutation/lag evidence deduplication, durable Guardian snapshot writing, and the shared scoped `tmp_path`/parent fsync helper. Callers supply absolute paths, the writer's enabled flag, and callbacks explicitly; dry-run still disables the error journal and redirects Guardian's snapshot path. Guardian drops from 1,134 to **968 lines**, meeting its A3 file-size gate without macros or re-included code. Sixteen constructed parity cases passed with evidence-only filesystem paths; the first test harness had shadowed its own baseline error callback and was corrected without changing runtime code. The four oversized Rust modules and the single Observer contract remain open.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.

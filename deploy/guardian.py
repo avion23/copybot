@@ -6,6 +6,11 @@ import hashlib
 import json
 import re
 import socket
+from guardian_state_store import (
+    tmp_path, fsync_parent, record_error as append_error,
+    record_advisories as append_advisories, record_equity_point as append_equity,
+    refutation_is_new, defer_for_lag, persist_state as save_guardian_state,
+)
 from guardian_evidence_inputs import (
     SETTLE_QUIET_SECS, PREFLIGHT_EVERY_SECS, ledger_activity,
     fetch_all_positions, preflight_records, preflight_value_sets,
@@ -60,18 +65,6 @@ CONFIRM_REQUIRED_CHECKS = 2
 GUARDIAN_PERIOD_SECS = 11
 CONFIRM_MIN_INTERVAL_SECS = GUARDIAN_PERIOD_SECS
 CONFIRM_PATH = os.path.join(GUARDIAN_DIR, 'guardian_confirmation.json')
-
-def tmp_path(path):
-    return '%s.%d.tmp' % (path, os.getpid())
-
-def fsync_parent(path):
-    directory = os.path.dirname(path) or '.'
-    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
-    fd = os.open(directory, flags)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 def log(msg):
     line = '%s %s' % (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), msg)
@@ -194,112 +187,13 @@ def find_armed():
     if wanted:
         return ('DEAD', BOT_DIR, wanted, None)
     return (None, None, None, None)
-ERROR_LOG_MAX = 400
-
-def error_log_path():
-    return os.path.join(BOT_DIR, 'run', 'errors.jsonl')
-
 _ALLOW_ERROR_LOG = True
 
 def record_error(lane, kind, detail):
-    if not _ALLOW_ERROR_LOG:
-        return
-    try:
-        row = {'t': int(time.time()), 'lane': lane, 'kind': kind, 'detail': detail, 'human': humanise(kind, detail), 'severity': 'stop' if kind == 'trip' else 'notice'}
-        path = error_log_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path + '.lock', 'w') as lockf:
-            fcntl.flock(lockf, fcntl.LOCK_EX)
-            try:
-                with open(path, 'a') as f:
-                    f.write(json.dumps(row) + '\n')
-                with open(path) as f:
-                    lines = f.readlines()
-                if len(lines) > ERROR_LOG_MAX * 2:
-                    tmp = tmp_path(path)
-                    with open(tmp, 'w') as f:
-                        f.writelines(lines[-ERROR_LOG_MAX:])
-                    os.replace(tmp, path)
-            finally:
-                fcntl.flock(lockf, fcntl.LOCK_UN)
-    except Exception:
-        pass
-ADVISORY_RESAY_SECS = int(os.environ.get('ADVISORY_RESAY_SECS', '900'))
+    return append_error(lane, kind, detail, os.path.join(BOT_DIR, 'run', 'errors.jsonl'), _ALLOW_ERROR_LOG)
 ADVISORY_STATE_PATH = os.path.join(GUARDIAN_DIR, 'guardian_advisories.json')
 
-def record_advisories(advisory, now):
-    codes = {c: m for c, m in advisory or []}
-    state = {}
-    try:
-        with open(ADVISORY_STATE_PATH) as f:
-            state = json.load(f)
-    except (OSError, ValueError):
-        pass
-    open_adv = state if isinstance(state, dict) else {}
-    changed = False
-    for code in sorted(codes):
-        prev = open_adv.get(code) if isinstance(open_adv.get(code), dict) else None
-        said = prev.get('said') if prev else None
-        if prev and isinstance(said, (int, float)) and (now - said < ADVISORY_RESAY_SECS):
-            continue
-        record_error(code.split(':', 1)[-1] if ':' in code else '', 'advisory:%s' % code.split(':', 1)[0], codes[code])
-        open_adv[code] = {'since': (prev or {}).get('since', now), 'said': now}
-        changed = True
-    for code in [c for c in list(open_adv) if c not in codes]:
-        since = (open_adv[code] or {}).get('since')
-        how_long = ' after %.0f min' % ((now - since) / 60.0) if isinstance(since, (int, float)) else ''
-        record_error(code.split(':', 1)[-1] if ':' in code else '', 'advisory_cleared:%s' % code.split(':', 1)[0], '%s has cleared%s — no action needed.' % (code, how_long))
-        del open_adv[code]
-        changed = True
-    if not changed:
-        return
-    try:
-        os.makedirs(GUARDIAN_DIR, exist_ok=True)
-        tmp = tmp_path(ADVISORY_STATE_PATH)
-        with open(tmp, 'w') as f:
-            json.dump(open_adv, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, ADVISORY_STATE_PATH)
-        fsync_parent(ADVISORY_STATE_PATH)
-    except OSError:
-        pass
-EQUITY_POINT_SECS = int(os.environ.get('EQUITY_POINT_SECS', '60'))
-EQUITY_HISTORY_MAX = int(os.environ.get('EQUITY_HISTORY_MAX', '20160'))
 EQUITY_HISTORY_PATH = os.path.join(BOT_DIR, 'run', 'equity_history.jsonl')
-
-def record_equity_point(pool, now):
-    try:
-        if not isinstance(pool, dict):
-            return
-        w = pool.get('wallet')
-        if not isinstance(w, dict) or w.get('equity_pnl') is None:
-            return
-        try:
-            last = os.path.getmtime(EQUITY_HISTORY_PATH)
-            if now - last < EQUITY_POINT_SECS:
-                return
-        except OSError:
-            pass
-        lanes = pool.get('lanes')
-        if isinstance(lanes, dict):
-            lanes = list(lanes.values())
-        realised = sum((float(l.get('realised_pnl') or 0.0) for l in lanes or [] if isinstance(l, dict)))
-        eq = float(w['equity_pnl'])
-        row = {'t': int(now), 'equity_pnl': round(eq, 2), 'portfolio': round(float(w.get('portfolio') or 0.0), 2), 'realised': round(realised, 2), 'unrealised': round(eq - realised, 2), 'funding': round(float(w.get('funding_basis') or 0.0), 2)}
-        os.makedirs(os.path.dirname(EQUITY_HISTORY_PATH), exist_ok=True)
-        with open(EQUITY_HISTORY_PATH, 'a') as f:
-            f.write(json.dumps(row) + '\n')
-        if int(now) % 3600 < EQUITY_POINT_SECS:
-            with open(EQUITY_HISTORY_PATH) as f:
-                lines = f.readlines()
-            if len(lines) > EQUITY_HISTORY_MAX * 2:
-                tmp = tmp_path(EQUITY_HISTORY_PATH)
-                with open(tmp, 'w') as f:
-                    f.writelines(lines[-EQUITY_HISTORY_MAX:])
-                os.replace(tmp, EQUITY_HISTORY_PATH)
-    except Exception:
-        pass
 
 def lanes_in(codes, known=None):
     out = set()
@@ -556,75 +450,15 @@ def confirm_or_disarm(issues, dry_run, now=None):
     progress = max((int(v.get('checks') or 0) for v in (state or {}).get('by_code', {}).values()), default=1)
     log('PENDING CONFIRMATION %d/%d (will re-check in %ds): %s' % (progress, CONFIRM_REQUIRED_CHECKS, GUARDIAN_PERIOD_SECS, reason))
     return False
-REFUTED_QUIET_SECS = 3600
+REFUTED_SEEN_PATH = os.path.join(GUARDIAN_DIR, 'refuted_seen.json')
 
-def refutation_is_new(lane, reason, now, path=None):
-    path = path or os.path.join(GUARDIAN_DIR, 'refuted_seen.json')
-    key = '%s|%s' % (lane, hashlib.sha256(str(reason).encode()).hexdigest()[:16])
-    try:
-        with open(path) as f:
-            seen = json.load(f)
-        if not isinstance(seen, dict):
-            seen = {}
-    except (OSError, ValueError):
-        seen = {}
-    last = seen.get(key)
-    fresh = not (isinstance(last, (int, float)) and now - last < REFUTED_QUIET_SECS)
-    if fresh:
-        seen[key] = now
-        seen = {k: t for k, t in seen.items() if isinstance(t, (int, float)) and now - t < REFUTED_QUIET_SECS * 24}
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = tmp_path(path)
-            with open(tmp, 'w') as f:
-                json.dump(seen, f)
-            os.replace(tmp, path)
-        except OSError:
-            pass
-    return fresh
 SCORECARD_PATH = os.path.join(GUARDIAN_DIR, 'halt_cases.jsonl')
 _LAST_CORROBORATION = None
 
-LAG_DEFER_WINDOW_SECS = 120
+LAG_DEFER_PATH = os.path.join(GUARDIAN_DIR, 'lag_deferred.json')
 
-def defer_for_lag(lane, token, now, path=None):
-    path = path or os.path.join(GUARDIAN_DIR, 'lag_deferred.json')
-    key = '%s|%s' % (lane, str(token)[-16:])
-    try:
-        with open(path) as f:
-            seen = json.load(f)
-        if not isinstance(seen, dict):
-            seen = {}
-    except (OSError, ValueError):
-        seen = {}
-    last = seen.get(key)
-    if isinstance(last, (int, float)) and now - last < LAG_DEFER_WINDOW_SECS:
-        return False
-    seen[key] = now
-    seen = {k: t for k, t in seen.items() if isinstance(t, (int, float)) and now - t < LAG_DEFER_WINDOW_SECS * 10}
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = tmp_path(path)
-        with open(tmp, 'w') as f:
-            json.dump(seen, f)
-        os.replace(tmp, path)
-    except OSError:
-        return False
-    return True
 def persist_state(state):
-    try:
-        os.makedirs(GUARDIAN_DIR, exist_ok=True)
-        tmp = tmp_path(STATE_PATH)
-        with open(tmp, 'w') as f:
-            json.dump(state, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, STATE_PATH)
-        fsync_parent(STATE_PATH)
-        return True
-    except OSError as e:
-        log('could not persist guardian state: %s' % e)
-        return False
+    return save_guardian_state(state, STATE_PATH, log)
 
 def market_resolved(condition, timeout=8):
     return resolution.is_resolved(condition)
@@ -911,13 +745,13 @@ def gather_and_check(dry_run):
                 verdict, evidence = corroborate.check(f['family'], f, corr_ctx)
             if not corroborate.halts(verdict):
                 log('REFUTED (not halting) %s: %s || independent check: %s' % (lane_name, reason[:90], evidence))
-                if refutation_is_new(lane_name, reason, now):
+                if refutation_is_new(lane_name, reason, now, REFUTED_SEEN_PATH):
                     record_error(lane_name, 'refuted', '%s || %s' % (reason, evidence))
                 continue
             if f is not None:
                 global _LAST_CORROBORATION
                 _LAST_CORROBORATION = verdict
-            if f is not None and verdict == corroborate.LAGGING and defer_for_lag(lane_name, f.get('token'), now):
+            if f is not None and verdict == corroborate.LAGGING and defer_for_lag(lane_name, f.get('token'), now, LAG_DEFER_PATH):
                 log('DEFERRED one cycle %s: %s || %s' % (lane_name, reason[:80], evidence))
                 continue
             if f is not None and verdict != corroborate.CONFIRMED:
@@ -925,7 +759,7 @@ def gather_and_check(dry_run):
             immediate_lane_reasons.append((lane_name, '%s: %s' % (lane_name, reason)))
         lane_summaries.append((lane_name, len(held), backend_open_usd, len(lane_fires), float(lane.get('spent_today') or 0.0)))
     pool = dash(port, '/api/pool')
-    record_equity_point(pool, now)
+    append_equity(pool, now, EQUITY_HISTORY_PATH)
     if isinstance(pool, dict) and pool.get('headroom') is not None:
         head = float(pool['headroom'])
         if head < 0:
@@ -985,7 +819,7 @@ def gather_and_check(dry_run):
     confirm_issues, advisory = split_by_severity(confirm_issues)
     for code, msg in advisory:
         log('WARN: %s (advisory — reported, not halting): %s' % (code, msg))
-    record_advisories(advisory, now)
+    append_advisories(advisory, now, ADVISORY_STATE_PATH, record_error)
     if confirm_issues:
         return 1 if confirm_or_disarm(confirm_issues, dry_run, now=now) else 0
     try:
