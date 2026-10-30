@@ -16,7 +16,7 @@
 | 2 | anoin123 `0x96489abcb9f583d6835c8ef95ffc923d05a86825` | 3.178 | +689,741 / +703,491 | 126 / 23 | 58.7% (378) | 289.32 / 254,105 | 73.0% | +0.294 (3) | missing / missing |
 | 3 | 0x0E7Fa... `0x9a46375a768cd76c06b5eee2d1005eef16061d99` | 0.450 | +16,711 / +17,090 | 160 / 8 | 77.7% (278) | 15.68 / 999 | 26.9% | missing (0) | missing / missing |
 | 4 | BreakTheBank `0xf0318c32136c2db7fec88b84869aee6a1106c80c` | 0.309 | +6,853,484 / +3,812,146 | 257 / 28 | 95.1% (203) | 8,117.66 / 607,583 | 93.0% | +1.000 (7) | +1.000 (5) / +1.000 (8) |
-| 5 | elmcap2 `0xed107a85a4585a381e48c7f7ca4144909e7dd2e5` | 0.247 | +248,413 / +335,761 | 122 / 22 | 81.6% (sample) | see screen.csv / 260,511 | 33.6% | +0.564 (5) | +1.000 (1) / missing |
+| 5 | elmcap2 `0xed107a85a4585a381e48c7f7ca4144909e7dd2e5` | 0.247 | +248,413 / +335,761 | 122 / 22 | 81.6% (sample) | 1,162.22 / 260,511 | 33.6% | +0.564 (5) | +1.000 (1) / missing |
 
 **paddaa trade mix:** geopolitics, Middle East ceasefire, elections and diplomacy rather than 15-minute crypto; median observed BUY-then-SELL hold = 15.95 hours (200 paired sequences). For latest 22 sampled Gamma condition markets median scheduled remaining 63.1 days. Latest sample's 1s adverse was positive even before the follower's taker spread/fees, so **live gate fails**. Other finalists have sparse, positive-adverse or missing print samples, and large 30d fill maxima. The highest raw P&L wallet is not automatically copyable.
 
