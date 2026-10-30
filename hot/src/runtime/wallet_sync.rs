@@ -26,10 +26,20 @@ pub(crate) fn spawn(
         let watched_rt = watched_addrs.clone();
         let pl_rt = pair_ledger.clone();
         tokio::spawn(async move {
-            let http_rt = reqwest::Client::builder()
+            let http_rt = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
-                .unwrap_or_default();
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    eprintln!("[wallets] REFUSING registry sync without timed HTTP client: {error}");
+                    ev_rt.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "wallet_sync_unavailable",
+                        "reason": "http_client_initialization",
+                    }));
+                    return;
+                }
+            };
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             let mut seed_retry: std::collections::HashMap<
                 String,
