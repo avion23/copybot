@@ -6,6 +6,7 @@ here. A failed write must remain visible to the caller as Unverifiable.
 from collections import deque
 from dataclasses import fields
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -94,3 +95,130 @@ class ObservationJournal:
 
     def __exit__(self, _exc_type, _exc, _trace):
         self.close()
+
+
+class AlertRouter:
+    """One opt-in writer for canonical alerts and Guardian-compatible sidecars.
+
+    The original watcher/fillwatch/buywatch standalone writers remain active
+    only when no AlertRouter sink has been installed by the single Observer.
+    This is not an email notifier or an order/halt authority.
+    """
+
+    def __init__(self, run_dir, *, watcher_path=None, buywatch_path=None):
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.canonical_path = self.run_dir / "observer_alerts.jsonl"
+        self.watcher_path = (Path(watcher_path) if watcher_path is not None
+                             else self.run_dir / "watcher_alerts.jsonl")
+        self.buywatch_path = (Path(buywatch_path) if buywatch_path is not None
+                              else self.run_dir / "buywatch_alerts.jsonl")
+        self._lock = threading.Lock()
+        self._seq = self._read_watcher_seq()
+        # Validate the destination before installing a sensor sink.
+        fd = self._open(self.canonical_path, create=True, strict=True)
+        os.close(fd)
+
+    @staticmethod
+    def _open(path, *, create, strict=False):
+        flags = os.O_CLOEXEC | os.O_NOFOLLOW | (os.O_RDWR if create else os.O_RDONLY)
+        if create:
+            flags |= os.O_CREAT | os.O_APPEND
+        fd = os.open(path, flags, 0o600)
+        try:
+            info = os.fstat(fd)
+            mode = stat.S_IMODE(info.st_mode)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or (mode != 0o600 if strict else bool(mode & 0o022))):
+                raise PermissionError("unsafe Observer alert destination: %s" % path)
+        except Exception:
+            os.close(fd)
+            raise
+        return fd
+
+    def _read_watcher_seq(self):
+        try:
+            fd = self._open(self.watcher_path, create=False)
+        except FileNotFoundError:
+            return 0
+        seq = 0
+        with os.fdopen(fd, "rb") as stream:
+            for line in stream:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("invalid watcher alert row")
+                current = row.get("seq")
+                if type(current) is not int or current <= 0:
+                    raise ValueError("watcher alert sequence must be positive")
+                seq = max(seq, current)
+        return seq
+
+    def _write(self, path, row, *, strict=False):
+        data = (json.dumps(row, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":")) + "\n").encode("utf-8")
+        fd = self._open(path, create=True, strict=strict)
+        try:
+            cursor = 0
+            while cursor < len(data):
+                count = os.write(fd, data[cursor:])
+                if count <= 0:
+                    raise OSError("Observer alert write made no progress")
+                cursor += count
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def record(self, source, record):
+        """Commit one legacy projection and one canonical alert, serially."""
+        if source not in ("watcher", "fillwatch", "buywatch"):
+            raise ValueError("unsupported Observer alert source")
+        if not isinstance(record, dict):
+            raise TypeError("alert must be a dictionary")
+        stamp = record.get("t")
+        if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                or not math.isfinite(stamp) or stamp < 0):
+            raise ValueError("alert timestamp must be finite and nonnegative")
+        kind = record.get("kind")
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError("alert kind required")
+        level = record.get("level", "WARNING" if source == "buywatch" else "CRITICAL")
+        if level not in ("INFO", "WARN", "WARNING", "CRITICAL"):
+            raise ValueError("invalid alert level")
+        message = record.get("msg")
+        if source == "buywatch":
+            count = record.get("count")
+            if type(count) is not int or count <= 0:
+                raise ValueError("buywatch unseen count must be positive")
+            message = "unseen leader buys: %d" % count
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("alert must carry a message")
+        lanes = record.get("lanes") or []
+        if (not isinstance(lanes, list)
+                or any(not isinstance(lane, str) or not lane for lane in lanes)):
+            raise ValueError("alert lanes must be a list of nonempty names")
+
+        with self._lock:
+            sidecar = dict(record)
+            if source != "buywatch":
+                next_seq = self._seq + 1
+                sidecar["seq"] = next_seq
+                sidecar["src"] = source
+                self._write(self.watcher_path, sidecar)
+                self._seq = next_seq
+            else:
+                # This format is read using the original timestamp cursor.
+                self._write(self.buywatch_path, sidecar)
+
+            event = {
+                "ev": "observer_alert", "source": source, "t": stamp,
+                "level": level, "kind": kind, "msg": message,
+                "lanes": sorted(set(lanes)),
+            }
+            if source != "buywatch":
+                event["legacy_seq"] = self._seq
+            if source == "buywatch":
+                event["count"] = record["count"]
+            # A central write failure is explicit. Already committed legacy
+            # critical sidecars remain visible to Guardian for safe retry.
+            self._write(self.canonical_path, event, strict=True)
+            return event

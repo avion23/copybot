@@ -44,12 +44,27 @@ _dropped_alerted = 0
 lock = threading.Lock()
 ALERTS_PATH = os.environ.get('WATCHER_ALERTS', os.path.join(BOT_DIR, 'run', 'watcher_alerts.jsonl'))
 _alert_seq = [0]
+_ALERT_SINK = None
+
+
+def configure_alert_sink(sink):
+    """Opt-in Observer-owned writer; standalone watcher uses its old file."""
+    global _ALERT_SINK
+    if sink is not None and not callable(sink):
+        raise TypeError('watcher alert sink must be callable')
+    previous = _ALERT_SINK
+    _ALERT_SINK = sink
+    return previous
+
 
 def append_alert(level, kind, msg, lanes=None):
     _alert_seq[0] += 1
     row = {'seq': _alert_seq[0], 't': time.time(), 'level': level, 'kind': kind, 'msg': msg}
     if lanes:
         row['lanes'] = sorted({str(x) for x in lanes if x})
+    if _ALERT_SINK is not None:
+        _ALERT_SINK('watcher', row)
+        return
     try:
         os.makedirs(os.path.dirname(ALERTS_PATH), exist_ok=True)
         with open(ALERTS_PATH, 'a') as f:

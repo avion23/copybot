@@ -19,7 +19,7 @@ if _DEPLOY not in sys.path:
 
 import corroborate
 from observer.adapters import AUDITS, AuditResult
-from observer.alerts import ObservationJournal
+from observer.alerts import ObservationJournal, AlertRouter
 from observer.lease import ObserverLease
 
 
@@ -150,12 +150,22 @@ def main(argv=None):
     # Monitoring never needs the order-signing key, even if the caller exported it.
     os.environ.pop("PRIVATE_KEY", None)
     import watcher
+    import fillwatch
+    import buywatch
     bot_dir = os.environ.get("BOT_DIR", "/opt/copybot")
     path = Path(bot_dir) / "run" / "observer.owner.lock"
     with ObserverLease(path):
         journal_path = Path(bot_dir) / "run" / "observer_observations.jsonl"
         with ObservationJournal(journal_path) as journal:
+            alerts = AlertRouter(
+                Path(bot_dir) / "run",
+                watcher_path=watcher.ALERTS_PATH,
+                buywatch_path=buywatch.ALERT_PATH,
+            )
             previous = corroborate.configure_observation_sink(journal.record)
+            previous_watcher = watcher.configure_alert_sink(alerts.record)
+            previous_fillwatch = fillwatch.configure_alert_sink(alerts.record)
+            previous_buywatch = buywatch.configure_alert_sink(alerts.record)
             try:
                 owner = ObserverScheduler(watcher.WatchSession(45))
                 try:
@@ -166,6 +176,9 @@ def main(argv=None):
                 finally:
                     owner.close()
             finally:
+                buywatch.configure_alert_sink(previous_buywatch)
+                fillwatch.configure_alert_sink(previous_fillwatch)
+                watcher.configure_alert_sink(previous_watcher)
                 corroborate.configure_observation_sink(previous)
 
 

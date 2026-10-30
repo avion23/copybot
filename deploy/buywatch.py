@@ -10,6 +10,30 @@ BOT_DIR = os.environ.get('BOT_DIR', '/opt/copybot')
 WINDOW_SECS = int(os.environ.get('BUYWATCH_WINDOW', '1260'))
 JOIN_SECS = int(os.environ.get('BUYWATCH_JOIN', '900'))
 ALERT_PATH = os.path.join(BOT_DIR, 'run', 'buywatch_alerts.jsonl')
+_ALERT_SINK = None
+
+
+def configure_alert_sink(sink):
+    """Observer-owned alert writer, installed only inside the opt-in owner."""
+    global _ALERT_SINK
+    if sink is not None and not callable(sink):
+        raise TypeError('buywatch alert sink must be callable')
+    previous = _ALERT_SINK
+    _ALERT_SINK = sink
+    return previous
+
+
+def record_unseen_alert(record):
+    if _ALERT_SINK is not None:
+        _ALERT_SINK('buywatch', record)
+        return
+    try:
+        os.makedirs(os.path.dirname(ALERT_PATH), exist_ok=True)
+        with open(ALERT_PATH, 'a') as f:
+            f.write(json.dumps(record) + '\n')
+    except OSError as error:
+        log('could not write the alert file: %s' % error)
+
 
 def log(msg):
     print('%s %s' % (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), msg), flush=True)
@@ -124,12 +148,16 @@ def run(window_secs, dry_run=False):
         for lane, b in unseen[:10]:
             log("!!! UNSEEN: %s — leader bought %.2f sh of …%s and the bot recorded NO decision. The decode did not surface his fill; check the feed and that this lane's leader address is right. tx %s" % (lane, b['shares'], str(b['token'])[-8:], b.get('tx')))
         if not dry_run:
-            try:
-                os.makedirs(os.path.dirname(ALERT_PATH), exist_ok=True)
-                with open(ALERT_PATH, 'a') as f:
-                    f.write(json.dumps({'t': int(now), 'kind': 'unseen_leader_buys', 'count': len(unseen), 'lanes': sorted({l for l, _ in unseen}), 'sample': [{'lane': l, 'token': str(b['token']), 'shares': b['shares'], 'tx': b.get('tx')} for l, b in unseen[:10]]}) + '\n')
-            except OSError as e:
-                log('could not write the alert file: %s' % e)
+            record_unseen_alert({
+                't': int(now), 'kind': 'unseen_leader_buys',
+                'count': len(unseen),
+                'lanes': sorted({l for l, _ in unseen}),
+                'sample': [
+                    {'lane': l, 'token': str(b['token']),
+                     'shares': b['shares'], 'tx': b.get('tx')}
+                    for l, b in unseen[:10]
+                ],
+            })
         log('NOT-PASS: %d leader buy(s) never reached a decision' % len(unseen))
         return 1
     log('PASS: every leader buy in the window reached a decision')

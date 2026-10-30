@@ -19,6 +19,11 @@ one serialized background audit worker. No trading key is used.
   each first overdue sensor emits an observer_deferred record
 - The scheduler emits Observer **health** records. They do not assert an
   independently confirmed market event or imply that a halt was applied
+- When explicitly enabled, watcher/fillwatch/buywatch critical alerts
+  flow through one `AlertRouter` to protected `run/observer_alerts.jsonl`;
+  the same writer maintains `watcher_alerts.jsonl` and
+  `buywatch_alerts.jsonl` for Guardian's existing alert cursors. Legacy
+  standalone services retain their original independent writers.
 - When explicitly enabled, checked corroborations from the four sensors
   use one `run/observer_observations.jsonl` journal (owner-only 0600, fsynced)
   and durable occurrence dedup across sources and restarts, only where a
@@ -69,5 +74,5 @@ The shared Observation schema is wired through the existing corroboration
 path. **One persistent corroboration journal and occurrence dedup are now
 active in the opt-in Observer process**; prior per-sensor critical-alert
 files and policy effects are retained deliberately, so a sole downstream
-alert-delivery writer is not yet established. Do not mark A5 DONE or claim live
+email/Guardian error-log delivery remains outside that router and needs production parity verification. Do not mark A5 DONE or claim live
 equivalence from synthetic probes.

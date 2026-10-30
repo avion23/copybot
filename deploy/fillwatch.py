@@ -243,7 +243,26 @@ def is_unstrandable(lane, token, shares, marks):
         return False
     return shares * mark < DUST_USD
 
+_ALERT_SINK = None
+
+
+def configure_alert_sink(sink):
+    """Opt-in Observer-owned alert writer; legacy output stays unchanged."""
+    global _ALERT_SINK
+    if sink is not None and not callable(sink):
+        raise TypeError('fillwatch alert sink must be callable')
+    previous = _ALERT_SINK
+    _ALERT_SINK = sink
+    return previous
+
+
 def record_alert(kind, msg):
+    if _ALERT_SINK is not None:
+        _ALERT_SINK('fillwatch', {
+            't': time.time(), 'level': 'CRITICAL',
+            'kind': kind, 'msg': msg, 'src': 'fillwatch',
+        })
+        return
     seq = 0
     try:
         with open(ALERTS_PATH) as f:
@@ -397,13 +416,23 @@ def run(window_secs, dry_run):
         log('PASS: every leader exit in the window is matched, and every buy of ours traces to a leader')
         return 0
     acted = True
+    alert_recorded = True
     for lane, kind, msg in faults:
         log('⛔ %s (%s): %s' % (kind, lane, msg))
-        record_alert('FILLWATCH_' + kind, msg)
+        try:
+            record_alert('FILLWATCH_' + kind, msg)
+        except Exception as error:
+            # Never skip a safety halt merely because the central alert
+            # journal cannot be written; report the audit as unverifiable.
+            log('⛔ Observer alert persistence FAILED: %r' % (error,))
+            alert_recorded = False
         if not halt_buys(lane, msg, dry_run):
             acted = False
     if not acted:
         log('⛔ a halt could not be written — the fault stands and this pass did NOT consume it; the next run will retry')
+        return 2
+    if not alert_recorded:
+        log('⛔ halt was attempted but Observer alert persistence failed — this pass is UNVERIFIABLE and will retry')
         return 2
     return 1
 
