@@ -25,6 +25,7 @@ import notify
 from observer.adapters import AUDITS, AuditResult
 from observer.alerts import ObservationJournal, AlertRouter
 from observer.delivery import NotificationDelivery
+from observer.health import ObserverHealth
 from observer.lease import ObserverLease
 
 
@@ -184,6 +185,7 @@ def main(argv=None):
     with ObserverLease(path):
         journal_path = Path(bot_dir) / "run" / "observer_observations.jsonl"
         delivery_path = Path(bot_dir) / "run" / "observer_notifications.jsonl"
+        health_path = Path(bot_dir) / "run" / "observer_health.json"
         with ObservationJournal(journal_path) as journal, NotificationDelivery(
             delivery_path, notify._send_direct,
             source=corroborate.current_sensor_source,
@@ -193,6 +195,9 @@ def main(argv=None):
                 watcher_path=watcher.ALERTS_PATH,
                 buywatch_path=buywatch.ALERT_PATH,
             )
+            # Reset the previous process's health receipt while this new
+            # process still holds the exclusive owner lock.
+            health = ObserverHealth(health_path, output=report_event)
             previous = corroborate.configure_observation_sink(journal.record)
             previous_watcher = watcher.configure_alert_sink(alerts.record)
             previous_fillwatch = fillwatch.configure_alert_sink(alerts.record)
@@ -202,15 +207,21 @@ def main(argv=None):
             )
             previous_notify = notify.configure_send_sink(notifications.send)
             try:
-                owner = ObserverScheduler(watcher.WatchSession(45))
+                owner = ObserverScheduler(
+                    watcher.WatchSession(45), report=health.record,
+                )
                 with graceful_stop():
                     try:
                         owner.start()
+                        health.record({
+                            "ev": "observer_started",
+                            "observed_at": time.time(),
+                        })
                         while True:
                             owner.step()
                             time.sleep(1)
                     except ObserverStop:
-                        report_event({
+                        health.record({
                             "ev": "observer_stopping",
                             "reason": "termination_requested",
                             "observed_at": time.time(),

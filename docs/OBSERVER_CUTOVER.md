@@ -125,6 +125,18 @@ zero lost unjudged fills. A feed merely marked `useful` during
 resubscription is not enough. A valid heartbeat is still a self-report,
 so even a cutover preflight pass is not real-world market-data parity.
 
+During an explicitly authorized `cutover` check, the new Observer must
+also have created `run/observer_health.json` from the current exclusive
+process. This owner-only mode-`0600` receipt must say `STARTED` and
+record a fresh, successfully **completed** Guardian audit with exit code
+zero. The latest per-engine Guardian state timestamp must fall between
+that process start and its completed Guardian result. A file left by a
+legacy Guardian, an audit still running, a failed or unverifiable audit,
+or a service shutting down must not count as ready. The health receipt
+is reset at the next Observer process start to prevent a previous
+process's PASS from being reused. An authenticated, independent market
+or systemd verification is still required for any production parity claim.
+
 The checker **does not** collect, authenticate, or modify those unit states.
 It verifies the supplied evidence, the expected engine state, and read-only
 run-directory/owner-lock metadata, and refuses stale, missing or

@@ -32,6 +32,7 @@ MAX_SNAPSHOT_AGE = 300
 WATCHER_HEARTBEAT_MAX_AGE = 90
 MAX_HEARTBEAT_BYTES = 65536
 MAX_GUARDIAN_STATE_BYTES = 1048576
+MAX_OWNER_HEALTH_BYTES = 65536
 START_DELAYS = {
     "copybot-guardian.timer": ("30s", "11s", "copybot-guardian.service"),
     "copybot-fillwatch.timer": ("5min", "15min", "copybot-fillwatch.service"),
@@ -196,6 +197,7 @@ def check_cutover_artifacts(run_dir, service_uid, *, now):
     # Guardian's chain-blind path can update this file WITHOUT performing
     # chain-derived checks. A fresh inode alone is not evidence of an audit.
     guardian_path = root / "guardian_state.json"
+    guardian_cycle_at = None
     try:
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         fd = os.open(guardian_path, flags)
@@ -231,6 +233,8 @@ def check_cutover_artifacts(run_dir, service_uid, *, now):
                     or not math.isfinite(run_at)
                     or not 0 <= now - run_at <= WATCHER_HEARTBEAT_MAX_AGE):
                 errors.append("Guardian completed audit timestamp is not recent")
+            else:
+                guardian_cycle_at = run_at
             lanes = cycle.get("lanes")
             if (not isinstance(lanes, dict) or not lanes
                     or any(not isinstance(name, str) or not name.strip()
@@ -239,6 +243,59 @@ def check_cutover_artifacts(run_dir, service_uid, *, now):
                 errors.append("Guardian completed audit lacks lane evidence")
     except (OSError, ValueError, TypeError) as exc:
         errors.append("Guardian state unreadable or invalid: %s" %
+                      type(exc).__name__)
+
+    # Guardian writes the per-engine snapshot BEFORE its final confirmation,
+    # halt and reporting branches return. Only a later real audit-result
+    # receipt from THIS Observer process can establish that run completed.
+    health_path = root / "observer_health.json"
+    try:
+        fd = os.open(health_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != service_uid or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_size > MAX_OWNER_HEALTH_BYTES):
+                raise ValueError("Observer health receipt inode is unsafe or oversized")
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                data = stream.read(MAX_OWNER_HEALTH_BYTES + 1)
+            if len(data) > MAX_OWNER_HEALTH_BYTES:
+                raise ValueError("Observer health receipt exceeds bounded read")
+            health = json.loads(data)
+        finally:
+            os.close(fd)
+        if not isinstance(health, dict) or type(health.get("schema")) is not int or health["schema"] != 1:
+            raise ValueError("Observer health receipt schema is missing or invalid")
+        if health.get("owner_state") != "STARTED":
+            errors.append("Observer has no active process-start receipt")
+        started = health.get("started_at")
+        audit = health.get("guardian")
+        if (type(started) not in (int, float)
+                or not math.isfinite(started)
+                or not 0 <= now - started):
+            errors.append("Observer start receipt is missing or future")
+        if not isinstance(audit, dict):
+            errors.append("Observer has no completed Guardian audit receipt")
+        else:
+            completed = audit.get("completed_at")
+            if (audit.get("status") != "PASS"
+                    or type(audit.get("exit_code")) is not int
+                    or audit["exit_code"] != 0):
+                errors.append("last completed Guardian audit did not pass")
+            if (type(completed) not in (int, float)
+                    or not math.isfinite(completed)
+                    or not 0 <= now - completed <= WATCHER_HEARTBEAT_MAX_AGE):
+                errors.append("Guardian audit result receipt is missing or stale")
+            elif (type(started) not in (int, float)
+                  or not math.isfinite(started)
+                  or not started <= completed):
+                errors.append("Guardian audit completion predates this Observer")
+            elif (guardian_cycle_at is None
+                  or not started <= guardian_cycle_at <= completed):
+                errors.append("Guardian state was not completed in this audit")
+    except (OSError, ValueError, TypeError) as exc:
+        errors.append("Observer health receipt unreadable or invalid: %s" %
                       type(exc).__name__)
 
     # A fresh file alone does not prove the watcher can decode leader fills.
