@@ -42,17 +42,24 @@ def guardian_once():
 
 
 def _guardian_once():
-    """Same exception/halt policy as guardian.main without argparse/sys.argv."""
+    """Preserve Guardian halt behavior; do not call a partial check PASS."""
     import guardian
+    receipt = guardian._OBSERVER_FULL_AUDIT.set(None)
     try:
-        code = guardian.gather_and_check(False)
-    except Exception as error:
-        guardian.log("GUARDIAN ITSELF FAILED: %s — disarming out of caution" % error)
         try:
-            guardian.disarm_all("guardian crashed: %s" % error, dry_run=False)
-        except Exception as halt_error:
-            guardian.log("GUARDIAN HALT REQUEST FAILED: %s" % halt_error)
-        code = 3
+            code = guardian.gather_and_check(False)
+        except Exception as error:
+            guardian.log("GUARDIAN ITSELF FAILED: %s — disarming out of caution" % error)
+            try:
+                guardian.disarm_all("guardian crashed: %s" % error, dry_run=False)
+            except Exception as halt_error:
+                guardian.log("GUARDIAN HALT REQUEST FAILED: %s" % halt_error)
+            code = 3
+        if code == 0 and guardian._OBSERVER_FULL_AUDIT.get() is not True:
+            guardian.log("UNVERIFIABLE: Guardian did not complete and persist its full audit")
+            code = 3
+    finally:
+        guardian._OBSERVER_FULL_AUDIT.reset(receipt)
     return _outcome("guardian", code, unknown_codes=(3,), alert_codes=(1, 2))
 
 

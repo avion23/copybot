@@ -1,5 +1,6 @@
 import argparse
 import collections
+from contextvars import ContextVar
 import glob
 import fcntl
 import hashlib
@@ -464,6 +465,11 @@ def market_resolved(condition, timeout=8):
     return resolution.is_resolved(condition)
 
 CHAIN_BLIND_WARN_RUNS = 20
+
+# Opt-in Observer adapter reads this per-call proof only after Guardian has
+# completed all checks AND persisted its final state. Standalone exit codes
+# are unchanged, including the chain-blind/deferred code-zero paths.
+_OBSERVER_FULL_AUDIT = ContextVar("guardian_observer_full_audit", default=None)
 
 def process_watcher_criticals(state, dry_run):
     immediate = []
@@ -930,7 +936,8 @@ def gather_and_check(dry_run):
         persist_state(state)
         log('NOT-PASS: %d lane(s) halted and forgotten: %s' % (len(stale), ', '.join(('%s=%s' % (n, human_secs(a)) for n, a in stale))))
         return 1
-    persist_state(state)
+    persisted = persist_state(state)
+    _OBSERVER_FULL_AUDIT.set(persisted is True)
     log('PASS: armed_slot=%d lanes=%d %s' % (port, len(lane_summaries), detail))
     return 0
 

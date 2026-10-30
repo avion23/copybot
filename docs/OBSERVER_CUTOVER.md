@@ -137,6 +137,15 @@ is reset at the next Observer process start to prevent a previous
 process's PASS from being reused. An authenticated, independent market
 or systemd verification is still required for any production parity claim.
 
+An Observer Guardian audit returning code `0` is now eligible for a
+`PASS` receipt **only** when the original Guardian reached its final
+full-audit success and durably persisted state. A partial-chain (or
+no-armed/deferred) zero return is explicitly `UNVERIFIABLE` inside the
+opt-in Observer, so the operator cannot use an old Guardian state file
+to justify live cutover. The standalone Guardian timer's exit-code behavior
+remains unchanged. Check `observer_health.json` and the Guardian journal
+for UNVERIFIABLE results before attempting any deployment.
+
 The checker **does not** collect, authenticate, or modify those unit states.
 It verifies the supplied evidence, the expected engine state, and read-only
 run-directory/owner-lock metadata, and refuses stale, missing or
