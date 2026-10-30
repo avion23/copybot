@@ -6,6 +6,8 @@ use super::telemetry::{now_ms, Emitter};
 use copybot_hot::control::Control;
 use copybot_hot::lanes::Router;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 pub(crate) fn release_cancelled(
     guard: &Option<Arc<copybot_hot::signal_guard::SignalGuard>>,
@@ -354,4 +356,335 @@ pub(crate) async fn rescue_exit(
 ({fail:?}) — position is STILL HELD"
     );
     false
+}
+
+pub(crate) fn spawn_cancellation_sweep(
+    resting_book: &Arc<copybot_hot::resting::RestingBook>,
+    http: &reqwest::Client,
+    clob: &String,
+    auth_addr: &String,
+    creds: &Arc<Option<copybot_hot::auth::ApiCreds>>,
+    router: &Arc<Router>,
+    emitter: &Arc<Emitter>,
+    signal_guard: &Option<Arc<copybot_hot::signal_guard::SignalGuard>>,
+    levels: &Arc<copybot_hot::book::Levels>,
+    prints: &Arc<copybot_hot::book::TradePrints>,
+) {
+        const TTL_SECS: i64 = 1_800;
+        const MAX_LIVE_PER_LANE: usize = 6;
+        const MAX_LIVE: usize = 36;
+        let (rb, http_c, clob_c, addr_c, creds_c, r_c, e_c) = (
+            resting_book.clone(),
+            http.clone(),
+            clob.clone(),
+            auth_addr.clone(),
+            creds.clone(),
+            router.clone(),
+            emitter.clone(),
+        );
+        let sg_sweep = signal_guard.clone();
+        let (levels_sweep, prints_sweep) = (levels.clone(), prints.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if rb.is_empty() {
+                    continue;
+                }
+                let Some(cr) = creds_c.as_ref().as_ref() else { continue };
+                let now = copybot_hot::ledger::now_secs();
+                let armed_anywhere = r_c
+                    .snapshot()
+                    .iter()
+                    .any(|l| l.state.armed.load(Ordering::Relaxed));
+                use copybot_hot::resting::CancelReason;
+                let mut doomed: Vec<(String, CancelReason)> = Vec::new();
+                if !armed_anywhere {
+                    for o in rb.all() {
+                        doomed.push((o.order_id, CancelReason::Disarmed));
+                    }
+                } else {
+                    let by_name: std::collections::HashMap<String, std::sync::Arc<_>> = r_c
+                        .snapshot()
+                        .into_iter()
+                        .map(|l| (l.cfg.name.clone(), l))
+                        .collect();
+                    for o in rb.all() {
+                        let pull = match by_name.get(&o.lane) {
+                            Some(l) => {
+                                copybot_hot::resting::halted_lane_must_pull(
+                                    o.side,
+                                    l.state.halted.load(Ordering::Relaxed),
+                                    l.state.armed.load(Ordering::Relaxed),
+                                    l.state.retired.load(Ordering::Relaxed),
+                                )
+                            }
+                            None => o.side == 0,
+                        };
+                        if pull {
+                            doomed.push((o.order_id, CancelReason::LaneHalted));
+                        }
+                    }
+                    for o in rb.expired(now, TTL_SECS) {
+                        if doomed.iter().any(|(i, _)| i == &o.order_id) {
+                            continue;
+                        }
+                        let v = rest_verdict(&levels_sweep, &prints_sweep, &o);
+                        if copybot_hot::restwatch::renewable(v, now - o.placed, o.side) {
+                            continue;
+                        }
+                        doomed.push((o.order_id, CancelReason::Expired));
+                    }
+                    for o in rb.all() {
+                        if doomed.iter().any(|(i, _)| i == &o.order_id) {
+                            continue;
+                        }
+                        if rest_verdict(&levels_sweep, &prints_sweep, &o)
+                            == copybot_hot::restwatch::RestVerdict::HeCancelled
+                        {
+                            doomed.push((o.order_id, CancelReason::HeCancelled));
+                        }
+                    }
+                    for o in rb.all() {
+                        let permitted = r_c
+                            .snapshot()
+                            .iter()
+                            .find(|l| l.cfg.name == o.lane)
+                            .map(|l| {
+                                if o.side == 0 {
+                                    l.state.rest_buys.load(Ordering::Relaxed)
+                                } else {
+                                    l.state.rest_sells.load(Ordering::Relaxed)
+                                }
+                            })
+                            .unwrap_or(false);
+                        if !permitted && !doomed.iter().any(|(i, _)| i == &o.order_id) {
+                            doomed.push((o.order_id, CancelReason::RestingDisabled));
+                        }
+                    }
+                    for o in rb
+                        .over_cap_per_lane(MAX_LIVE_PER_LANE)
+                        .into_iter()
+                        .chain(rb.over_cap(MAX_LIVE))
+                    {
+                        if !doomed.iter().any(|(i, _)| i == &o.order_id) {
+                            doomed.push((o.order_id, CancelReason::OverCap));
+                        }
+                    }
+                }
+                if doomed.is_empty() {
+                    continue;
+                }
+                let mut ids: Vec<String> = doomed
+                    .iter()
+                    .map(|(i, _)| i.clone())
+                    .collect();
+                ids.sort();
+                ids.dedup();
+                let res = copybot_hot::resting::cancel_batch(
+                        &http_c,
+                        &clob_c,
+                        &addr_c,
+                        cr,
+                        &ids,
+                    )
+                    .await;
+                let settles = res
+                    .iter()
+                    .filter(|(_, ok)| *ok)
+                    .map(|(id, _)| {
+                        let why = doomed
+                            .iter()
+                            .find(|(i, _)| i == id)
+                            .map(|(_, r)| r.as_str())
+                            .unwrap_or("cancelled");
+                        settle_cancelled_rest(
+                            &http_c,
+                            &clob_c,
+                            &addr_c,
+                            cr,
+                            &rb,
+                            &sg_sweep,
+                            &e_c,
+                            id,
+                            why,
+                        )
+                    });
+                futures_util::future::join_all(settles).await;
+                let why = doomed.first().map(|(_, r)| r.as_str()).unwrap_or("?");
+                e_c.emit(
+                    serde_json::json!(
+                        { "t" : now_ms(), "ev" : "cancel_sweep", "reason" : why,
+                        "attempted" : ids.len(), "cancelled" : res.iter().filter(| (_,
+                        ok) | * ok).count(), "still_live" : rb.len(), }
+                    ),
+                );
+            }
+        });
+}
+
+pub(crate) fn spawn_open_order_reconcile(
+    resting_book: &Arc<copybot_hot::resting::RestingBook>,
+    http: &reqwest::Client,
+    clob: &String,
+    auth_addr: &String,
+    creds: &Arc<Option<copybot_hot::auth::ApiCreds>>,
+    emitter: &Arc<Emitter>,
+    signal_guard: &Option<Arc<copybot_hot::signal_guard::SignalGuard>>,
+    router: &Arc<Router>,
+    control: &Arc<std::sync::Mutex<Control>>,
+) {
+        let (rb_r, http_r, clob_r, addr_r, creds_r, e_r, sg_r, rt_r, ctl_r) = (
+            resting_book.clone(),
+            http.clone(),
+            clob.clone(),
+            auth_addr.clone(),
+            creds.clone(),
+            emitter.clone(),
+            signal_guard.clone(),
+            router.clone(),
+            control.clone(),
+        );
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            let mut last_unattributable = 0usize;
+            loop {
+                tick.tick().await;
+                let Some(cr) = creds_r.as_ref().as_ref() else { continue };
+                let path = "/data/orders";
+                let Ok(h) = copybot_hot::auth::l2_headers(
+                    &addr_r,
+                    cr,
+                    copybot_hot::auth::now_secs(),
+                    "GET",
+                    path,
+                    None,
+                ) else { continue };
+                let mut rq = http_r.get(format!("{clob_r}{path}"));
+                for (k, v) in &h {
+                    rq = rq.header(*k, v);
+                }
+                let Ok(resp) = rq.send().await else { continue };
+                if !resp.status().is_success() {
+                    continue;
+                }
+                let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
+                let Some(rows) = v.as_array() else { continue };
+                if rows.is_empty() && !rb_r.is_empty() {
+                    e_r.emit(
+                        serde_json::json!(
+                            { "t" : now_ms() as i64, "ev" : "open_orders_reconcile",
+                            "skipped" :
+                            "empty venue list \
+while we hold rests — refusing to prune on an ambiguous read",
+                            "ours" : rb_r.len() }
+                        ),
+                    );
+                    continue;
+                }
+                let venue_ids: std::collections::HashSet<String> = rows
+                    .iter()
+                    .filter_map(|r| r["id"].as_str().or_else(|| r["orderID"].as_str()))
+                    .map(|i| i.trim_start_matches("0x").to_string())
+                    .collect();
+                let missing: Vec<String> = rb_r
+                    .all()
+                    .into_iter()
+                    .filter(|o| !venue_ids.contains(o.order_id.trim_start_matches("0x")))
+                    .map(|o| o.order_id)
+                    .collect();
+                let mut pruned = 0usize;
+                if !missing.is_empty() && !rb_r.prune_is_plausible(missing.len()) {
+                    e_r.emit(
+                        serde_json::json!(
+                            { "t" : now_ms() as i64, "ev" : "open_orders_reconcile",
+                            "skipped" :
+                            "too many of our rests are absent at once — treating \
+this as a bad read, not a mass cancellation",
+                            "missing" : missing.len(), "live" : rb_r.len() }
+                        ),
+                    );
+                } else {
+                    for id in &missing {
+                        settle_cancelled_rest(
+                                &http_r,
+                                &clob_r,
+                                &addr_r,
+                                cr,
+                                &rb_r,
+                                &sg_r,
+                                &e_r,
+                                id,
+                                "venue_gone",
+                            )
+                            .await;
+                        pruned += 1;
+                    }
+                }
+                let mut adopted = 0usize;
+                let mut unattributable = 0usize;
+                for r in rows {
+                    let Some(id) = r["id"].as_str().or_else(|| r["orderID"].as_str())
+                    else { continue };
+                    if rb_r.contains(id) {
+                        continue;
+                    }
+                    let Some(tok) = r["asset_id"]
+                        .as_str()
+                        .or_else(|| r["market"].as_str()) else { continue };
+                    let snap = rt_r.snapshot();
+                    let owner = rt_r
+                        .owner_of(tok)
+                        .and_then(|ix| snap.get(ix).map(|l| l.cfg.name.clone()))
+                        .or_else(|| {
+                            let g = ctl_r.lock().unwrap();
+                            let by_held: Vec<String> = snap
+                                .iter()
+                                .filter(|l| {
+                                    g
+                                        .ledger
+                                        .holdings(&l.cfg.name)
+                                        .get(tok)
+                                        .copied()
+                                        .unwrap_or(0.0) > 1e-9
+                                })
+                                .map(|l| l.cfg.name.clone())
+                                .collect();
+                            if by_held.len() == 1 {
+                                return Some(by_held[0].clone());
+                            }
+                            let by_his: Vec<String> = snap
+                                .iter()
+                                .filter(|l| {
+                                    g.his_pos
+                                        .get(&l.cfg.name)
+                                        .map(|h| h.contains_key(tok))
+                                        .unwrap_or(false)
+                                })
+                                .map(|l| l.cfg.name.clone())
+                                .collect();
+                            if by_his.len() == 1 {
+                                Some(by_his[0].clone())
+                            } else {
+                                None
+                            }
+                        });
+                    match owner {
+                        Some(lane) => {
+                            adopted += rb_r.rehydrate(&serde_json::json!([r]), &lane);
+                        }
+                        None => unattributable += 1,
+                    }
+                }
+                if pruned > 0 || adopted > 0 || unattributable != last_unattributable {
+                    e_r.emit(
+                        serde_json::json!(
+                            { "t" : now_ms() as i64, "ev" : "open_orders_reconcile",
+                            "pruned" : pruned, "adopted" : adopted, "unattributable" :
+                            unattributable, "live" : rb_r.len() }
+                        ),
+                    );
+                }
+                last_unattributable = unattributable;
+            }
+        });
 }
