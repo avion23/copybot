@@ -274,6 +274,10 @@ Guardian now imports its five checked-in monitoring dependencies (`resolution`, 
 
 `hot/src/pending_verdict.rs` now owns the pure order-status/trade-list parsing and price-merge decisions. The `pending.rs` facade re-exports the original six public parsing functions, preserving binary/runtime call sites and the existing test suite. The parser has no network, journal, or file I/O; durable WAL and unresolved-order lifecycle remain in the single `PendingLog`. This stage reduces `pending.rs` from 1,360 to 1,183 lines, adds a focused 187-line module, and deliberately does not change unknown-vs-filled semantics or move journal ownership. The 1,000-line pending-file budget remains open until its journal is separated.
 
+### A3: pending journal owner (COPYBOT-3)
+
+`hot/src/pending_journal.rs` now owns the one `PendingLog` implementation: durable replay and compaction, append/resolve, stale/due windows and inflight reservation reconstruction. The parent `pending.rs` retains the domain types and existing tests and exposes the same methods; the sibling `pending_verdict.rs` contains the pure venue parser. No second journal or order state owner was introduced, and no timeout, release-on-unknown or WAL recovery paths were altered. `pending.rs` decreased from 1,183 to **908 lines**, meeting its 1,000-line source cap; the journal is 281 lines and verdict parser 187. This closes the pending file-size A3 subgate, not the whole A3/A4 order-ownership redesign.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
