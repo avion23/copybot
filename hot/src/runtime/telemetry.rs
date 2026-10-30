@@ -1,6 +1,7 @@
 //! Event persistence and bounded stdout mirroring at the runtime edge.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
 // Probes reuse the event-ledger emitter; they never alter trading state.
@@ -110,6 +111,55 @@ impl FeedRace {
         }
         false
     }
+}
+
+/// Periodically publish socket, order-resting and feed race liveness counters.
+pub(crate) fn spawn_feed_status(
+    stats: &std::sync::Arc<copybot_hot::feeds::FeedStats>,
+    emitter: &std::sync::Arc<Emitter>,
+    books: &std::sync::Arc<copybot_hot::book::BookCache>,
+    watch_tokens: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    feed_registry: &std::sync::Arc<copybot_hot::feeds::FeedRegistry>,
+    book: &std::sync::Arc<copybot_hot::race::RaceBook>,
+    resting_book: &std::sync::Arc<copybot_hot::resting::RestingBook>,
+) {
+        let (s, e, bk, wt) = (
+            stats.clone(),
+            emitter.clone(),
+            books.clone(),
+            watch_tokens.clone(),
+        );
+        let (reg, rb) = (feed_registry.clone(), book.clone());
+        let reg_rb = resting_book.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let per: Vec<serde_json::Value> = reg
+                    .snapshot()
+                    .into_iter()
+                    .map(|(name, frames, xtx, recon, errs)| {
+                        serde_json::json!(
+                            { "feed" : name, "frames" : frames, "exchange_txs" : xtx,
+                            "reconnects" : recon, "errors" : errs, }
+                        )
+                    })
+                    .collect();
+                let (wins, confirms, redeliveries) = rb.stats();
+                e.emit(
+                    serde_json::json!(
+                        { "t" : now_ms(), "ev" : "feed_stats", "books_cached" : bk.len(),
+                        "books_watched" : wt.lock().unwrap().len(), "frames" : s.frames
+                        .load(Ordering::Relaxed), "exchange_txs" : s.exchange_txs
+                        .load(Ordering::Relaxed), "reconnects" : s.reconnects
+                        .load(Ordering::Relaxed), "errors" : s.errors
+                        .load(Ordering::Relaxed), "per_feed" : per, "resting" : reg_rb
+                        .snapshot(), "race" : { "wins" : wins, "confirms" : confirms,
+                        "redeliveries" : redeliveries, "behind_ms" : rb
+                        .median_behind_ms(), }, }
+                    ),
+                );
+            }
+        });
 }
 
 pub(crate) fn now_ms() -> u128 {
