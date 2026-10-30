@@ -112,6 +112,19 @@ coverage**, never synthesize these artifacts or bypass the checks. Pre-start
 not-yet-produced files. Passing this metadata/readiness gate still does **not**
 establish independent market-data truth or production parity.
 
+The `cutover` preflight now also requires evidence that Guardian completed
+a recent engine audit, rather than a recently touched state file. The
+bounded `run/guardian_state.json` must contain a fresh per-engine `8807`
+record with lane evidence and no active `chain_blind_runs` counter. Its
+chain-blind fast path can rewrite the file without completing the
+chain-derived checks, which must **not** count as healthy coverage. The
+watcher heartbeat must explicitly report a connected, non-booting,
+non-resubscribing feed with decoded messages and frame/decode ages no
+greater than 90 seconds, and consistent fill-buffer depth/capacity with
+zero lost unjudged fills. A feed merely marked `useful` during
+resubscription is not enough. A valid heartbeat is still a self-report,
+so even a cutover preflight pass is not real-world market-data parity.
+
 The checker **does not** collect, authenticate, or modify those unit states.
 It verifies the supplied evidence, the expected engine state, and read-only
 run-directory/owner-lock metadata, and refuses stale, missing or

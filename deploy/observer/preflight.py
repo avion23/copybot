@@ -31,6 +31,7 @@ ALL_STATES = frozenset((*LEGACY, OBSERVER, HOT))
 MAX_SNAPSHOT_AGE = 300
 WATCHER_HEARTBEAT_MAX_AGE = 90
 MAX_HEARTBEAT_BYTES = 65536
+MAX_GUARDIAN_STATE_BYTES = 1048576
 START_DELAYS = {
     "copybot-guardian.timer": ("30s", "11s", "copybot-guardian.service"),
     "copybot-fillwatch.timer": ("5min", "15min", "copybot-fillwatch.service"),
@@ -192,20 +193,53 @@ def check_cutover_artifacts(run_dir, service_uid, *, now):
             errors.append("Observer artifact unavailable: %s (%s)" %
                           (name, type(exc).__name__))
 
-    # The Guardian must have completed a recent audit. An old state file from
-    # the disabled timer cannot establish cutover health indefinitely.
+    # Guardian's chain-blind path can update this file WITHOUT performing
+    # chain-derived checks. A fresh inode alone is not evidence of an audit.
     guardian_path = root / "guardian_state.json"
     try:
-        guardian = os.stat(guardian_path, follow_symlinks=False)
-        if (not stat.S_ISREG(guardian.st_mode)
-                or guardian.st_uid != service_uid
-                or guardian.st_nlink != 1
-                or stat.S_IMODE(guardian.st_mode) & 0o022):
-            errors.append("Guardian state inode is unsafe")
-        if not 0 <= now - guardian.st_mtime <= WATCHER_HEARTBEAT_MAX_AGE:
-            errors.append("Guardian state has not been refreshed recently")
-    except OSError as exc:
-        errors.append("Guardian state unavailable: %s" % type(exc).__name__)
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        fd = os.open(guardian_path, flags)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != service_uid or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) & 0o022
+                    or info.st_size > MAX_GUARDIAN_STATE_BYTES):
+                raise ValueError("Guardian state inode is unsafe or oversized")
+            if not 0 <= now - info.st_mtime <= WATCHER_HEARTBEAT_MAX_AGE:
+                errors.append("Guardian state has not been refreshed recently")
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                data = stream.read(MAX_GUARDIAN_STATE_BYTES + 1)
+            if len(data) > MAX_GUARDIAN_STATE_BYTES:
+                raise ValueError("Guardian state exceeds bounded read")
+            state = json.loads(data)
+        finally:
+            os.close(fd)
+        if not isinstance(state, dict):
+            raise ValueError("Guardian state is not an object")
+        blind = state.get("chain_blind_runs", 0)
+        if type(blind) is not int or blind != 0:
+            errors.append("Guardian chain-derived evidence is blind or invalid")
+        # guardian.gather_and_check writes this per-port snapshot only on the
+        # complete-chain path, not on its blind or no-armed-lanes fast paths.
+        cycle = state.get("8807")
+        if not isinstance(cycle, dict):
+            errors.append("Guardian has no completed engine audit record")
+        else:
+            run_at = cycle.get("t")
+            if (type(run_at) not in (int, float)
+                    or not math.isfinite(run_at)
+                    or not 0 <= now - run_at <= WATCHER_HEARTBEAT_MAX_AGE):
+                errors.append("Guardian completed audit timestamp is not recent")
+            lanes = cycle.get("lanes")
+            if (not isinstance(lanes, dict) or not lanes
+                    or any(not isinstance(name, str) or not name.strip()
+                           or not isinstance(row, dict)
+                           for name, row in lanes.items())):
+                errors.append("Guardian completed audit lacks lane evidence")
+    except (OSError, ValueError, TypeError) as exc:
+        errors.append("Guardian state unreadable or invalid: %s" %
+                      type(exc).__name__)
 
     # A fresh file alone does not prove the watcher can decode leader fills.
     # Read one bounded heartbeat from a verified, non-symlink regular inode.
@@ -235,10 +269,23 @@ def check_cutover_artifacts(run_dir, service_uid, *, now):
                 or not 0 <= now - stamp <= WATCHER_HEARTBEAT_MAX_AGE):
             errors.append("watcher heartbeat is missing, future or stale")
         feed = heartbeat.get("feed")
-        if (not isinstance(feed, dict)
-                or feed.get("useful") is not True
-                or feed.get("decoded_ever") is not True):
-            errors.append("watcher feed cannot prove useful decoded activity")
+        if not isinstance(feed, dict):
+            errors.append("watcher feed evidence is missing or invalid")
+        else:
+            if (feed.get("useful") is not True
+                    or feed.get("connected") is not True
+                    or feed.get("booting") is not False
+                    or feed.get("resubscribing") is not False
+                    or feed.get("decoded_ever") is not True):
+                errors.append("watcher feed is disconnected, booting or resubscribing")
+            for field in ("frame_age_secs", "decode_age_secs"):
+                age = feed.get(field)
+                if (type(age) not in (int, float)
+                        or not math.isfinite(age)
+                        or not 0 <= age <= WATCHER_HEARTBEAT_MAX_AGE):
+                    errors.append("watcher %s is missing or not fresh" % field)
+        if heartbeat.get("problem") not in (None, ""):
+            errors.append("watcher reports an unacknowledged runtime problem")
         if heartbeat.get("leaders_error"):
             errors.append("watcher cannot verify its leader registry")
         leaders = heartbeat.get("leaders")
@@ -246,10 +293,16 @@ def check_cutover_artifacts(run_dir, service_uid, *, now):
                 or any(not isinstance(n, str) or not n for n in leaders)):
             errors.append("watcher heartbeat has no verified leader coverage")
         fills = heartbeat.get("fills")
-        if (not isinstance(fills, dict)
-                or type(fills.get("dropped_unjudged")) is not int
-                or fills["dropped_unjudged"] != 0):
-            errors.append("watcher reports missing or dropped unjudged fill evidence")
+        if not isinstance(fills, dict):
+            errors.append("watcher fill-buffer evidence is missing")
+        else:
+            depth, cap, dropped = (
+                fills.get("depth"), fills.get("cap"),
+                fills.get("dropped_unjudged"),
+            )
+            if (any(type(value) is not int for value in (depth, cap, dropped))
+                    or cap <= 0 or depth < 0 or depth > cap or dropped != 0):
+                errors.append("watcher fill-buffer capacity or loss is invalid")
     except (OSError, ValueError, TypeError) as exc:
         errors.append("watcher heartbeat unreadable or invalid: %s" %
                       type(exc).__name__)
