@@ -59,10 +59,17 @@ will be rejected 401 by the venue. This process cannot place an order."
         );
         Arc::new(None)
     } else {
-        use copybot_hot::auth::derive_or_create_creds;
+        use copybot_hot::auth::{derive_existing_creds, derive_or_create_creds};
         match pk {
             Some(pk) => {
-                match derive_or_create_creds(&http, &clob, &pk, &signer_addr, 0).await {
+                // A dry run is observational: it must not create or rotate
+                // an API key when the existing credential lookup fails.
+                let authentication = if live {
+                    derive_or_create_creds(&http, &clob, &pk, &signer_addr, 0).await
+                } else {
+                    derive_existing_creds(&http, &clob, &pk, &signer_addr, 0).await
+                };
+                match authentication {
                     Ok(c) => {
                         eprintln!("[auth] L2 credentials derived — {}", c.redacted());
                         *creds_slot.lock().unwrap() = Some(c.clone());

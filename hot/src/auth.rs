@@ -209,6 +209,29 @@ fn parse_creds(body: &str) -> Result<ApiCreds, String> {
         _ => Err(format!("creds missing fields: {}", & body[..body.len().min(200)])),
     }
 }
+/// Read-only authentication path for dry observations. Never sends an API
+/// key creation request; an absent or rejected key is an explicit refusal.
+pub async fn derive_existing_creds(
+    http: &reqwest::Client,
+    host: &str,
+    private_key: &[u8; 32],
+    address: &str,
+    nonce: u128,
+) -> Result<ApiCreds, String> {
+    let headers = l1_headers(private_key, address, now_secs(), nonce)?;
+    let mut request = http.get(format!("{host}/auth/derive-api-key"));
+    for (name, value) in &headers {
+        request = request.header(*name, value);
+    }
+    let response = request.send().await
+        .map_err(|error| format!("read-only key derivation unavailable: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("read-only key derivation refused: HTTP {}", response.status().as_u16()));
+    }
+    let body = response.text().await
+        .map_err(|_| "read-only key derivation returned unreadable JSON".to_string())?;
+    parse_creds(&body).map_err(|_| "read-only key derivation returned invalid credentials".into())
+}
 pub async fn derive_or_create_creds(
     http: &reqwest::Client,
     host: &str,

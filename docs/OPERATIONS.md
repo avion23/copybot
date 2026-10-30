@@ -11,7 +11,7 @@ env -i PATH="$PATH" HOME="$HOME" PRIVATE_KEY="${PRIVATE_KEY:?load local signer k
   timeout 180 hot/target/release/copybot-hot deploy/copybot2.toml
 ```
 
-Use only a locally provisioned key, never put the key in Git or an output log, and do not enable live/shadow execution or arm a lane. `signature_type = 3` uses the Deposit Wallet contract as `funder` and the EOA owner as `signer`; CLOB authentication alone does not prove the venue will accept a signed 1271 order. A transient HTTP 429 on a Data API positions page receives at most three bounded retries across the complete snapshot. Exhaustion remains **RateLimited / unverifiable**; it never means zero holdings.
+Use only a locally provisioned key, never put the key in Git or an output log, and do not enable live/shadow execution or arm a lane. Dry mode derives existing CLOB credentials with a read-only GET; if no key exists, it reports authentication unavailable instead of creating a new API key. `signature_type = 3` uses the Deposit Wallet contract as `funder` and the EOA owner as `signer`; CLOB authentication alone does not prove the venue will accept a signed 1271 order. A transient HTTP 429 on a Data API positions page receives at most three bounded retries across the complete snapshot. Exhaustion remains **RateLimited / unverifiable**; it never means zero holdings.
 
 ## Three controls, three different effects
 
