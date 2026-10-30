@@ -10,6 +10,7 @@ pub(crate) mod flatten_task;
 pub(crate) mod http;
 pub(crate) mod merge;
 pub(crate) mod operator;
+pub(crate) mod position_reconciliation;
 pub(crate) mod reconcile;
 pub(crate) mod signal;
 pub(crate) mod telemetry;

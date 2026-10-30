@@ -218,6 +218,10 @@ configured pending WS (one live detection protocol)
 
 All async tasks send typed messages to the owner; no spawned closure independently updates wallet, position, pending and reservation maps. The owner may run in a single task and serialize only state transitions, leaving network I/O outside the critical section. Explicit bounded ingress has a tracked overload policy: never silently drop an exit, incident or recovery event; halt new buys when the evidence queue becomes stale. Recovery replays a single durable order identity before re-enabling buys.
 
+## COPYBOT-3 continuation
+
+The first A3 continuation extracts the periodic position-reconciliation task into `runtime/position_reconciliation.rs` (141 lines), with concrete control/router/pending/telemetry/read-model dependencies. `main.rs` is 5,684 lines (5,853 at the handoff). The caller retains the live gate and spawn order. The five-second interval, incomplete/empty-snapshot refusals, pending-token exclusions, quiet windows, ledger corrections and emitted events are unchanged. This is responsibility separation, not the single-state-owner target. A4 must still replace lossy position parsing and the HTTP-client fallback; A5 and A6 remain open. COPYBOT-3 gate results are kept outside the repository under `copybot-evidence/COPYBOT-3/`.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
