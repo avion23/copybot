@@ -5,6 +5,7 @@ It never invokes systemctl, starts/stops services, reads secrets or validates
 real market safety. A passing snapshot is not production attestation.
 """
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -171,14 +172,49 @@ def check_run_ownership(run_dir, service_uid, *, require_lock=False):
     return errors
 
 
+def check_exclusive_owner_lock(lock_path, service_uid):
+    """Read-only, nonblocking proof of an exclusive flock on the owner inode.
+
+    A free lock file or a legacy shared lock is not evidence of an active
+    Observer. This proves contention by *some* exclusive holder, not a PID
+    identity or service authenticity. No lock content is changed.
+    """
+    errors = []
+    try:
+        fd = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != service_uid
+                    or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600):
+                return ["Observer owner lock is not a secure regular inode"]
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # Only a conflicting exclusive lease blocks another SH lock.
+                pass
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                errors.append("Observer owner lock is free or shared, not exclusive")
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        errors.append("Observer exclusive lock cannot be inspected: %s" %
+                      type(exc).__name__)
+    return errors
+
+
 def check_cutover_artifacts(run_dir, service_uid, *, now):
-    """Verify readable, owner-controlled Observer artifacts, not live parity.
+    """Verify read-only Observer artifacts and exclusive ownership, not parity.
 
     This is an explicit path supplied by an operator. No systemctl, provider,
     signing key, hostname or environment-file access occurs here.
     """
     errors = []
     root = Path(run_dir)
+    errors.extend(check_exclusive_owner_lock(
+        root / "observer.owner.lock", service_uid
+    ))
     for name in ("observer_observations.jsonl", "observer_notifications.jsonl",
                  "observer_alerts.jsonl", "errors.jsonl", "watcher.log"):
         path = root / name

@@ -146,6 +146,17 @@ to justify live cutover. The standalone Guardian timer's exit-code behavior
 remains unchanged. Check `observer_health.json` and the Guardian journal
 for UNVERIFIABLE results before attempting any deployment.
 
+For an active `cutover` check, the lock file must not merely exist:
+the Observer must actually be holding an **exclusive** advisory file lock.
+The preflight briefly attempts a nonblocking, read-only shared lock on
+`run/observer.owner.lock`; if that succeeds, no exclusive owner is
+holding the inode and cutover is **BLOCKED**. This also rejects a legacy
+process still holding a shared lock. A valid check does not change file
+contents or stop/start services. It must run with permission to open the
+owner-only file, typically as the service user. The check cannot identify
+the exclusive lock-holder PID or authenticate the operator-supplied
+systemd snapshot, so success still reports `live_parity=UNKNOWN`.
+
 The checker **does not** collect, authenticate, or modify those unit states.
 It verifies the supplied evidence, the expected engine state, and read-only
 run-directory/owner-lock metadata, and refuses stale, missing or
