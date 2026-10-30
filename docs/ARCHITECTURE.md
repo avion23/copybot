@@ -222,6 +222,14 @@ All async tasks send typed messages to the owner; no spawned closure independent
 
 The first A3 continuation extracts the periodic position-reconciliation task into `runtime/position_reconciliation.rs` (141 lines), with concrete control/router/pending/telemetry/read-model dependencies. `main.rs` is 5,684 lines (5,853 at the handoff). The caller retains the live gate and spawn order. The five-second interval, incomplete/empty-snapshot refusals, pending-token exclusions, quiet windows, ledger corrections and emitted events are unchanged. This is responsibility separation, not the single-state-owner target. A4 must still replace lossy position parsing and the HTTP-client fallback; A5 and A6 remain open. COPYBOT-3 gate results are kept outside the repository under `copybot-evidence/COPYBOT-3/`.
 
+### A4: first typed-boundary slice
+
+`position_evidence::complete_balances` is a pure, all-or-error balance parser: it rejects incomplete pagination, missing/blank assets, duplicate assets and missing, negative or non-finite sizes. `runtime::reconcile::reactivate_lane` returns `ReactivationError` before changing the leader book; callers keep a new lane unready or a resumed lane retired, and retain existing holdings. Absence in a successfully validated complete snapshot is distinct from malformed evidence.
+
+`runtime::accounting::resolve_pending` now returns the typed `reqwest::Error` from constructing its timed client. The periodic caller records `pending_recovery_skipped` and leaves pending rows and reservations intact. `runtime::operator::handle_arm_post` handles the typed serialization result before creating a temporary file; failure returns HTTP 500 without replacing operator state. The sweep task also reports `sweep_unavailable` and exits if its timed client cannot be built, rather than dropping the timeout.
+
+This removes five fallback expressions and closes three of the five COPYBOT-2 candidate rows (reactivation, pending client and operator serialization). The sweep's snapshot/parser migration was blocked by the connector safety check and its partial data-path edits were restored; its single-page and zero/default parsing remain. Flatten market evidence, rescue-success reporting and the merge `UNKNOWN` string classification remain unchanged. No Observer or authenticated operator surface is claimed by this slice.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.

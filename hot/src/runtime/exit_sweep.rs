@@ -43,10 +43,17 @@ pub(crate) fn spawn(
             order_paths.clone(),
         );
         tokio::spawn(async move {
-            let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default();
+            let http = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(30)).build() {
+                Ok(client) => client,
+                Err(_client_error) => {
+                    e3.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "sweep_unavailable",
+                        "reason": "http_client_initialization",
+                    }));
+                    return;
+                }
+            };
             let mut swept: std::collections::HashMap<String, u64> = Default::default();
             let mut pending: std::collections::HashMap<
                 (String, String),

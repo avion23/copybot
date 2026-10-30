@@ -365,6 +365,17 @@ hand, then retry.")
         format!("{actor} set {lane} to {state}"), "actor" : actor, "pid" :
         std::process::id(), }
     );
+    let serialized = match serde_json::to_vec(&doc) {
+        Ok(bytes) => bytes,
+        Err(_serialization_error) => {
+            return (
+                "500 Internal Server Error",
+                serde_json::json!({
+                    "error": "operator state serialization failed; existing state unchanged",
+                }).to_string(),
+            );
+        }
+    };
     let tmp = format!(
         "{path}.api.{}.{}.tmp", std::process::id(), std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(| d | d.as_nanos()).unwrap_or(0)
@@ -372,7 +383,7 @@ hand, then retry.")
     let done = (|| -> std::io::Result<()> {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(serde_json::to_string(&doc).unwrap_or_default().as_bytes())?;
+        f.write_all(&serialized)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
         if let Some(dir) = std::path::Path::new(path).parent() {

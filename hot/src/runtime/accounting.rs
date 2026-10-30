@@ -18,17 +18,16 @@ pub(crate) async fn resolve_pending(
     signer_addr: &str,
     _sig_type: u8,
     resting: Option<&Arc<copybot_hot::resting::RestingBook>>,
-) {
+) -> Result<(), reqwest::Error> {
     use copybot_hot::pending::Verdict;
-    let Some(cr) = creds.as_ref().as_ref() else { return };
+    let Some(cr) = creds.as_ref().as_ref() else { return Ok(()) };
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
-        .build()
-        .unwrap_or_default();
+        .build()?;
     let now = copybot_hot::ledger::now_secs();
     let due = log.lock().unwrap().due(now);
     if due.is_empty() {
-        return;
+        return Ok(());
     }
     let get = |path: String| {
         let (http, clob, cr, addr) = (
@@ -211,6 +210,7 @@ pub(crate) async fn resolve_pending(
                 ),
             );
     }
+    Ok(())
 }
 
 pub(crate) fn halt_buys_on_persistence_fault_with(
@@ -661,18 +661,16 @@ pub(crate) fn spawn_pending_recovery(
                 if lg.lock().unwrap().is_empty() {
                     continue;
                 }
-                resolve_pending(
-                        &lg,
-                        &ctl,
-                        &rt,
-                        &em,
-                        &clob_r,
-                        &creds_r,
-                        &addr_r,
-                        sig_type,
-                        Some(&rb_res),
-                    )
-                    .await;
+                if let Err(_client_error) = resolve_pending(
+                    &lg, &ctl, &rt, &em, &clob_r, &creds_r, &addr_r,
+                    sig_type, Some(&rb_res),
+                ).await {
+                    em.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "pending_recovery_skipped",
+                        "reason": "http_client_initialization", "pending_retained": true,
+                    }));
+                    eprintln!("[pending] timed HTTP client unavailable; recovery skipped, rows retained");
+                }
             }
         });
 }

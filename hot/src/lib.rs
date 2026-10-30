@@ -33,6 +33,7 @@ pub mod order;
 pub mod orphan;
 pub mod pending;
 pub mod positions;
+pub mod position_evidence;
 pub mod provenance;
 pub mod settlement;
 pub mod signal_guard;

@@ -1,7 +1,24 @@
 //! Existing restart-recovery sizing and lane reactivation boundary.
 
 use copybot_hot::control::Control;
+use copybot_hot::position_evidence::{complete_balances, PositionError};
 use std::sync::Arc;
+
+#[derive(Debug)]
+pub(crate) enum ReactivationError {
+    Position(PositionError),
+    EmptyLeaderWithHoldings,
+}
+
+impl std::fmt::Display for ReactivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Position(error) => write!(f, "leader book refused: {error}"),
+            Self::EmptyLeaderWithHoldings => write!(f, "leader snapshot is empty while our ledger has holdings"),
+        }
+    }
+}
+impl std::error::Error for ReactivationError {}
 
 pub(crate) const RECON_SECS: u64 = 5;
 pub(crate) const RECON_QUIET_SECS: i64 = 120;
@@ -33,7 +50,7 @@ pub(crate) async fn reactivate_lane(
     lane: &std::sync::Arc<copybot_hot::lanes::Lane>,
     control: &Arc<std::sync::Mutex<Control>>,
     http: &reqwest::Client,
-) -> Result<usize, String> {
+) -> Result<usize, ReactivationError> {
     let name = lane.cfg.name.clone();
     let leader = format!("0x{}", hex::encode(lane.cfg.wallet20));
     let snap = copybot_hot::positions::fetch(
@@ -45,30 +62,11 @@ pub(crate) async fn reactivate_lane(
             copybot_hot::ledger::now_secs(),
         )
         .await;
-    if !snap.may_act_destructively() {
-        return Err(
-            format!(
-                "leader book is not a complete list ({}) — refusing to seed \
-from a partial book, because an omitted token reads as fully exited",
-                snap.completeness.reason()
-            ),
-        );
-    }
-    let rows: Vec<serde_json::Value> = snap.rows;
-    let mut book: std::collections::HashMap<String, f64> = Default::default();
-    for p in &rows {
-        let t = p["asset"].as_str().unwrap_or("").to_string();
-        let sz = p["size"]
-            .as_f64()
-            .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
-            .unwrap_or(0.0);
-        if !t.is_empty() && sz > 0.0 {
-            book.insert(t, sz);
-        }
-    }
+    let mut book = complete_balances(&snap).map_err(ReactivationError::Position)?;
+    book.retain(|_, size| *size > 0.0);
     let held = control.lock().unwrap().ledger.holdings(&name);
     if book.is_empty() && !held.is_empty() {
-        return Err("leader snapshot is empty while our ledger has holdings".into());
+        return Err(ReactivationError::EmptyLeaderWithHoldings);
     }
     control.lock().unwrap().seed_his_book(&name, &book);
     Ok(book.len())
