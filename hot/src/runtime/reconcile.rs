@@ -97,10 +97,20 @@ pub(crate) fn spawn_reanchor(
         );
         let pulse_ra = reanchor_pulse.clone();
         tokio::spawn(async move {
-            let http = reqwest::Client::builder()
+            let http = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .unwrap_or_default();
+            {
+                Ok(client) => client,
+                Err(_) => {
+                    eprintln!("[reanchor] refusing to start without a timed HTTP client");
+                    em_ra.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "reanchor_unavailable",
+                        "reason": "http_client_initialization",
+                    }));
+                    return;
+                }
+            };
             let mut tick = tokio::time::interval(Duration::from_secs(300));
             loop {
                 tick.tick().await;
@@ -120,34 +130,27 @@ pub(crate) fn spawn_reanchor(
                             copybot_hot::ledger::now_secs(),
                         )
                         .await;
-                    let complete = snap.may_act_destructively();
-                    let venue: std::collections::HashMap<String, f64> = snap
-                        .rows
-                        .iter()
-                        .filter_map(|p| {
-                            let t = p["asset"].as_str()?.to_string();
-                            let sz = p["size"]
-                                .as_f64()
-                                .or_else(|| {
-                                    p["size"].as_str().and_then(|x| x.parse().ok())
-                                })?;
-                            Some((t, sz))
-                        })
-                        .collect();
-                    let (writes, report) = {
+                    let plan = {
                         let g = ctl_ra.lock().unwrap();
                         let modelled = g.his_pos.get(&name).cloned().unwrap_or_default();
                         let held = g.ledger.holdings(&name);
-                        copybot_hot::reanchor::plan(&modelled, &venue, &held, complete)
+                        copybot_hot::reanchor::plan_complete_snapshot(&modelled, &snap, &held)
+                    };
+                    let (writes, report) = match plan {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            eprintln!("[reanchor] {name}: refusing invalid leader evidence: {error}");
+                            em_ra.emit(serde_json::json!({
+                                "t": now_ms(), "ev": "reanchor_unavailable",
+                                "lane": name, "reason": error.to_string(),
+                            }));
+                            continue;
+                        }
                     };
                     {
                         let mut g = pulse_ra.lock().unwrap();
                         let e = g.entry(name.clone()).or_insert((0, 0, 0, 0, 0, 0, 0));
-                        let last_complete = if complete {
-                            now_ms() as i64 / 1000
-                        } else {
-                            e.1
-                        };
+                        let last_complete = now_ms() as i64 / 1000;
                         *e = (
                             now_ms() as i64 / 1000,
                             last_complete,
@@ -188,7 +191,7 @@ pub(crate) fn spawn_reanchor(
                                     .lowered, "agreed" : report.agreed, "refused" : report
                                     .refused, "disarmed_zeros" : report.disarmed_zeros,
                                     "shares_raised" : (report.shares_raised * 100.0).round() /
-                                    100.0, "complete" : complete }
+                                    100.0, "complete" : true }
                                 ),
                             );
                     }

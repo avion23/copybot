@@ -105,6 +105,17 @@ pub fn plan(
     }
     (writes, r)
 }
+/// Apply the reanchor plan only after every position row and page is validated.
+/// An absent token is evidence of zero only in a complete, well-formed snapshot.
+pub fn plan_complete_snapshot(
+    modelled: &HashMap<String, f64>,
+    snapshot: &crate::positions::Positions,
+    held: &HashMap<String, f64>,
+) -> Result<(Vec<(String, f64)>, Report), crate::position_evidence::PositionError> {
+    let venue = crate::position_evidence::complete_balances(snapshot)?;
+    Ok(plan(modelled, &venue, held, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
