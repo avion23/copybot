@@ -81,7 +81,7 @@ CORROBORATORS = {'exposure': _exposure, 'stranded': _stranded}
 def check(family, fact, ctx):
     fn = CORROBORATORS.get(family)
     if fn is None:
-        return (CONFIRMED, 'no independent check exists for %r — halting as before' % family)
+        return (UNVERIFIABLE, 'no independent check exists for %r — halting conservatively without confirmation' % family)
     try:
         verdict, evidence = fn(fact, ctx)
     except Exception as e:

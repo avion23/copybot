@@ -739,7 +739,7 @@ def gather_and_check(dry_run):
         _, reasons = check_fire_patterns(lane_fires, max_usd_per_fill, per_market_usd, scale, lane_pct, facts_out=fire_facts)
         for reason in reasons:
             f = next((x for x in fire_facts if x.get('reason') == reason), None)
-            verdict, evidence = (corroborate.CONFIRMED, '')
+            verdict, evidence = (corroborate.UNVERIFIABLE, 'no matching independent evidence fact for this fire-pattern reason')
             if f is not None:
                 f = dict(f, leader=lane_leader.get(lane_name))
                 verdict, evidence = corroborate.check(f['family'], f, corr_ctx)
@@ -754,8 +754,8 @@ def gather_and_check(dry_run):
             if f is not None and verdict == corroborate.LAGGING and defer_for_lag(lane_name, f.get('token'), now, LAG_DEFER_PATH):
                 log('DEFERRED one cycle %s: %s || %s' % (lane_name, reason[:80], evidence))
                 continue
-            if f is not None and verdict != corroborate.CONFIRMED:
-                log('  (halting anyway — %s)' % evidence)
+            if verdict != corroborate.CONFIRMED:
+                log('  (halting without confirmation — %s)' % evidence)
             immediate_lane_reasons.append((lane_name, '%s: %s' % (lane_name, reason)))
         lane_summaries.append((lane_name, len(held), backend_open_usd, len(lane_fires), float(lane.get('spent_today') or 0.0)))
     pool = dash(port, '/api/pool')
