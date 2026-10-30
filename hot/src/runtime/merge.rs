@@ -11,6 +11,110 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Account for leader split/merge evidence and classify merge withdrawals.
+/// Observe-only: no follower execution or additional pair-ledger owner.
+pub(crate) fn observe_leader_pair_tx(
+    raw: &copybot_hot::feeds::RawTx,
+    router: &Arc<Router>,
+    pair_ledger: &Arc<std::sync::Mutex<copybot_hot::pairledger::PairLedger>>,
+    emitter: &Arc<Emitter>,
+    errors_path: &str,
+) {
+        if !raw.to.is_empty() {
+            let owned: Vec<(usize, [u8; 20])> = (0..router.len())
+                .filter_map(|ix| router.lane(ix).map(|l| (ix, l.cfg.wallet20)))
+                .collect();
+            let acts = copybot_hot::mergewatch::route(
+                &raw.to,
+                &raw.input,
+                owned.iter().map(|(ix, w)| (*ix, w)),
+            );
+            for (lane_ix, act) in acts {
+                let Some(lane) = router.lane(lane_ix) else { continue };
+                let name = lane.cfg.name.clone();
+                let leader = format!("0x{}", hex::encode(lane.cfg.wallet20));
+                match act.kind {
+                    copybot_hot::mergewatch::PairKind::Split => {
+                        pair_ledger
+                            .lock()
+                            .unwrap()
+                            .credit_split(
+                                &leader,
+                                &act.condition_id,
+                                act.shares,
+                                act.sized,
+                            );
+                        emitter
+                            .emit(
+                                serde_json::json!(
+                                    { "t" : now_ms(), "ev" : "leader_split", "lane" : name,
+                                    "cond" : & act.condition_id[..act.condition_id.len()
+                                    .min(14)], "shares" : act.shares, "sized" : act.sized,
+                                    "note" : "credited to his split balance; NOT copied" }
+                                ),
+                            );
+                    }
+                    copybot_hot::mergewatch::PairKind::Merge => {
+                        let signal = pair_ledger
+                            .lock()
+                            .unwrap()
+                            .merge_signal(
+                                &leader,
+                                &act.condition_id,
+                                act.shares,
+                                act.sized,
+                            );
+                        let (kind, exit_shares) = match &signal {
+                            copybot_hot::pairledger::MergeSignal::Exit { shares } => {
+                                ("exit", *shares)
+                            }
+                            copybot_hot::pairledger::MergeSignal::NonSignal => {
+                                ("income_withdrawal", 0.0)
+                            }
+                            copybot_hot::pairledger::MergeSignal::Unknown => {
+                                ("UNKNOWN_needs_human", 0.0)
+                            }
+                        };
+                        emitter
+                            .emit(
+                                serde_json::json!(
+                                    { "t" : now_ms(), "ev" : "leader_merge", "lane" : name,
+                                    "cond" : & act.condition_id[..act.condition_id.len()
+                                    .min(14)], "merged" : act.shares, "sized" : act.sized,
+                                    "signal" : kind, "exit_shares" : exit_shares, "acted" :
+                                    false, "note" :
+                                    "OBSERVE-ONLY: decoded and netted, no order placed" }
+                                ),
+                            );
+                        if matches!(
+                            signal, copybot_hot::pairledger::MergeSignal::Unknown
+                        ) {
+                            copybot_hot::errors::record(
+                                &errors_path,
+                                &copybot_hot::errors::ErrorRow {
+                                    t: copybot_hot::ledger::now_secs(),
+                                    lane: name.clone(),
+                                    kind: "merge_unknown".into(),
+                                    detail: format!(
+                                        "…{} merged {:.4} — split balance unknowable", & act
+                                        .condition_id[act.condition_id.len().saturating_sub(10)..],
+                                        act.shares
+                                    ),
+                                    human: format!(
+                                        "{name}'s leader merged a position we cannot classify \
+because an earlier split on that market had no readable size. It may be a real exit or a \
+savings withdrawal — nothing was done automatically. Check the market by hand."
+                                    ),
+                                    severity: "warn".into(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum MergeOutcome {
     Merged,
