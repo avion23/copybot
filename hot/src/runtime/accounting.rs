@@ -85,6 +85,17 @@ pub(crate) async fn resolve_pending(
         }
         match verdict {
             Verdict::Filled { shares, price } => {
+                // A verified venue match advances the durable reservation
+                // before any ledger booking. Unknown outcomes stay reserved.
+                if let Err(error) = log.lock().unwrap().advance(
+                    &p.order_hash, copybot_hot::pending::OrderStage::Accepted,
+                ) {
+                    emitter.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "pending_state_unavailable",
+                        "lane": p.lane, "reason": error,
+                    }));
+                    continue;
+                }
                 let (px, px_provisional) = copybot_hot::pending::recovered_price(
                     p.resting,
                     price,
@@ -130,9 +141,13 @@ pub(crate) async fn resolve_pending(
                     }
                     r
                 } else {
-                    log.lock()
-                        .unwrap()
-                        .resolve(&p.order_hash, "filled", Some((0.0, px)));
+                    // A zero bookable balance does not prove that an observed
+                    // fill did not take place; retain the identity for review.
+                    emitter.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "pending_unattributed",
+                        "lane": p.lane, "tok": p.token,
+                        "reason": "venue match has no bookable shares",
+                    }));
                     continue;
                 };
                 let Some(r) = receipt else {
@@ -174,7 +189,15 @@ pub(crate) async fn resolve_pending(
                     );
             }
             Verdict::NotFilled => {
-                log.lock().unwrap().resolve(&p.order_hash, "not_filled", None);
+                if let Err(error) = log.lock().unwrap().resolve(
+                    &p.order_hash, "not_filled", None,
+                ) {
+                    emitter.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "pending_release_unavailable",
+                        "lane": p.lane, "reason": error,
+                    }));
+                    continue;
+                }
                 emitter
                     .emit(
                         serde_json::json!(

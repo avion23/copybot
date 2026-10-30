@@ -1,17 +1,17 @@
 # Operations
 
-## Local 180-second no-order dry run
+## DRY-RUN RUNBOOK (ten steps)
 
-From the repository root, set `bot.mode = "dry"` in `deploy/copybot2.toml`. Dry mode with zero enabled leader lanes is an explicit **observe-only** boot: it can inspect feed and CLOB authentication without placing orders. Never use `mode = "shadow"` for this check; shadow is an order-submitting mode.
-
-The D-600 operator reported the command form `env -i ... timeout 180 hot/target/release/copybot-hot deploy/copybot2.toml`. Its actual environment assignments were not supplied, so they cannot be reproduced verbatim. This is the equivalent isolated-environment command with an externally loaded signing key, not a claim of the exact agent environment:
-
-```sh
-env -i PATH="$PATH" HOME="$HOME" PRIVATE_KEY="${PRIVATE_KEY:?load local signer key}" \
-  timeout 180 hot/target/release/copybot-hot deploy/copybot2.toml
-```
-
-Use only a locally provisioned key, never put the key in Git or an output log, and do not enable live/shadow execution or arm a lane. Dry mode derives existing CLOB credentials with a read-only GET; if no key exists, it reports authentication unavailable instead of creating a new API key. `signature_type = 3` uses the Deposit Wallet contract as `funder` and the EOA owner as `signer`; CLOB authentication alone does not prove the venue will accept a signed 1271 order. A transient HTTP 429 on a Data API positions page receives at most three bounded retries across the complete snapshot. Exhaustion remains **RateLimited / unverifiable**; it never means zero holdings.
+1. **Inputs:** use an isolated local worktree, a private ignored config, an owner-only signer key source, a pending-transaction Polygon WSS, and a bounded HTTP RPC for position evidence; never copy credentials into Git or logs.
+2. **Mode:** set `[bot] mode = "dry"` in `deploy/copybot2.toml`; `shadow` and `live` are order-submitting modes, not dry runs.
+3. **Wallet:** set the deposit-wallet contract as `funder`, owner EOA as `signer`, and `signature_type = 3` for POLY_1271; confirm they match the local key without printing it.
+4. **Leader:** with no leader selected, keep all lanes disabled; the typed `DryObserveOnly` profile validates auth/feed but cannot exercise copy decisions or order reservations.
+5. **Feed and auth:** configure one proven full-object pending-tx WSS and `clob_host`; dry mode may GET existing CLOB API credentials and GET `/data/orders`, never POST `/order` or create an API key.
+6. **Safety:** isolate `events_path`, `control_path`, `ledger_path` and `signal_guard_path`; retain owner-only permissions and do not run the systemd live service concurrently.
+7. **Start (180-second smoke test):** from the repo root after building, run `env -i PATH="$PATH" HOME="$HOME" PRIVATE_KEY="${PRIVATE_KEY:?load key locally}" timeout 180 hot/target/release/copybot-hot deploy/copybot2.toml`; prior agent-specific environment assignments were not supplied.
+8. **Minutes 0–3:** confirm `DRY OBSERVE ONLY`, correct wallet type, successful CLOB `/data/orders` GET, actual full-object feed frames, no POST order, and any 429 marked `RateLimited` rather than empty balances.
+9. **Minutes 3–10:** only under an approved longer `timeout 600` dry-only observation, watch reconnection/error counts, feed freshness, positions pagination completion, repeated 429/backoff, latches and stale telemetry; a 180-second run alone cannot cover 10 minutes.
+10. **Stop:** let `timeout` terminate the foreground process or send Ctrl-C to that PID; verify it exited and inspect sanitized logs, with no order attempt or live service; no leader/fill/profit/1271 order-acceptance claim without separate evidence and GO.
 
 ## Three controls, three different effects
 

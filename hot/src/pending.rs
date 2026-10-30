@@ -25,6 +25,45 @@ pub enum Verdict {
     NotFilled,
     Unknown,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderStage {
+    /// Durable reservation written before any submission attempt.
+    Reserved,
+    /// A venue response reports a match; inventory still needs booking.
+    Accepted,
+    /// The venue reports a live resting order.
+    Resting,
+    /// A duplicate, timeout, or incomplete answer cannot free a reservation.
+    Unknown,
+}
+impl OrderStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Accepted => "accepted",
+            Self::Resting => "resting",
+            Self::Unknown => "unknown",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reserved" => Some(Self::Reserved),
+            "accepted" => Some(Self::Accepted),
+            "resting" => Some(Self::Resting),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+    pub fn can_advance(self, next: Self) -> bool {
+        match (self, next) {
+            (a, b) if a == b => true,
+            (Self::Reserved, _) => true,
+            (Self::Unknown, Self::Accepted | Self::Resting) => true,
+            (Self::Resting, Self::Accepted) => true,
+            _ => false,
+        }
+    }
+}
 pub const STALE_SECS: i64 = 45;
 pub const STALE_RESTING_SECS: i64 = 1_800 + 180;
 pub fn stale_after(p: &Pending) -> i64 {
@@ -50,6 +89,7 @@ pub struct PendingLog {
     pub unreadable_sources: usize,
     path: String,
     open: HashMap<String, Pending>,
+    stages: HashMap<String, OrderStage>,
 }
 #[path = "pending_journal.rs"]
 mod journal;

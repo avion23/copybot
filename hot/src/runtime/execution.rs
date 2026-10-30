@@ -63,12 +63,32 @@ pub(crate) async fn submit_tracked(
             timeout,
         )
         .await;
-    match &outcome {
-        Outcome::Rejected { .. } => {
-            pend.lock().unwrap().resolve(&hash, "rejected", None);
+    use copybot_hot::pending::OrderStage;
+    let stage = match &outcome {
+        Outcome::Rejected { .. } => None,
+        Outcome::Matched { .. } => Some(OrderStage::Accepted),
+        Outcome::Resting { .. } => Some(OrderStage::Resting),
+        Outcome::DuplicateOnly { .. } | Outcome::Ambiguous { .. }
+        | Outcome::NoResponse => Some(OrderStage::Unknown),
+    };
+    let mut owner = pend.lock().unwrap();
+    if let Some(stage) = stage {
+        if let Err(why) = owner.advance(&hash, stage) {
+            // The HTTP request already ran: never call this a refused
+            // submission. Preserve the reservation and expose the fault.
+            em.emit(serde_json::json!({
+                "t": now_ms(), "ev": "order_stage_unavailable",
+                "order_hash": hash, "reason": why,
+            }));
         }
-        _ => {}
+    } else if let Err(why) = owner.resolve(&hash, "rejected", None) {
+        // A rejection is not a durable release until the journal confirms it.
+        em.emit(serde_json::json!({
+            "t": now_ms(), "ev": "order_release_unavailable",
+            "order_hash": hash, "reason": why,
+        }));
     }
+    drop(owner);
     em.emit(
         serde_json::json!(
             { "t" : now_ms(), "ev" : "order_result", "origin" : prov.origin.kind(),
