@@ -314,6 +314,10 @@ The 300-second leader position reanchor worker has moved from `main.rs` into the
 
 The Guardian liveness watcher moved from the binary into `runtime::control::spawn_guardian_liveness`, preserving its original live-only startup, Guardian-state path, 15-second interval, warmup warning and `guardian_stale` atomic buy gate. The binary passes the existing `Control` and control-file path explicitly, and the task retains all state within one spawned worker; no second halt writer or watcher process was introduced. `main.rs` shrinks from 4,652 to 4,615 lines and `runtime/control.rs` grows from 106 to 151. This A3 extraction does not claim a unified A5 Observer, change alert thresholds or alter any exit behavior.
 
+### A3: orphan diagnostic and exit worker (COPYBOT-3)
+
+`runtime/orphan_sweep.rs` (252 lines) now owns the optional orphan-exit task, including the 90-second scan, orphan classifications, 3,600-second warning suppression, read-only complete-page check, existing optional `ORPHAN_SWEEP` fire switch, signed tracked submission and outcome telemetry. `main.rs` retains the original `live` gate and worker spawn order, passing concrete control, router, pending, signer and route dependencies; the extraction does not add a second writer or background feed. The entrypoint shrank from 4,615 to 4,393 lines. The extracted worker still defaults missing price to 0.02 and `negativeRisk` to false and still has an untimed fallback HTTP client: those are **unresolved A4 money-path errors**, explicitly left unchanged in this mechanical A3 slice rather than covertly altering order semantics. No live operation or new test was added.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
