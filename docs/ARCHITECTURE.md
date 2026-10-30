@@ -290,6 +290,10 @@ Guardian now imports its five checked-in monitoring dependencies (`resolution`, 
 
 The existing `lanes::tests` module has been separated into `hot/src/lanes_tests/mod.rs` (905 lines, including the shared offline fixtures) and child module `hot/src/lanes_tests/more.rs` (746 lines), while prior route tests remain in `hot/src/lanes_route_tests.rs` (506 lines). This is a **mechanical relocation of existing tests**, not new tests, altered assertions or duplicated runtime policy; the child imports the same fixture scope. Production `hot/src/lanes.rs` is now **779 lines**, below the A3 cap. Its live Router/Lane code still mixes sizing, routing and reservations; the structural budget is met, but the intended pure-kernel/state-owner redesign remains open.
 
+### A3: entrypoint verification isolation (COPYBOT-3)
+
+The existing binary test module `http_handler_tests` now resides in `hot/src/main_tests.rs` (967 lines); the entrypoint declares it with `#[cfg(test)]` and retains the module name/private production access. No test case, fixture or assertion is added, removed or reinterpreted. This reduces `hot/src/main.rs` from 5,728 to 4,763 lines. The change is test-only relocation and does **not** fix the remaining 3,763-line deficit relative to the 1,000-line executable entrypoint budget; startup/task ownership must still be extracted at existing I/O seams.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
