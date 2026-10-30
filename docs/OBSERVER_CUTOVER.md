@@ -19,6 +19,11 @@ one serialized background audit worker. No trading key is used.
   each first overdue sensor emits an observer_deferred record
 - The scheduler emits Observer **health** records. They do not assert an
   independently confirmed market event or imply that a halt was applied
+- Guardian error events now share the one opt-in `AlertRouter` and preserve
+  the exact `run/errors.jsonl` row schema and bounded history. A pre-existing
+  insecure errors file refuses cutover until an operator repairs its ownership
+  and 0600 permissions; failed durable error writes still trigger Guardian's
+  conservative exception/disarm path.
 - Guardian and watcher email calls share one serialized Observer delivery
   owner with owner-only `run/observer_notifications.jsonl`. Each provider
   attempt is fsynced before transport, and the outcome is fsynced afterward.

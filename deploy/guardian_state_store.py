@@ -21,28 +21,75 @@ def fsync_parent(path):
         os.close(fd)
 
 ERROR_LOG_MAX = 400
+_ERROR_SINK = None
+
+
+def configure_error_sink(sink):
+    """Only the opt-in Observer installs a common Guardian error writer."""
+    global _ERROR_SINK
+    if sink is not None and not callable(sink):
+        raise TypeError("Guardian error sink must be callable")
+    previous = _ERROR_SINK
+    _ERROR_SINK = sink
+    return previous
+
+
+def persist_error_row(row, path, *, durable=False):
+    """Original Guardian error schema, file lock and 400-row rotation.
+
+    Observer mode additionally fsyncs data and rotated file/parent.
+    Filesystem failures propagate so a claimed write cannot be fabricated.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + '.lock', 'w') as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            with open(path, 'a') as f:
+                f.write(json.dumps(row) + '\n')
+                if durable:
+                    f.flush()
+                    os.fsync(f.fileno())
+            with open(path) as f:
+                lines = f.readlines()
+            if len(lines) > ERROR_LOG_MAX * 2:
+                tmp = tmp_path(path)
+                if durable:
+                    flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                             | os.O_CLOEXEC | os.O_NOFOLLOW)
+                    fd = os.open(tmp, flags, 0o600)
+                    with os.fdopen(fd, 'w') as f:
+                        f.writelines(lines[-ERROR_LOG_MAX:])
+                        f.flush()
+                        os.fsync(f.fileno())
+                else:
+                    with open(tmp, 'w') as f:
+                        f.writelines(lines[-ERROR_LOG_MAX:])
+                os.replace(tmp, path)
+                if durable:
+                    fsync_parent(path)
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+
 
 def record_error(lane, kind, detail, path, enabled):
     if not enabled:
         return
+    sink = _ERROR_SINK
     try:
-        row = {'t': int(time.time()), 'lane': lane, 'kind': kind, 'detail': detail, 'human': humanise(kind, detail), 'severity': 'stop' if kind == 'trip' else 'notice'}
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path + '.lock', 'w') as lockf:
-            fcntl.flock(lockf, fcntl.LOCK_EX)
-            try:
-                with open(path, 'a') as f:
-                    f.write(json.dumps(row) + '\n')
-                with open(path) as f:
-                    lines = f.readlines()
-                if len(lines) > ERROR_LOG_MAX * 2:
-                    tmp = tmp_path(path)
-                    with open(tmp, 'w') as f:
-                        f.writelines(lines[-ERROR_LOG_MAX:])
-                    os.replace(tmp, path)
-            finally:
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+        row = {
+            't': int(time.time()), 'lane': lane, 'kind': kind,
+            'detail': detail, 'human': humanise(kind, detail),
+            'severity': 'stop' if kind == 'trip' else 'notice',
+        }
+        if sink is not None:
+            # Observer-only evidence errors must reach guardian_once, whose
+            # existing exception path conservatively disarms buys.
+            return sink(row, path)
+        persist_error_row(row, path)
     except Exception:
+        if sink is not None:
+            raise
+        # Preserve the legacy standalone behavior without changing timers.
         pass
 ADVISORY_RESAY_SECS = int(os.environ.get('ADVISORY_RESAY_SECS', '900'))
 

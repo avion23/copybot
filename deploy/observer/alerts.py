@@ -13,6 +13,7 @@ import stat
 import threading
 import time
 
+from guardian_state_store import persist_error_row
 from observer.contract import Observation
 from observer.policy import OccurrenceDeduper, alert_level
 
@@ -111,6 +112,7 @@ class AlertRouter:
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.canonical_path = self.run_dir / "observer_alerts.jsonl"
+        self.error_path = self.run_dir / "errors.jsonl"
         self.watcher_path = (Path(watcher_path) if watcher_path is not None
                              else self.run_dir / "watcher_alerts.jsonl")
         self.buywatch_path = (Path(buywatch_path) if buywatch_path is not None
@@ -127,6 +129,10 @@ class AlertRouter:
         # Guardian still reads the legacy watcher log after the old watcher
         # service is stopped. This compatibility file must exist at cutover.
         fd = self._open(self.watcher_log_path, create=True)
+        os.close(fd)
+        # Guardian's existing error-journal consumers need this same path
+        # after a cutover. Unsafe preexisting permissions refuse startup.
+        fd = self._open(self.error_path, create=True, strict=True)
         os.close(fd)
 
     @staticmethod
@@ -199,6 +205,34 @@ class AlertRouter:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    def record_guardian_error(self, row, path):
+        """One opt-in writer for Guardian's legacy error and alert evidence."""
+        if Path(path) != self.error_path:
+            raise ValueError("Guardian error path is outside the Observer owner")
+        if not isinstance(row, dict):
+            raise TypeError("Guardian error must be a dictionary")
+        if (type(row.get("t")) is not int or row["t"] < 0
+                or not isinstance(row.get("lane"), str)
+                or not isinstance(row.get("kind"), str) or not row["kind"].strip()
+                or not isinstance(row.get("detail"), str)
+                or not isinstance(row.get("human"), str)
+                or row.get("severity") not in ("stop", "notice")):
+            raise ValueError("invalid Guardian error-journal schema")
+        with self._lock:
+            # Validate the existing file on EVERY write, not only startup,
+            # because an external process may have rotated or replaced it.
+            fd = self._open(self.error_path, create=True, strict=True)
+            os.close(fd)
+            persist_error_row(row, str(self.error_path), durable=True)
+            event = {
+                "ev": "observer_alert", "source": "guardian", "t": row["t"],
+                "level": "CRITICAL" if row["severity"] == "stop" else "INFO",
+                "kind": row["kind"], "msg": row["human"],
+                "lanes": [row["lane"]] if row["lane"] else [],
+            }
+            self._write(self.canonical_path, event, strict=True)
+            return event
 
     def record(self, source, record):
         """Commit one legacy projection and one canonical alert, serially."""

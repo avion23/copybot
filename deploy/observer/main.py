@@ -20,6 +20,7 @@ if _DEPLOY not in sys.path:
     sys.path.insert(0, _DEPLOY)
 
 import corroborate
+import guardian_state_store
 import notify
 from observer.adapters import AUDITS, AuditResult
 from observer.alerts import ObservationJournal, AlertRouter
@@ -196,6 +197,9 @@ def main(argv=None):
             previous_watcher = watcher.configure_alert_sink(alerts.record)
             previous_fillwatch = fillwatch.configure_alert_sink(alerts.record)
             previous_buywatch = buywatch.configure_alert_sink(alerts.record)
+            previous_guardian = guardian_state_store.configure_error_sink(
+                alerts.record_guardian_error
+            )
             previous_notify = notify.configure_send_sink(notifications.send)
             try:
                 owner = ObserverScheduler(watcher.WatchSession(45))
@@ -215,6 +219,7 @@ def main(argv=None):
                         owner.close()
             finally:
                 notify.configure_send_sink(previous_notify)
+                guardian_state_store.configure_error_sink(previous_guardian)
                 buywatch.configure_alert_sink(previous_buywatch)
                 fillwatch.configure_alert_sink(previous_fillwatch)
                 watcher.configure_alert_sink(previous_watcher)
