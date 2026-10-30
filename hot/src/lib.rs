@@ -30,6 +30,7 @@ pub mod txsend;
 pub mod mergeverify;
 pub mod pairledger;
 pub mod order;
+pub mod order_commit;
 pub mod order_state_owner;
 pub mod operator_access;
 pub mod orphan;

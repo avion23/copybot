@@ -326,6 +326,9 @@ impl PendingLog {
             .cloned()
             .collect()
     }
+    pub fn durable_path_configured(&self) -> bool {
+        !self.path.is_empty()
+    }
     pub fn persistence_ok(&self) -> bool {
         self.last_write_error.is_none()
     }

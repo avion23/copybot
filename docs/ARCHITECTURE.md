@@ -2,6 +2,12 @@
 
 **Status:** design target; not a claim that this refactor is complete. Reviewed source at `streamline-1` after A1 commit `c0452bc` (2026-10-29); A2 removes the optional txpool input in the follow-up code commit. First are the ideal Rust interfaces, then a line-referenced comparison, then the layered module budgets and migration steps. **Do not fund/deploy solely because the refactor builds.**
 
+## D615 atomic fill-commit journal (offline foundation, not the live owner)
+
+`hot/src/order_commit.rs` now contains `AtomicFakJournal`, an owner-only append-only sequence of single-frame FAK decisions, each fsynced with a SHA-256 hash chain. Frames contain integer micro-share, micro-price, and micro-fee values with mandatory explicit price/fee evidence tags and order identity. Empty price/fee evidence is not encoded as a zero or a limit fallback. Reopen refuses a torn or modified record, duplicate hash on disk, missing sequence, or unsafe permissions; same-hash append is idempotent. `repair_legacy` can replay an already-durable frame into Ledger and PendingLog, preflighting every identity before moving any inventory. An interrupted replay may resume at the next restart without counting the fill twice.
+
+**This is not deployed or wired to signing, HTTP submissions, or runtime fee parsing.** Existing runtime Ledger and PendingLog remain separately durable; `Control::book_response` and the runtime recovery path can still book a provisional price or zero fee. The journal's evidence tags are caller assertions until a venue adapter independently validates them. The next migration must make the single journal append the authoritative commit **before** booking/resolving, route all fill-producing paths through that owner, and validate actual money provenance; only then can the full A4 atomic invariant be considered for a live gate. The offline tests do not justify arming.
+
 ## First-principles product and invariants
 
 The product is a **single-operator, one-process Polygon CLOB copy executor** that responds to *observed* leader settlement activity, sizes follower orders, signs/submits to the configured CLOB, tracks ambiguous fills/resting orders, reconciles inventory, and exposes a local operator view. Its Python services observe and corroborate evidence; they do not independently own trading state. It is **not** an early-leader-order detector, backtester, generic on-chain strategy, or multi-tenant trading service.
