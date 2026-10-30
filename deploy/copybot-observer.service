@@ -1,0 +1,48 @@
+[Unit]
+Description=Abomination81 Copybot — single authoritative observer scheduler (opt-in)
+Wants=network-online.target
+After=network-online.target
+# Prevent the new scheduler from overlapping the old guardian, watcher and
+# separate 15-minute audit services or their timers during a deliberate cutover.
+Conflicts=copybot-watcher.service copybot-guardian.service copybot-fillwatch.service copybot-buywatch.service copybot-guardian.timer copybot-fillwatch.timer copybot-buywatch.timer
+After=copybot-watcher.service copybot-guardian.service copybot-fillwatch.service copybot-buywatch.service copybot-guardian.timer copybot-fillwatch.timer copybot-buywatch.timer
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/copybot/deploy/copybot.env
+Environment=PYTHONUNBUFFERED=1
+Environment=BOT_DIR=/opt/copybot
+Environment=BOT_PORT=8807
+# Observers may use a separately scoped operator halt capability, never a
+# private trading/signing key.
+UnsetEnvironment=PRIVATE_KEY
+User=copybot
+Group=copybot
+WorkingDirectory=/opt/copybot
+ExecStart=/usr/bin/python3 /opt/copybot/deploy/observer/main.py
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/opt/copybot/run
+StandardOutput=append:/opt/copybot/run/observer.log
+StandardError=append:/opt/copybot/run/observer.log
+CapabilityBoundingSet=
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+# Not automatically enabled by adding this unit to the repo. Explicit
+# cutover must disable --now all seven conflicting legacy units first.
+[Install]
+WantedBy=multi-user.target
