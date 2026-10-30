@@ -2657,12 +2657,19 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
     }
     runtime::bankroll_monitor::spawn(&control, &router, &emitter, &registry);
     runtime::telemetry::spawn_route_warm_probe(&order_paths, &clob, &emitter);
-    let politics: Arc<std::sync::RwLock<std::collections::HashSet<[u8; 32]>>> = Arc::new(
-        std::sync::RwLock::new(std::collections::HashSet::new()),
-    );
+    let politics: runtime::politics::PoliticsBook =
+        Arc::new(std::sync::RwLock::new(None));
     if live {
-        let hc = mk_client(false).unwrap_or_default();
-        runtime::politics::spawn(&politics, &registry, hc);
+        match mk_client(false) {
+            Ok(hc) => runtime::politics::spawn(&politics, &registry, &emitter, hc),
+            Err(_) => {
+                eprintln!("[politics] REFUSED: cannot construct timed activity client");
+                emitter.emit(serde_json::json!({
+                    "t": now_ms(), "ev": "politics_unavailable",
+                    "why": "http_client_initialization",
+                }));
+            }
+        }
     }
     let mut tx_seen = copybot_hot::race::SeenTx::new(8192);
     let mut behind = copybot_hot::race::BehindTally::default();
@@ -2803,8 +2810,10 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                 if lane.cfg.exclude_political
                     && politics
                         .read()
-                        .map(|s| s.contains(&d.condition_id))
-                        .unwrap_or(false)
+                        .map(|s| copybot_hot::political_evidence::blocks_condition(
+                            s.as_ref(), &d.condition_id,
+                        ))
+                        .unwrap_or(true)
                 {
                     continue;
                 }
