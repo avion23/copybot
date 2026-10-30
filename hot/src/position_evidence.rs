@@ -14,6 +14,7 @@ pub enum PositionError {
     InvalidAsset { row: usize },
     DuplicateAsset { row: usize },
     InvalidSize { row: usize },
+    InvalidAveragePrice { row: usize },
 }
 
 impl fmt::Display for PositionError {
@@ -28,6 +29,7 @@ impl fmt::Display for PositionError {
             Self::InvalidAsset { row } => write!(f, "position row {row} has no valid asset"),
             Self::DuplicateAsset { row } => write!(f, "position row {row} repeats an asset"),
             Self::InvalidSize { row } => write!(f, "position row {row} has invalid size"),
+            Self::InvalidAveragePrice { row } => write!(f, "position row {row} has invalid average price"),
         }
     }
 }
@@ -60,4 +62,35 @@ pub fn complete_balances(snapshot: &Positions) -> Result<HashMap<String, f64>, P
         balances.insert(token.to_owned(), size);
     }
     Ok(balances)
+}
+
+/// Read-only proposed shadow fills. No ledger writes occur until the entire
+/// snapshot and every candidate's recorded average price are validated.
+pub fn shadow_adoptions(
+    snapshot: &Positions,
+    leader: &HashMap<String, f64>,
+    held: &HashMap<String, f64>,
+) -> Result<Vec<(String, f64, f64)>, PositionError> {
+    let balances = complete_balances(snapshot)?;
+    let mut planned = Vec::new();
+    for (index, row) in snapshot.rows.iter().enumerate() {
+        // complete_balances already checked asset existence, uniqueness, and size.
+        let token = row["asset"].as_str()
+            .ok_or(PositionError::InvalidAsset { row: index })?;
+        if !leader.contains_key(token) {
+            continue;
+        }
+        let size = *balances.get(token)
+            .ok_or(PositionError::InvalidSize { row: index })?;
+        let diff = size - held.get(token).copied().unwrap_or(0.0);
+        if diff <= 0.01 {
+            continue;
+        }
+        let avg = row["avgPrice"].as_f64()
+            .or_else(|| row["avgPrice"].as_str().and_then(|text| text.parse().ok()))
+            .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+            .ok_or(PositionError::InvalidAveragePrice { row: index })?;
+        planned.push((token.to_owned(), diff, avg));
+    }
+    Ok(planned)
 }

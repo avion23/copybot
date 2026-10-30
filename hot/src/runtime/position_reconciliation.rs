@@ -14,82 +14,88 @@ pub(crate) fn spawn_shadow(
     emitter: &Arc<Emitter>,
     funder: &str,
 ) {
-        let (c2, r2, e2, f2) = (
-            control.clone(),
-            router.clone(),
-            emitter.clone(),
-            funder.to_owned(),
-        );
-        tokio::spawn(async move {
-            let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default();
-            loop {
-                tokio::time::sleep(Duration::from_secs(300)).await;
-                let snap = copybot_hot::positions::fetch(
-                        &http,
-                        "https://data-api.polymarket.com",
-                        &f2,
-                        "0.01",
-                        "",
-                        copybot_hot::ledger::now_secs(),
-                    )
-                    .await;
-                if !snap.may_act_destructively() {
-                    continue;
-                }
-                let chain = &snap.rows;
-                for lane in r2.snapshot().iter() {
-                    let name = lane.cfg.name.clone();
-                    let held = c2.lock().unwrap().ledger.holdings(&name);
-                    let his = c2
-                        .lock()
-                        .unwrap()
-                        .his_pos
-                        .get(&name)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut adopted = 0usize;
-                    for p in chain {
-                        let tok = p["asset"].as_str().unwrap_or("").to_string();
-                        if tok.is_empty() || !his.contains_key(&tok) {
-                            continue;
-                        }
-                        let sz = p["size"]
-                            .as_f64()
-                            .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
-                            .unwrap_or(0.0);
-                        let diff = sz - held.get(&tok).copied().unwrap_or(0.0);
-                        if diff <= 0.01 {
-                            continue;
-                        }
-                        let px = p["avgPrice"]
-                            .as_f64()
-                            .or_else(|| {
-                                p["avgPrice"].as_str().and_then(|x| x.parse().ok())
-                            })
-                            .unwrap_or(0.0);
-                        if px <= 0.0 {
-                            continue;
-                        }
-                        c2.lock()
-                            .unwrap()
-                            .ledger
-                            .record_fill(&name, &tok, 0, diff, px, 0.0);
-                        adopted += 1;
-                    }
-                    if adopted > 0 {
-                        e2.emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "recon", "lane" : name, "adopted" :
-                                adopted, "periodic" : true }
-                            ),
-                        );
+    let (c2, r2, e2, f2) = (
+        control.clone(),
+        router.clone(),
+        emitter.clone(),
+        funder.to_owned(),
+    );
+    tokio::spawn(async move {
+        let http = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                e2.emit(serde_json::json!({
+                    "t": now_ms(), "ev": "shadow_recon_unavailable",
+                    "reason": "http_client_initialization",
+                }));
+                return;
+            }
+        };
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            let snapshot = copybot_hot::positions::fetch(
+                &http,
+                "https://data-api.polymarket.com",
+                &f2,
+                "0.01",
+                "",
+                copybot_hot::ledger::now_secs(),
+            ).await;
+
+            // Validate every page and row, even if no lane is eligible.
+            if let Err(error) = copybot_hot::position_evidence::complete_balances(&snapshot) {
+                e2.emit(serde_json::json!({
+                    "t": now_ms(), "ev": "shadow_recon_unavailable",
+                    "reason": error.to_string(),
+                }));
+                continue;
+            }
+
+            // Compute the entire shadow plan before booking any lane's fills.
+            // Missing/invalid average prices cannot produce a partial pass.
+            let mut planned = Vec::new();
+            let mut fault = None;
+            for lane in r2.snapshot().iter() {
+                let name = lane.cfg.name.clone();
+                let held = c2.lock().unwrap().ledger.holdings(&name);
+                let his = c2.lock().unwrap().his_pos
+                    .get(&name).cloned().unwrap_or_default();
+                match copybot_hot::position_evidence::shadow_adoptions(
+                    &snapshot, &his, &held,
+                ) {
+                    Ok(rows) => planned.push((name, rows)),
+                    Err(error) => {
+                        fault = Some((name, error.to_string()));
+                        break;
                     }
                 }
             }
-        });
+            if let Some((lane, reason)) = fault {
+                e2.emit(serde_json::json!({
+                    "t": now_ms(), "ev": "shadow_recon_unavailable",
+                    "lane": lane, "reason": reason,
+                }));
+                continue;
+            }
+
+            for (name, rows) in planned {
+                let adopted = rows.len();
+                for (token, diff, avg) in rows {
+                    c2.lock().unwrap().ledger
+                        .record_fill(&name, &token, 0, diff, avg, 0.0);
+                }
+                if adopted > 0 {
+                    e2.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "recon", "lane": name,
+                        "adopted": adopted, "periodic": true,
+                    }));
+                }
+            }
+        }
+    });
 }
 
 pub(crate) fn spawn(
