@@ -6,6 +6,7 @@ pub(crate) mod control;
 pub(crate) mod custody_monitor;
 pub(crate) mod dashboard_model;
 pub(crate) mod dashboard_positions;
+pub(crate) mod dashboard_pool;
 pub(crate) mod dashboard_trades;
 pub(crate) mod equity_monitor;
 pub(crate) mod execution;
