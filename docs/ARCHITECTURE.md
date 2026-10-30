@@ -250,6 +250,10 @@ The browser requests the capability in a password dialog per mutation, keeps it 
 
 Guardian now imports its five checked-in monitoring dependencies (`resolution`, `scorecard`, `preflight`, `corroborate`, `notify`) directly. The former `ImportError` stubs could silently discard incident cases, report unavailable preflight as healthy, suppress alerts and, worst, return `CONFIRMED` when corroboration was not importable. Missing modules now stop Guardian initialization with an explicit import error rather than authorizing an invented observation. At the call site this preserves existing halt attempts only when the actual corroboration module produced the verdict. This does **not** consolidate Guardian, watcher, fillwatch and buywatch into one Observer yet.
 
+### A3: foreign-writer evidence (COPYBOT-3)
+
+`deploy/guardian_foreign_writer.py` (124 lines) owns the venue-vs-ledger fill comparison, timestamp completeness, strike accumulation and explicit blindness warnings. Guardian (1,570 → 1,450 lines) passes the ledger path and fetch callback explicitly from its HTTP edge; no new network client, default row or second authority was introduced. The detector still warns only, and unknown/incomplete feeds cannot count as healthy evidence. Offline baseline parity 14 constructed cases passed, network calls 0. This remains a partial A3 separation, with the main Guardian controller and A5 single-Observer authority outstanding.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
