@@ -10,7 +10,9 @@ use crate::order_commit::{
     JournalRefusal, PriceEvidence, RepairCount,
 };
 use crate::pending::{Pending, PendingLog};
+use crate::race_send::{Outcome, PathResult};
 use serde_json::Value;
+use std::collections::HashSet;
 
 const MICRO: u64 = 1_000_000;
 const MAX_EXACT: u64 = (1u64 << 53) - 1;
@@ -26,6 +28,7 @@ pub enum StrictFakRefusal {
     RestingCannotCommit,
     DurableStateUnavailable,
     UnprovenSellInventory,
+    Race(&'static str),
     Journal(JournalRefusal),
 }
 impl From<JournalRefusal> for StrictFakRefusal {
@@ -189,6 +192,91 @@ pub fn parse_matched_fak(
     };
     c.validate().map_err(StrictFakRefusal::Journal)?;
     Ok(c)
+}
+
+/// Proof that the exact matched body was one recorded successful HTTP race
+/// response, with a unique winner path and no contradictory sibling match.
+/// This is transport evidence only, not cryptographic venue authentication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedRaceEvidence {
+    pub winner_path: String,
+    pub commitment: FakFillCommit,
+}
+
+pub fn prove_matched_race(
+    pending: &Pending,
+    outcome: &Outcome,
+    results: &[PathResult],
+    attempted_paths: usize,
+) -> Result<MatchedRaceEvidence, StrictFakRefusal> {
+    if attempted_paths == 0 || results.is_empty() || results.len() > attempted_paths {
+        return Err(StrictFakRefusal::Race("invalid attempted/completed path inventory"));
+    }
+    let (body, winner, winner_ms) = match outcome {
+        Outcome::Matched { body, winner, ms } => (body, winner, *ms),
+        _ => return Err(StrictFakRefusal::Race("not a definitive matched race outcome")),
+    };
+    if winner.is_empty() || !winner_ms.is_finite() || winner_ms < 0.0 {
+        return Err(StrictFakRefusal::Race("missing or invalid matched winner"));
+    }
+    let mut unique = HashSet::new();
+    for row in results {
+        if row.path.is_empty() || !unique.insert(row.path.as_str())
+            || !row.ms.is_finite() || row.ms < 0.0
+        {
+            return Err(StrictFakRefusal::Race("duplicate or invalid path identity"));
+        }
+    }
+    let Some(winning_path) = results.iter().find(|r| &r.path == winner) else {
+        return Err(StrictFakRefusal::Race("winning path has no actual HTTP result"));
+    };
+    if !(200..300).contains(&winning_path.http)
+        || winning_path.body != *body || winning_path.ms != winner_ms
+    {
+        return Err(StrictFakRefusal::Race("winner is not the matching successful HTTP reply"));
+    }
+    // The parser requires order identity, amount legs and actual fee source;
+    // a mere status:matched substring is insufficient for booking.
+    let proof = parse_matched_fak(pending, body)?;
+    for sibling in results.iter().filter(|r| r.path != *winner
+        && (200..300).contains(&r.http) && crate::race_send::looks_matched(&r.body))
+    {
+        // All successful siblings purporting to have matched the same signed
+        // order must agree on every monetary field, not just the status.
+        let other = parse_matched_fak(pending, &sibling.body)?;
+        if other != proof {
+            return Err(StrictFakRefusal::Race("conflicting matched venue response evidence"));
+        }
+    }
+    Ok(MatchedRaceEvidence {
+        winner_path: winner.clone(), commitment: proof,
+    })
+}
+
+/// Journal-first booking of an *observed* matched FAK path, not an order sender.
+/// Checks actual HTTP outcome+row correspondence before any money mutation;
+/// rejects a 5xx echo, invented winner or contradictory sibling evidence.
+/// The caller still owns TLS/1271 signer provenance and all attempted paths.
+pub fn commit_matched_fak_from_race(
+    journal: &AtomicFakJournal,
+    ledger: &mut Ledger,
+    pending: &mut PendingLog,
+    hash: &str,
+    outcome: &Outcome,
+    results: &[PathResult],
+    attempted_paths: usize,
+) -> Result<StrictFakCommitted, StrictFakRefusal> {
+    let original = pending.open_rows().into_iter()
+        .find(|p| p.order_hash == hash).ok_or(StrictFakRefusal::NotPending)?;
+    let evidence = prove_matched_race(&original, outcome, results, attempted_paths)?;
+    let Outcome::Matched { body, .. } = outcome else { unreachable!() };
+    // The existing strict adapter is the only append path: original receipt
+    // -> journal fsync -> idempotent ledger projection -> pending close.
+    let committed = commit_matched_fak(journal, ledger, pending, hash, body)?;
+    if journal.commits()?.iter().find(|c| c.order_hash == hash) != Some(&evidence.commitment) {
+        return Err(StrictFakRefusal::Race("journal does not match winning HTTP evidence"));
+    }
+    Ok(committed)
 }
 
 /// A complete journal-first matched FAK *booking* path; never sends an order.
@@ -403,6 +491,171 @@ mod tests {
             Err(StrictFakRefusal::RestingCannotCommit));
         assert!(commit_matched_fak(&journal, &mut led, &mut pend, "missing",
             &venue_buy(r#","fee":"0""#)).is_err());
+        assert!(journal.commits().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn http_reply(path: &str, http: u16, body: String, ms: f64) -> PathResult {
+        PathResult { path: path.into(), http, body, ms }
+    }
+    fn race_win(body: &str, path: &str, ms: f64) -> Outcome {
+        Outcome::Matched {
+            body: body.into(), winner: path.into(), ms,
+        }
+    }
+    #[test]
+    fn observed_2xx_winner_books_exact_money_despite_silent_sibling() {
+        let (dir, mut ledger, mut pending, journal) = fixture("race-ok", 0);
+        let body = venue_buy(r#","feeAmount":"0.015""#);
+        let outcome = race_win(&body, "https-primary", 12.0);
+        let results = vec![
+            http_reply("https-primary", 200, body.clone(), 12.0),
+            http_reply("https-secondary", 0, "".into(), 10000.0),
+        ];
+        let proof = prove_matched_race(
+            &pending.open_rows()[0], &outcome, &results, 2,
+        ).unwrap();
+        assert_eq!(proof.winner_path, "https-primary");
+        assert_eq!(proof.commitment.fee_micros, 15_000);
+        let booked = commit_matched_fak_from_race(
+            &journal, &mut ledger, &mut pending,
+            "h1", &outcome, &results, 2,
+        ).unwrap();
+        assert_eq!(booked.receipt, Booked { shares: 9.0, price: 0.45 });
+        assert_eq!(booked.append, AppendVerdict::DurablyWritten);
+        assert_eq!(ledger.recorded_order("h1").unwrap().fee, 0.015);
+        assert!(!pending.is_open("h1"));
+        assert_eq!(journal.commits().unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn fake_matched_body_in_http_503_cannot_book() {
+        let (dir, mut ledger, mut pending, journal) = fixture("race-503", 0);
+        let body = venue_buy(r#","feeAmount":"0.01""#);
+        let outcome = race_win(&body, "a", 1.0);
+        let results = [http_reply("a", 503, body, 1.0)];
+        assert!(matches!(
+            commit_matched_fak_from_race(
+                &journal, &mut ledger, &mut pending,
+                "h1", &outcome, &results, 1,
+            ),
+            Err(StrictFakRefusal::Race(_)),
+        ));
+        assert!(pending.is_open("h1"));
+        assert!(!ledger.was_order_booked("h1"));
+        assert!(journal.commits().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn invented_winner_or_body_mismatch_cannot_commit() {
+        let (dir, mut ledger, mut pending, journal) = fixture("race-forged", 0);
+        let body = venue_buy(r#","feeAmount":"0.01""#);
+        let real = [http_reply("edge", 200, body.clone(), 14.0)];
+        for outcome in [
+            race_win(&body, "not-an-observed-edge", 14.0),
+            race_win(&body, "edge", 15.0),
+            race_win(&venue_buy(r#","feeAmount":"0.02""#), "edge", 14.0),
+        ] {
+            assert!(matches!(
+                commit_matched_fak_from_race(
+                    &journal, &mut ledger, &mut pending,
+                    "h1", &outcome, &real, 1,
+                ), Err(StrictFakRefusal::Race(_))
+            ));
+        }
+        assert!(pending.is_open("h1"));
+        assert!(!ledger.was_order_booked("h1"));
+        assert!(journal.commits().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn duplicate_or_unbounded_path_inventory_refuses_before_money_write() {
+        let (dir, mut ledger, mut pending, journal) = fixture("race-dupe", 0);
+        let body = venue_buy(r#","feeAmount":"0.01""#);
+        let outcome = race_win(&body, "a", 14.0);
+        let rows = [
+            http_reply("a", 200, body.clone(), 14.0),
+            http_reply("a", 200, body, 14.0),
+        ];
+        for count in [0, 1, 2] {
+            assert!(matches!(
+                commit_matched_fak_from_race(
+                    &journal, &mut ledger, &mut pending,
+                    "h1", &outcome, &rows, count,
+                ), Err(StrictFakRefusal::Race(_))
+            ));
+        }
+        assert!(pending.is_open("h1"));
+        assert!(journal.commits().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn sibling_with_conflicting_matched_money_or_unknown_fee_refuses() {
+        let (dir, mut ledger, mut pending, journal) = fixture("race-sibling", 0);
+        let good = venue_buy(r#","feeAmount":"0.01""#);
+        let outcome = race_win(&good, "primary", 12.0);
+        for sibling in [
+            venue_buy(r#","feeAmount":"0.02""#),
+            venue_buy(""),
+            venue_buy(r#","feeAmount":"0.01""#)
+                .replace(r#""makingAmount":"4.05""#, r#""makingAmount":"4.14""#),
+        ] {
+            let rows = [
+                http_reply("primary", 200, good.clone(), 12.0),
+                http_reply("secondary", 201, sibling, 15.0),
+            ];
+            assert!(commit_matched_fak_from_race(
+                &journal, &mut ledger, &mut pending,
+                "h1", &outcome, &rows, 2,
+            ).is_err());
+        }
+        assert!(pending.is_open("h1"));
+        assert!(!ledger.was_order_booked("h1"));
+        assert!(journal.commits().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn all_observed_matched_siblings_with_identical_money_can_commit() {
+        let (dir, mut ledger, mut pending, journal) = fixture("race-same", 0);
+        let body = venue_buy(r#","feeAmount":"0.01""#);
+        let outcome = race_win(&body, "first", 8.0);
+        let rows = [
+            http_reply("first", 200, body.clone(), 8.0),
+            http_reply("second", 200, body, 12.0),
+        ];
+        let booked = commit_matched_fak_from_race(
+            &journal, &mut ledger, &mut pending,
+            "h1", &outcome, &rows, 2,
+        ).unwrap();
+        assert_eq!(booked.receipt.price, 0.45);
+        assert!(!pending.is_open("h1"));
+        assert_eq!(journal.commits().unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn unmatched_or_unverifiable_outcome_cannot_close_a_pending_row() {
+        let (dir, mut ledger, mut pending, journal) = fixture("race-unknown", 0);
+        let body = venue_buy(r#","feeAmount":"0.01""#);
+        let rows = [http_reply("primary", 200, body, 3.0)];
+        for outcome in [
+            Outcome::Ambiguous { detail: "timeout".into() },
+            Outcome::NoResponse,
+            Outcome::DuplicateOnly { winner: "primary".into() },
+            Outcome::Rejected { body: "deny".into() },
+            Outcome::Resting {
+                order_id: "h1".into(), body: "live".into(),
+                winner: "primary".into(), ms: 3.0,
+            },
+        ] {
+            assert!(matches!(
+                commit_matched_fak_from_race(
+                    &journal, &mut ledger, &mut pending,
+                    "h1", &outcome, &rows, 1,
+                ), Err(StrictFakRefusal::Race(_))
+            ));
+        }
+        assert!(pending.is_open("h1"));
+        assert!(!ledger.was_order_booked("h1"));
         assert!(journal.commits().unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
