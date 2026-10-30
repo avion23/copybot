@@ -278,6 +278,10 @@ Guardian now imports its five checked-in monitoring dependencies (`resolution`, 
 
 `hot/src/pending_journal.rs` now owns the one `PendingLog` implementation: durable replay and compaction, append/resolve, stale/due windows and inflight reservation reconstruction. The parent `pending.rs` retains the domain types and existing tests and exposes the same methods; the sibling `pending_verdict.rs` contains the pure venue parser. No second journal or order state owner was introduced, and no timeout, release-on-unknown or WAL recovery paths were altered. `pending.rs` decreased from 1,183 to **908 lines**, meeting its 1,000-line source cap; the journal is 281 lines and verdict parser 187. This closes the pending file-size A3 subgate, not the whole A3/A4 order-ownership redesign.
 
+### A3: control verification boundary (COPYBOT-3)
+
+`hot/src/control.rs` previously mixed 446 lines of production control/ledger coordination with 960 lines of compiled-only regression tests. Those **existing, unchanged** tests now live in `hot/src/control_tests.rs` and retain the same `control::tests` module and private access. Production `control.rs` is 449 lines and the test module 960 lines, each under the 1,000-line budget. This is a source organization and verification isolation change, **not** a runtime state-owner redesign or a measured correctness gain; no assertion, unit test or runtime behavior is added or removed. The A3 `lanes.rs` and `main.rs` sizes remain unresolved.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.
