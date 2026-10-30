@@ -1,4 +1,6 @@
 import argparse
+from contextlib import closing
+import http.client
 import json
 import os
 import sys
@@ -190,16 +192,34 @@ def halt_buys(lane, reason, dry_run):
     if dry_run:
         log('  (dry-run — would halt BUYS on %s)' % lane)
         return True
+    capability = os.environ.get('COPYBOT_OPERATOR_TOKEN', '')
+    if len(capability) != 64 or any(c not in '0123456789abcdefABCDEF' for c in capability):
+        log('  FAILED to halt %s: a valid operator capability is not configured; fault retained' % lane)
+        return False
     body = json.dumps({'lane': lane, 'state': 'halt_buys'}).encode()
     try:
-        req = urllib.request.Request('http://127.0.0.1:%d/api/arm' % BOT_PORT, data=body, headers={'content-type': 'application/json', 'User-Agent': UA})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            ok = json.loads(r.read().decode()).get('ok') is True
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        log('  ⛔ FAILED to halt %s: %s' % (lane, e))
+        # A concrete loopback connection neither uses proxies nor follows redirects.
+        with closing(http.client.HTTPConnection('127.0.0.1', BOT_PORT, timeout=15)) as conn:
+            conn.request('POST', '/api/arm', body=body, headers={
+                'Content-Type': 'application/json', 'User-Agent': UA,
+                'Authorization': 'Bearer ' + capability,
+            })
+            response = conn.getresponse()
+            if response.status != 200:
+                log('  FAILED to halt %s: operator HTTP %d; fault retained' % (lane, response.status))
+                return False
+            payload = response.read(65_537)
+            if len(payload) > 65_536:
+                raise ValueError('oversized operator response')
+            result = json.loads(payload.decode())
+            if not isinstance(result, dict) or result.get('ok') is not True:
+                log('  FAILED to halt %s: operator did not confirm the change; fault retained' % lane)
+                return False
+    except (OSError, ValueError, http.client.HTTPException):
+        log('  FAILED to halt %s: operator response unavailable; fault retained' % lane)
         return False
     log('  halted BUYS on %s (exits keep mirroring)' % lane)
-    return ok
+    return True
 
 def position_marks():
     try:

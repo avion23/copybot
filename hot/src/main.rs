@@ -25,6 +25,7 @@ use copybot_hot::config::{addr20, Root};
 use copybot_hot::feeds::{FeedConfig, FeedStats, RawTx};
 use copybot_hot::lanes::{resolve_route, Route, Router, MICRO};
 use copybot_hot::order::{amounts, json_body, order_signer, safe_salt, Order};
+use copybot_hot::operator_access::{OperatorAccess, OperatorAction};
 use copybot_hot::race::{FillKey, RaceBook};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -33,6 +34,13 @@ use tokio::sync::mpsc;
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     eprintln!("Abomination81 Copybot — execution engine");
+    let operator_access = match OperatorAccess::from_environment() {
+        Ok(access) => Arc::new(access),
+        Err(error) => {
+            eprintln!("OPERATOR CONFIG ERROR: {error}");
+            std::process::exit(2);
+        }
+    };
     let cfg_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "deploy/copybot2.toml".into());
@@ -1114,6 +1122,8 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
             .and_then(|p| p.parse().ok())
             .unwrap_or(8806);
         let (c, r, bk2) = (control.clone(), router.clone(), books.clone());
+        let operator_access_d = operator_access.clone();
+        let operator_events_d = emitter.clone();
         let pend_dash = pending_log.clone();
         let custody_dash = custody_report.clone();
         let leader_pnl_dash = leader_pnl.clone();
@@ -1244,7 +1254,10 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                     return;
                 }
             };
-            eprintln!("[dash] http://127.0.0.1:{port}  (loopback; no app token)");
+            eprintln!(
+                "[dash] http://127.0.0.1:{port} (loopback; mutations {})",
+                if operator_access_d.enabled() { "require operator capability" } else { "disabled" },
+            );
             const MAX_DASH_CONNS: usize = 32;
             const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
             let conn_limit = std::sync::Arc::new(
@@ -1298,6 +1311,8 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                 let unattributed_d = unattributed_dash.clone();
                 let response_times_c = response_times_dash.clone();
                 let fund_pool2 = fund_pool.clone();
+                let operator_access_c = operator_access_d.clone();
+                let operator_events_c = operator_events_d.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let _permit = permit;
@@ -1344,6 +1359,35 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                                     .map(|(_, q)| q)
                                     .unwrap_or("");
                                 let _ = query;
+                                if method != "GET" {
+                                    let action = OperatorAction::from_route(method, path);
+                                    let authorization = match action {
+                                        Some(action) => operator_access_c.authorize(action, &req),
+                                        None => {
+                                            let resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
+                                            let _ = sock.write_all(resp.as_bytes()).await;
+                                            return;
+                                        }
+                                    };
+                                    let authorized = match authorization {
+                                        Ok(authorized) => authorized,
+                                        Err(error) => {
+                                            let (code, message) = error.response();
+                                            let out = serde_json::json!({ "error": message }).to_string();
+                                            let resp = format!(
+                                                "HTTP/1.1 {code}\r\nContent-Type: application/json\r\n\
+                                                 WWW-Authenticate: Bearer\r\nCache-Control: no-store\r\n\
+                                                 Content-Length: {}\r\n\r\n{}", out.len(), out,
+                                            );
+                                            let _ = sock.write_all(resp.as_bytes()).await;
+                                            return;
+                                        }
+                                    };
+                                    operator_events_c.emit(serde_json::json!({
+                                        "t": now_ms(), "ev": "operator_authorized",
+                                        "actor": "operator-capability", "action": authorized.action().label(),
+                                    }));
+                                }
                                 if method == "GET"
                                     && (path == "/" || path == "/index"
                                         || path == "/index.html")

@@ -239,24 +239,78 @@ const when = ts => ts ? new Date(ts * 1000).toLocaleString(undefined,
   { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—";
 
 
-function commit(intent) {
+function requestOperatorCapability() {
+  return new Promise(resolve => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "modal";
+    const input = el("input", {
+      type: "password", autocomplete: "off", spellcheck: "false",
+      "aria-label": "Operator capability", required: true,
+      oninput: e => e.target.setCustomValidity(""),
+    });
+    const finish = value => {
+      input.value = "";
+      dialog.close();
+      dialog.remove();
+      resolve(value);
+    };
+    const form = el("form", { method: "dialog" }, [
+      el("h3", {}, "Authorize this change"),
+      el("p", {}, "Enter the operator capability from the protected environment file. It is used for this request only and is not saved in this browser."),
+      input,
+      el("div", { style: "display:flex;gap:10px;justify-content:flex-end;margin-top:16px" }, [
+        el("button", { type: "button", onclick: () => finish(null) }, "Cancel"),
+        el("button", { type: "submit" }, "Authorize"),
+      ]),
+    ]);
+    form.addEventListener("submit", event => {
+      event.preventDefault();
+      const value = input.value.trim();
+      if (!/^[0-9a-f]{64}$/i.test(value)) {
+        input.setCustomValidity("Enter the 64-character hexadecimal operator capability.");
+        input.reportValidity();
+        return;
+      }
+      finish(value);
+    });
+    dialog.addEventListener("cancel", event => { event.preventDefault(); finish(null); });
+    dialog.append(form);
+    document.body.append(dialog);
+    dialog.showModal();
+    input.focus();
+  });
+}
+
+async function commit(intent) {
   if (READ_ONLY) {
     toast("Read-only — not sent", `${intent.method} ${intent.url}\n` +
       JSON.stringify(intent.body, null, 2));
-    return Promise.resolve({ ok: true, readOnly: true });
+    return { ok: true, readOnly: true };
   }
-  return fetch(intent.url, {
-    method: intent.method,
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(intent.body),
-
-  }).then(
-    r => r.json().catch(() => ({})).then(j => ({
-      ...j, ok: r.ok, status: r.status,
-      error: r.ok ? null : (j && j.error) || `HTTP ${r.status}`,
-    })),
-    e => ({ ok: false, status: 0, error: String(e && e.message || e) })
-  );
+  if (intent.method !== "POST" ||
+      !["/api/wallets", "/api/arm", "/api/flatten", "/api/incident/clear"].includes(intent.url)) {
+    return { ok: false, error: "Unsupported operator action; nothing sent." };
+  }
+  if (location.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname)) {
+    return { ok: false, error: "Operator changes require HTTPS or a loopback connection." };
+  }
+  let capability = await requestOperatorCapability();
+  if (capability === null) return { ok: false, error: "Authorization cancelled; nothing sent." };
+  try {
+    const response = await fetch(intent.url, {
+      method: intent.method,
+      headers: { "content-type": "application/json", "authorization": `Bearer ${capability}` },
+      body: JSON.stringify(intent.body),
+      redirect: "error", cache: "no-store",
+    });
+    const result = await response.json();
+    return { ...result, ok: response.ok, status: response.status,
+      error: response.ok ? null : result.error || `HTTP ${response.status}` };
+  } catch (_) {
+    return { ok: false, status: 0, error: "Request outcome unavailable. Check current state before retrying." };
+  } finally {
+    capability = "";
+  }
 }
 
 function driftByLane(pool) {
@@ -1393,7 +1447,7 @@ function renderRailFooter() {
         onclick: () => commit({ method: "POST", url: "/api/wallets", body: { name: l.name, ...pend } })
           .then(res => {
             if (res.ok) { S.edits[l.name] = {}; toast("Saved", l.name); }
-            else { toast("NOT saved — your edit is still here",
+            else { toast("Save not confirmed — check current state before retrying",
                          res.error || "the runtime refused it"); }
             render();
           })
@@ -1452,7 +1506,7 @@ function openGate(laneName, mode) {
       stage.innerHTML = "";
       if (!res.ok) {
         stage.append(el("div", { class: "warnbox", style: "margin:0" },
-          `NOT queued — ${res.error || "the runtime refused it"}. Nothing has been sold.`));
+          `Exit request not confirmed — ${res.error || "no confirmation received"}. Check current state before retrying.`));
         confirmBtn.textContent = "Close"; confirmBtn.disabled = false;
         confirmBtn.onclick = close;
         return;
@@ -1549,7 +1603,7 @@ function setArm(lane, state) {
                                  body: { lane, state, ...extra } })
     .then(res => {
       if (!res.ok) {
-        toast(`NOT ${state === "off" ? "disarmed" : "armed"} — ${lane}`,
+        toast(`Arm-state change not confirmed — ${lane}`,
               res.error || "the runtime refused it");
       }
       setTimeout(load, 400);
