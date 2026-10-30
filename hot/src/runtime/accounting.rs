@@ -380,6 +380,17 @@ pub(crate) fn open_fak_journal_for_live(
     }
 }
 
+/// Cheap canonical-FAK-owner admission check. No journal file is created,
+/// and this never submits an order. Replaced or unlinked inodes refuse before
+/// the caller can sign/POST or reserve a new FAK trade.
+pub(crate) fn fak_owner_submit_ready(
+    owner: Option<&Arc<copybot_hot::order_commit::AtomicFakJournal>>,
+) -> Result<(), copybot_hot::order_commit::JournalRefusal> {
+    owner.ok_or_else(|| copybot_hot::order_commit::JournalRefusal::Unsafe(
+        "FAK journal not bootstrapped/replayed".into(),
+    ))?.verify_owner()
+}
+
 /// The one migrated runtime matched-FAK booking edge. A venue HTTP race
 /// has ALREADY happened: failure here must keep the durable reservation and
 /// halt new buys instead of silently trying legacy limit/zero-fee booking.
@@ -502,137 +513,9 @@ pub(crate) fn book_and_resolve(
 
 
 #[cfg(test)]
-mod d619_tests {
-    use super::*;
-    use copybot_hot::pending::{Pending, PendingLog};
-    use copybot_hot::ledger::Ledger;
-    use copybot_hot::risk::RiskConfig;
-    use copybot_hot::race_send::{Outcome, PathResult};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+#[path = "accounting_tests.rs"]
+mod d619_tests;
 
-    static NEXT: AtomicUsize = AtomicUsize::new(1);
-    type Fixture = (
-        PathBuf, Arc<std::sync::Mutex<Control>>,
-        Arc<std::sync::Mutex<PendingLog>>, Arc<Router>,
-        Arc<std::sync::Mutex<copybot_hot::incidents::Incidents>>, Arc<Emitter>,
-        String,
-    );
-    fn fixture(label: &str) -> Fixture {
-        let dir = std::env::temp_dir().join(format!(
-            "cb-d619-{label}-{}-{}", std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let control_path = dir.join("ctl").to_string_lossy().into_owned();
-        let ledger = Ledger::new(
-            dir.join("ledger.jsonl").to_str().unwrap(),
-            &[("alpha".into(), RiskConfig::default())],
-        );
-        let control = Arc::new(std::sync::Mutex::new(Control::new(
-            ledger, dir.join("operator.json").to_str().unwrap(),
-        )));
-        let pending = Arc::new(std::sync::Mutex::new(PendingLog::open(
-            dir.join("pending.jsonl").to_str().unwrap(),
-        )));
-        pending.lock().unwrap().record(Pending {
-            lane: "alpha".into(), token: "tok".into(), side: 0,
-            order_hash: "h1".into(), shares: 10.0, limit: 0.6,
-            ts: 12, why: "offline_fixture".into(), resting: false,
-        }).unwrap();
-        let router = Arc::new(Router::new(vec![]));
-        let incidents = Arc::new(std::sync::Mutex::new(
-            copybot_hot::incidents::Incidents::open(dir.join("incidents.jsonl")),
-        ));
-        let emitter = Arc::new(Emitter::new(
-            dir.join("events.jsonl").to_string_lossy().into_owned(), false,
-        ));
-        (dir, control, pending, router, incidents, emitter, control_path)
-    }
-    fn matched(fee: bool) -> String {
-        format!(
-            r#"{{"status":"matched","success":true,"orderID":"0xh1","takingAmount":"9","makingAmount":"4.05"{}}}"#,
-            if fee { r#","feeAmount":"0.015""# } else { "" },
-        )
-    }
-    #[test]
-    fn dry_and_shadow_never_open_a_durable_fak_owner_file() {
-        let (dir, c, p, r, i, _e, path) = fixture("dry");
-        assert!(open_fak_journal_for_live(false, &path, &c, &p, &r, &i).is_none());
-        assert!(!dir.join("ctl.fak_commit").exists());
-        assert!(!dir.join("ctl.fak_commit.owner.lock").exists());
-        assert!(p.lock().unwrap().is_open("h1"));
-        assert!(!c.lock().unwrap().ledger.was_order_booked("h1"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn prepared_owner_routes_matched_fak_through_one_journal_then_ledger() {
-        let (dir, c, p, r, i, e, path) = fixture("match");
-        let journal = open_fak_journal_for_live(true, &path, &c, &p, &r, &i)
-            .expect("valid empty owner must open");
-        let body = matched(true);
-        let outcome = Outcome::Matched {
-            body: body.clone(), winner: "p".into(), ms: 1.0,
-        };
-        let results = [PathResult {
-            path: "p".into(), http: 200, body, ms: 1.0,
-        }];
-        let (booked, shares) = book_matched_fak_race(
-            Some(&journal), &c, &p, &r, &i, &e, "h1", "alpha",
-            &outcome, &results, 1,
-        );
-        assert!(booked);
-        assert_eq!(shares, 9.0);
-        assert!(!p.lock().unwrap().is_open("h1"));
-        assert_eq!(journal.commits().unwrap().len(), 1);
-        let guard = c.lock().unwrap();
-        assert_eq!(guard.ledger.recorded_order("h1").unwrap().fee, 0.015);
-        drop(guard);
-        drop(journal);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn matched_without_fee_latches_result_and_keeps_pending_unchanged() {
-        let (dir, c, p, r, i, e, path) = fixture("unknown");
-        let journal = open_fak_journal_for_live(true, &path, &c, &p, &r, &i).unwrap();
-        let body = matched(false);
-        let outcome = Outcome::Matched {
-            body: body.clone(), winner: "p".into(), ms: 1.0,
-        };
-        let results = [PathResult {
-            path: "p".into(), http: 200, body, ms: 1.0,
-        }];
-        let (booked, shares) = book_matched_fak_race(
-            Some(&journal), &c, &p, &r, &i, &e, "h1", "alpha",
-            &outcome, &results, 1,
-        );
-        assert!(!booked);
-        assert_eq!(shares, 0.0);
-        assert!(p.lock().unwrap().is_open("h1"));
-        assert!(!c.lock().unwrap().ledger.was_order_booked("h1"));
-        assert!(journal.commits().unwrap().is_empty());
-        drop(journal);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn journal_only_crash_is_recovered_at_boot_without_network_or_post() {
-        let (dir, c, p, r, i, _e, path) = fixture("restart");
-        let journal = copybot_hot::order_commit::AtomicFakJournal::open(
-            dir.join("ctl.fak_commit"),
-        ).unwrap();
-        let fact = copybot_hot::venue_fak::parse_matched_fak(
-            &p.lock().unwrap().open_rows()[0], &matched(true),
-        ).unwrap();
-        journal.append(fact).unwrap();
-        drop(journal);
-        let recovered = open_fak_journal_for_live(true, &path, &c, &p, &r, &i).unwrap();
-        assert_eq!(recovered.commits().unwrap().len(), 1);
-        assert!(!p.lock().unwrap().is_open("h1"));
-        assert_eq!(c.lock().unwrap().ledger.recorded_order("h1").unwrap().fee, 0.015);
-        drop(recovered);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-}
 
 pub(crate) fn spawn_settlement_booking(
     control: &Arc<std::sync::Mutex<Control>>,

@@ -329,6 +329,17 @@ impl AtomicFakJournal {
         })
     }
     pub fn path(&self) -> &Path { &self.path }
+    /// O(1) live admission preflight: no cloning of all historical fill
+    /// frames on the latency-sensitive path. A poisoned/replaced owner must
+    /// refuse BEFORE posting another order.
+    pub fn verify_owner(&self) -> Result<(), JournalRefusal> {
+        let owner = self.state.lock()
+            .map_err(|_| JournalRefusal::Unsafe("journal owner poisoned".into()))?;
+        if owner.poisoned {
+            return Err(JournalRefusal::Unsafe("journal fsync/identity fault latched".into()));
+        }
+        self.ensure_owner(&owner)
+    }
     pub fn commits(&self) -> Result<Vec<FakFillCommit>, JournalRefusal> {
         let owner = self.state.lock()
             .map_err(|_| JournalRefusal::Unsafe("journal owner poisoned".into()))?;
@@ -782,6 +793,7 @@ mod tests {
             let (dir, _, _) = fixture(which);
             let path = dir.join("owner.jsonl");
             let journal = AtomicFakJournal::open(&path).unwrap();
+            assert!(journal.verify_owner().is_ok());
             let original = if which == "journal" {
                 path.clone()
             } else {
@@ -795,6 +807,7 @@ mod tests {
                 Err(JournalRefusal::Unsafe(_))
             ), "unlinked writer must never record a successful commit");
             assert!(journal.commits().is_err(), "poisoned owner must not provide valid replay");
+            assert!(journal.verify_owner().is_err(), "poisoned owner must not authorize POST");
             assert!(journal.append(commit("h", "T")).is_err(),
                 "poison remains latched for the process lifetime");
             assert!(fs::read_to_string(&saved).unwrap().is_empty());

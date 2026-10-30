@@ -1,6 +1,7 @@
 //! Existing periodic and post-sale sweep task. The caller owns the live-mode gate.
 
-use super::accounting::book_and_resolve;
+use super::accounting::{book_matched_fak_race, fak_owner_submit_ready};
+use super::control::latch_buys;
 use super::execution::submit_tracked;
 use super::reconcile::recovery_target_shares;
 use super::telemetry::{now_ms, Emitter};
@@ -10,6 +11,19 @@ use copybot_hot::order::order_signer;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Conservative one-worker sweep guard. Do not submit another FAK against a
+/// token while ANY lane has a still-unresolved order for it. A previous
+/// strict-money refusal retains its reservation by design; without this
+/// check the next scheduled sweep could repeatedly sell the same inventory.
+fn sweep_pending_conflict(
+    pending: &copybot_hot::pending::PendingLog,
+    token: &str,
+) -> bool {
+    pending.unreadable_sources > 0
+        || !pending.persistence_ok()
+        || pending.open_rows().iter().any(|p| p.token == token)
+}
 
 pub(crate) fn spawn(
     pending_log: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
@@ -25,9 +39,11 @@ pub(crate) fn spawn(
     clob: &String,
     creds: &Arc<Option<copybot_hot::auth::ApiCreds>>,
     order_paths: &Arc<Vec<(String, reqwest::Client)>>,
+    fak_journal: &Option<Arc<copybot_hot::order_commit::AtomicFakJournal>>,
     mut sweep_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
         let pend3 = pending_log.clone();
+        let fak3 = fak_journal.clone();
         let inc3 = incidents.clone();
         let mc3 = merge_claims.clone();
         let (c3, r3, e3, f3, pk3, sa3, st3, clob3, creds3, paths3) = (
@@ -240,6 +256,16 @@ pub(crate) fn spawn(
                         {
                             continue;
                         }
+                        let unresolved = pend3.lock()
+                            .map(|journal| sweep_pending_conflict(&journal, &tok))
+                            .unwrap_or(true);
+                        if unresolved {
+                            e3.emit(serde_json::json!({
+                                "t":now_ms(), "ev":"sweep_skip", "lane":name,
+                                "tok":tok, "reason":"unresolved_order_or_pending_journal",
+                            }));
+                            continue;
+                        }
                         swept.insert(sweep_key, now);
                         let (shares, limit) = if is_dust {
                             copybot_hot::venue::dust_fak_terms(sell_qty, px)
@@ -253,6 +279,19 @@ pub(crate) fn spawn(
                                     : tok, "shares" : sz, "reason" : "below_venue_share_tick" }
                                 ),
                             );
+                            continue;
+                        }
+                        // A sweep is a FAK sell. Its matched response must
+                        // be booked by the canonical journal, never by the
+                        // legacy zero-fee/limit fallback. Check before POST.
+                        if let Err(reason) = fak_owner_submit_ready(fak3.as_ref()) {
+                            latch_buys(&lane, &inc3, "fak_owner_unavailable",
+                                "sweep FAK has no intact money owner; refusing submission");
+                            e3.emit(serde_json::json!({
+                                "t":now_ms(), "ev":"sweep_skip", "lane":name,
+                                "tok":tok, "reason":"fak_owner_unavailable",
+                                "detail":format!("{reason:?}"),
+                            }));
                             continue;
                         }
                         let (ma, ta) = copybot_hot::order::amounts(limit, shares, 1);
@@ -297,7 +336,7 @@ pub(crate) fn spawn(
                             }
                         };
                         let sweep_hash = hex::encode(ord.digest());
-                        let (outcome, _res) = match submit_tracked(
+                        let (outcome, results) = match submit_tracked(
                                 &pend3,
                                 &e3,
                                 &copybot_hot::provenance::Provenance::own(
@@ -343,25 +382,75 @@ pub(crate) fn spawn(
                                 .chars().take(90).collect::< String > () }
                             ),
                         );
-                        if let copybot_hot::race_send::Outcome::Matched { body, .. } = &outcome {
-                            book_and_resolve(
-                                &c3,
-                                &pend3,
-                                &r3,
-                                &inc3,
-                                &e3,
-                                &name,
-                                &tok,
-                                1,
-                                limit,
-                                body,
-                                None,
-                                &sweep_hash,
-                                false,
+                        if matches!(outcome, copybot_hot::race_send::Outcome::Matched { .. }) {
+                            let (booked, _) = book_matched_fak_race(
+                                fak3.as_ref(), &c3, &pend3, &r3, &inc3, &e3,
+                                &sweep_hash, &name, &outcome, &results, paths3.len(),
                             );
+                            if !booked {
+                                e3.emit(serde_json::json!({
+                                    "t":now_ms(), "ev":"sweep_unconfirmed",
+                                    "lane":name, "tok":tok,
+                                    "reason":"matched_but_fak_money_unverified",
+                                }));
+                            }
                         }
                     }
                 }
             }
         });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use copybot_hot::pending::{Pending, PendingLog};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+
+    fn pending_fixture(label: &str) -> (std::path::PathBuf, PendingLog) {
+        let path = std::env::temp_dir().join(format!(
+            "copybot-d620-sweep-{label}-{}-{}.jsonl",
+            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let log = PendingLog::open(path.to_str().unwrap());
+        (path, log)
+    }
+    #[test]
+    fn unresolved_sell_or_buy_blocks_duplicate_sweep_until_durable_close() {
+        let (path, mut log) = pending_fixture("outstanding");
+        assert!(!sweep_pending_conflict(&log, "token"));
+        log.record(Pending {
+            lane:"lane_a".into(), token:"token".into(), side:1,
+            order_hash:"s1".into(), shares:4.0, limit:0.3,
+            ts:100, why:"synthetic".into(), resting:false,
+        }).unwrap();
+        assert!(sweep_pending_conflict(&log, "token"),
+            "unknown matched FAK remains reserved so no second sweep can send");
+        assert!(!sweep_pending_conflict(&log, "other_token"));
+        log.resolve("s1", "no_fill", None).unwrap();
+        assert!(!sweep_pending_conflict(&log, "token"));
+
+        log.record(Pending {
+            lane:"lane_b".into(), token:"token".into(), side:0,
+            order_hash:"b1".into(), shares:2.0, limit:0.5,
+            ts:101, why:"synthetic".into(), resting:true,
+        }).unwrap();
+        assert!(sweep_pending_conflict(&log, "token"),
+            "a cross-lane resting buy also means this token's inventory is unsettled");
+        log.resolve("b1", "no_fill", None).unwrap();
+        assert!(!sweep_pending_conflict(&log, "token"));
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn unreadable_or_faulted_pending_log_defers_all_sweep_submissions() {
+        let (path, mut log) = pending_fixture("corrupt");
+        log.unreadable_sources = 1;
+        assert!(sweep_pending_conflict(&log, "token"));
+        assert!(sweep_pending_conflict(&log, "any_other_token"));
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 }

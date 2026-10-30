@@ -399,15 +399,20 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                             // FAK submissions may never use legacy limit/zero-fee
                             // accounting. Without a successfully replayed owner,
                             // refuse BEFORE HTTP POST and latch the buy side.
-                            if order_type == "FAK" && fak_journal.is_none() {
-                                latch_buys(&lane, &incidents, "fak_owner_unavailable",
-                                    "FAK execution needs a durable money journal before POST");
-                                emitter.emit(serde_json::json!({
-                                    "t":now_ms(), "ev":"submit_precondition_failed",
-                                    "lane":lane_name, "tok":intent.token_id,
-                                    "why":"FAK journal unavailable", "buys_halted":true,
-                                }));
-                                continue;
+                            if order_type == "FAK" {
+                                if let Err(reason) =
+                                    runtime::accounting::fak_owner_submit_ready(fak_journal.as_ref())
+                                {
+                                    latch_buys(&lane, &incidents, "fak_owner_unavailable",
+                                        "FAK execution needs an intact durable money journal before POST");
+                                    emitter.emit(serde_json::json!({
+                                        "t":now_ms(), "ev":"submit_precondition_failed",
+                                        "lane":lane_name, "tok":intent.token_id,
+                                        "why":format!("FAK owner unavailable: {reason:?}"),
+                                        "buys_halted":true,
+                                    }));
+                                    continue;
+                                }
                             }
                             let Some(sig) = sig else {
                                 latch_buys(

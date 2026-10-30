@@ -879,7 +879,8 @@ still be holding something, check that the funder address is right."
     if live {
         runtime::exit_sweep::spawn(
             &pending_log, &incidents, &merge_claims, &control, &router, &emitter,
-            &funder, pk, &signer_addr, sig_type, &clob, &creds, &order_paths, sweep_rx,
+            &funder, pk, &signer_addr, sig_type, &clob, &creds, &order_paths,
+            &fak_journal, sweep_rx,
         );
     }
     if live {
