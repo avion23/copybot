@@ -191,6 +191,8 @@ SOLD — the wallet still holds everything it held before.",
                 };
                 let held = c4.lock().unwrap().ledger.holdings(&lane.cfg.name);
                 let mut sold = 0usize;
+                let mut attempted = 0usize;
+                let mut unconfirmed = 0usize;
                 for (tok, sz) in held.iter() {
                     if *sz <= 1e-9 {
                         continue;
@@ -209,6 +211,7 @@ SOLD — the wallet still holds everything it held before.",
                     if shares <= 0.0 {
                         continue;
                     }
+                    attempted += 1;
                     let neg = ours
                         .iter()
                         .find(|p| p["asset"].as_str() == Some(tok.as_str()))
@@ -229,7 +232,10 @@ SOLD — the wallet still holds everything it held before.",
                     };
                     let sig = ord.sign_for_type(key);
                     let body = copybot_hot::order::json_body(&ord, &sig, &cr.key, "FAK");
-                    let Ok(body_s) = serde_json::to_string(&body) else { continue };
+                    let Ok(body_s) = serde_json::to_string(&body) else {
+                        unconfirmed += 1;
+                        continue;
+                    };
                     let hdrs = match copybot_hot::auth::l2_headers(
                         &sa4,
                         cr,
@@ -239,7 +245,10 @@ SOLD — the wallet still holds everything it held before.",
                         Some(&body_s),
                     ) {
                         Ok(h) => h,
-                        Err(_) => continue,
+                        Err(_) => {
+                            unconfirmed += 1;
+                            continue;
+                        }
                     };
                     let flat_hash = hex::encode(ord.digest());
                     let (outcome, _) = match submit_tracked(
@@ -272,12 +281,13 @@ SOLD — the wallet still holds everything it held before.",
                             eprintln!(
                                 "[{}] flatten REFUSING TO SUBMIT: {e}", lane.cfg.name
                             );
+                            unconfirmed += 1;
                             continue;
                         }
                     };
                     match &outcome {
                         copybot_hot::race_send::Outcome::Matched { body, .. } => {
-                            book_and_resolve(
+                            let (booked, _) = book_and_resolve(
                                 &c4,
                                 &pend4,
                                 &r4,
@@ -292,11 +302,20 @@ SOLD — the wallet still holds everything it held before.",
                                 &flat_hash,
                                 false,
                             );
-                            let _ = wake4.send(tok.clone());
-                            sold += 1;
+                            if booked {
+                                let _ = wake4.send(tok.clone());
+                                sold += 1;
+                            } else {
+                                unconfirmed += 1;
+                                e4.emit(serde_json::json!({
+                                    "t": now_ms(), "ev": "flatten_unconfirmed",
+                                    "lane": lane.cfg.name, "token": tok,
+                                    "reason": "matched_but_unbooked",
+                                }));
+                            }
                         }
                         copybot_hot::race_send::Outcome::Rejected { body } => {
-                            rescue_exit(
+                            let booked = rescue_exit(
                                     body,
                                     ord,
                                     pk4,
@@ -319,15 +338,28 @@ SOLD — the wallet still holds everything it held before.",
                                     &inc4,
                                 )
                                 .await;
-                            sold += 1;
+                            if booked {
+                                sold += 1;
+                            } else {
+                                unconfirmed += 1;
+                                e4.emit(serde_json::json!({
+                                    "t": now_ms(), "ev": "flatten_unconfirmed",
+                                    "lane": lane.cfg.name, "token": tok,
+                                    "reason": "rescue_unresolved",
+                                }));
+                            }
                         }
-                        _ => {}
+                        _ => { unconfirmed += 1; }
                     }
                 }
                 e4.emit(
                     serde_json::json!(
-                        { "t" : now_ms(), "ev" : "flatten_done", "lane" : lane.cfg.name,
-                        "mode" : mode.as_str(), "positions_sold" : sold }
+                        { "t" : now_ms(),
+                          "ev" : if unconfirmed == 0 { "flatten_done" } else { "flatten_incomplete" },
+                          "lane" : lane.cfg.name,
+                          "mode" : mode.as_str(), "positions_sold" : sold,
+                          "positions_booked": sold, "attempted": attempted,
+                          "unconfirmed": unconfirmed }
                     ),
                 );
             }

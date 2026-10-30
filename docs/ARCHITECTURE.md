@@ -294,6 +294,10 @@ The existing `lanes::tests` module has been separated into `hot/src/lanes_tests/
 
 The existing binary test module `http_handler_tests` now resides in `hot/src/main_tests.rs` (967 lines); the entrypoint declares it with `#[cfg(test)]` and retains the module name/private production access. No test case, fixture or assertion is added, removed or reinterpreted. This reduces `hot/src/main.rs` from 5,728 to 4,763 lines. The change is test-only relocation and does **not** fix the remaining 3,763-line deficit relative to the 1,000-line executable entrypoint budget; startup/task ownership must still be extracted at existing I/O seams.
 
+### A4: truthful flatten booking and rescue outcomes (COPYBOT-3)
+
+`runtime::exits::rescue_exit` now returns `false` when a venue `Matched` response cannot be booked into the durable ledger; the pending order stays unresolved, no false `exit_rescue_ok` is emitted, and no follow-up sweep is woken. `runtime::flatten_task::spawn` increments `positions_sold` **only** for `book_and_resolve(...).0 == true` or a rescue returning true. Serializer, signing-header, persistence, rejected-rescue and unknown submission outcomes contribute to `unconfirmed` instead of fabricated sold counts. The task emits `flatten_incomplete` with `attempted`, `positions_booked` and `unconfirmed` when any attempted sale remains unconfirmed; graceful mode still reports zero sales. The caller retains the unresolved order for recovery and emits `flatten_unconfirmed` for matched-unbooked or rescue failures. This closes the predecessor's false rescue-success reporting issue; **it does not** close A4's separate missing-price/negative-risk or incomplete position-page fallbacks.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.

@@ -305,7 +305,7 @@ pub(crate) async fn rescue_exit(
         attempt += 1;
         match &outcome {
             Outcome::Matched { body, .. } => {
-                book_and_resolve(
+                let (booked, _) = book_and_resolve(
                     control,
                     pend,
                     router,
@@ -320,6 +320,15 @@ pub(crate) async fn rescue_exit(
                     &retry_hash,
                     false,
                 );
+                if !booked {
+                    emitter.emit(serde_json::json!({
+                        "ev": "exit_rescue_FAILED", "lane": lane, "token": token,
+                        "attempts": attempt, "why": "matched_but_unbooked",
+                        "msg": "[CRITICAL] venue matched but durable ledger booking failed; pending retained",
+                        "t": now_ms(),
+                    }));
+                    return false;
+                }
                 let _ = wake.send(token.to_string());
                 emitter
                     .emit(
