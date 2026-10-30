@@ -342,6 +342,10 @@ The existing 60-second custody comparison task now lives in `runtime/custody_mon
 
 `deploy/watcher.py` now requires its checked-in `corroborate` and `notify` modules at import time and validates their expected callable capabilities before starting any listener, sweep or alert. The old `ImportError` stubs could return `('CONFIRMED', 'corroboration unavailable')` from a nonexistent corroborator or suppress all notifications; they and the misleading "inert/fail-closed" warning are removed. Test-facing `_CORROBORATE_REAL`/`_NOTIFY_REAL` remain true only after validation, with no alternate observer implementation. Offline injected-absence checks refused either missing dependency and normal imports passed, with zero external calls. **This hardens A5 but does not yet merge Guardian, watcher, fillwatch and buywatch into one process/scheduler or the final Observation envelope.**
 
+### A4: periodic position reconciliation requires all-row evidence (COPYBOT-3)
+
+`runtime/position_reconciliation.rs` now requires `position_evidence::complete_balances` before performing any custody gap comparison or durable ledger recon-fill. This rejects pagination failures, missing/duplicate token identities and malformed, negative or non-finite sizes; a malformed row can no longer vanish from `positions::by_asset` and falsely authorize releasing a held position as a phantom. The existing `recon_skipped_incomplete` event carries a typed reason, and the timed HTTP client must construct successfully rather than silently switching to a default. The existing 5-second cadence, complete-empty skip, 120/1,800-second quiet gates, pending-order exclusions and ledger writer are unchanged. The offline all-row balance probe runs alongside nine locked gates; this is **not** a live custody measurement or a completed A5 Observer redesign.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.

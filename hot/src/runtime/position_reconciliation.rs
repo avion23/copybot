@@ -22,10 +22,21 @@ pub(crate) fn spawn(
     let errpath = errors_path.to_owned();
     let drift_w = drift_by_lane.clone();
     tokio::spawn(async move {
-        let http = reqwest::Client::builder()
+        let http = match reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .unwrap_or_default();
+        {
+            Ok(client) => client,
+            Err(_) => {
+                em.emit(serde_json::json!({
+                    "t": now_ms(), "ev": "recon_skipped_incomplete",
+                    "why": "http_client_initialization",
+                    "rows": 0,
+                    "note": "cannot reconcile without a timed HTTP client",
+                }));
+                return;
+            }
+        };
         let mut tick = tokio::time::interval(Duration::from_secs(RECON_SECS));
         loop {
             tick.tick().await;
@@ -37,18 +48,20 @@ pub(crate) fn spawn(
                 "",
                 (now_ms() / 1000) as i64,
             ).await;
-            if !snap.may_act_destructively() {
-                em.emit(serde_json::json!({
-                    "t": now_ms(), "ev": "recon_skipped_incomplete",
-                    "why": snap.completeness.reason(), "rows": snap.len(),
-                    "note": "a partial portfolio cannot prove a token is gone",
-                }));
-                continue;
-            }
+            let chain = match copybot_hot::position_evidence::complete_balances(&snap) {
+                Ok(balances) => balances,
+                Err(error) => {
+                    em.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "recon_skipped_incomplete",
+                        "why": error.to_string(), "rows": snap.len(),
+                        "note": "an unreadable or partial portfolio cannot prove a token is gone",
+                    }));
+                    continue;
+                }
+            };
             if snap.is_empty() {
                 continue;
             }
-            let chain = snap.by_asset();
             let inflight: HashSet<String> = pend.lock().unwrap().open_tokens()
                 .into_iter().map(|(_, t)| t).collect();
             let now = (now_ms() / 1000) as i64;
