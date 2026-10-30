@@ -70,82 +70,65 @@ pub(crate) fn spawn(
                 };
                 let Some(cr) = creds3.as_ref() else { continue };
                 let Some(key) = pk3.as_ref() else { continue };
-                let url = format!(
-                    "https://data-api.polymarket.com/positions?user={f3}\
-&sizeThreshold=0.0001&limit=500"
-                );
-                let Ok(resp) = http.get(&url).send().await else { continue };
-                if !resp.status().is_success() {
-                    continue;
-                }
-                let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
-                let Some(ours) = v.as_array() else { continue };
-                for lane in r3.snapshot().iter() {
+                // Read and validate all venue pages and every active lane
+                // BEFORE any sweep order can be signed in this tick.
+                let ours_snapshot = copybot_hot::positions::fetch(
+                    &http, "https://data-api.polymarket.com", &f3,
+                    "0.0001", "", copybot_hot::ledger::now_secs(),
+                ).await;
+                let mut staged = Vec::new();
+                let mut evidence_failed = false;
+                for lane in r3.snapshot() {
                     let name = lane.cfg.name.clone();
                     if !lane.state.armed.load(Ordering::Relaxed) {
                         pending.retain(|(lane_name, _), _| lane_name != &name);
-                        e3.emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "sweep_skip", "lane" : name,
-                                "reason" : "lane_disarmed" }
-                            ),
-                        );
+                        e3.emit(serde_json::json!({
+                            "t": now_ms(), "ev": "sweep_skip", "lane": name,
+                            "reason": "lane_disarmed",
+                        }));
                         continue;
                     }
-                    let leader = format!("0x{}", hex::encode(lane.cfg.wallet20));
-                    let his_url = format!(
-                        "https://data-api.polymarket.com/positions?user={leader}\
-&sizeThreshold=0.0001&limit=500"
-                    );
-                    let his = match http.get(&his_url).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            match resp.json::<serde_json::Value>().await {
-                                Ok(rows) => {
-                                    rows.as_array()
-                                        .map(|a| {
-                                            a
-                                                .iter()
-                                                .filter_map(|p| {
-                                                    let token = p["asset"].as_str()?.to_string();
-                                                    let size = p["size"]
-                                                        .as_f64()
-                                                        .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
-                                                        .unwrap_or(0.0);
-                                                    let avg = p["avgPrice"]
-                                                        .as_f64()
-                                                        .or_else(|| {
-                                                            p["avgPrice"].as_str().and_then(|x| x.parse().ok())
-                                                        })
-                                                        .unwrap_or(0.0);
-                                                    Some((token, (size, avg)))
-                                                })
-                                                .collect::<std::collections::HashMap<_, _>>()
-                                        })
-                                }
-                                Err(_) => None,
-                            }
-                        }
-                        _ => None,
-                    };
-                    let Some(his) = his else {
-                        e3.emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "sweep_skip", "lane" : name,
-                                "reason" : "leader_positions_unavailable" }
-                            ),
-                        );
-                        continue;
-                    };
                     let held = c3.lock().unwrap().ledger.holdings(&name);
-                    for p in ours {
-                        let tok = p["asset"].as_str().unwrap_or("").to_string();
-                        if tok.is_empty() {
-                            continue;
+                    let ours = match copybot_hot::sweep::complete_owned(
+                        &ours_snapshot, &held,
+                    ) {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            e3.emit(serde_json::json!({
+                                "t": now_ms(), "ev": "sweep_unavailable",
+                                "lane": name, "reason": error.to_string(),
+                            }));
+                            evidence_failed = true;
+                            break;
                         }
-                        if !held.contains_key(&tok) {
-                            continue;
+                    };
+                    let leader = format!("0x{}", hex::encode(lane.cfg.wallet20));
+                    let his_snapshot = copybot_hot::positions::fetch(
+                        &http, "https://data-api.polymarket.com", &leader,
+                        "0.0001", "", copybot_hot::ledger::now_secs(),
+                    ).await;
+                    let his = match copybot_hot::sweep::complete_leader(&his_snapshot) {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            e3.emit(serde_json::json!({
+                                "t": now_ms(), "ev": "sweep_unavailable",
+                                "lane": name, "reason": error.to_string(),
+                            }));
+                            evidence_failed = true;
+                            break;
                         }
-                        if p["redeemable"].as_bool().unwrap_or(false) {
+                    };
+                    staged.push((lane, held, ours, his));
+                }
+                if evidence_failed {
+                    // Retain previous observations, reservations and ledger;
+                    // refuse a partial snapshot instead of treating rows as zero.
+                    continue;
+                }
+                for (lane, held, ours, his) in staged {
+                    let name = lane.cfg.name.clone();
+                    for (tok, p) in ours {
+                        if p.redeemable {
                             continue;
                         }
                         if mc3
@@ -161,15 +144,13 @@ pub(crate) fn spawn(
                             );
                             continue;
                         }
-                        let (his_sz, his_avg) = his
-                            .get(&tok)
-                            .copied()
-                            .unwrap_or((0.0, 0.0));
-                        let physical_sz = p["size"]
-                            .as_f64()
-                            .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
-                            .unwrap_or(0.0);
-                        let ours_claim = held.get(&tok).copied().unwrap_or(0.0);
+                        // An absent leader token is verified flat only because
+                        // complete_leader validated the entire paginated read.
+                        let leader_position = his.get(&tok).copied();
+                        let his_sz = leader_position.map_or(0.0, |row| row.shares);
+                        let his_avg = leader_position.and_then(|row| row.average);
+                        let physical_sz = p.physical;
+                        let ours_claim = held[&tok];
                         let pool = c3.lock().unwrap().ledger.pool_claim(&tok);
                         let sz = ours_claim
                             .min(
@@ -179,19 +160,9 @@ pub(crate) fn spawn(
                                     ours_claim,
                                 ),
                             );
-                        let px = p["curPrice"]
-                            .as_f64()
-                            .or_else(|| {
-                                p["curPrice"].as_str().and_then(|x| x.parse().ok())
-                            })
-                            .unwrap_or(0.0);
-                        let our_avg = p["avgPrice"]
-                            .as_f64()
-                            .or_else(|| {
-                                p["avgPrice"].as_str().and_then(|x| x.parse().ok())
-                            })
-                            .unwrap_or(0.0);
-                        if sz <= 1e-6 || px <= 0.0 {
+                        let px = p.mark;
+                        let our_avg = p.average;
+                        if sz <= 1e-6 {
                             continue;
                         }
                         let obs_key = (name.clone(), tok.clone());
@@ -200,18 +171,13 @@ pub(crate) fn spawn(
                             .get(&obs_key)
                             .map(|(seen, t, e)| (now_s.saturating_sub(*seen), *t, *e));
                         let pol = lane.policy();
-                        let proportional_target = match pol.sizing {
-                            copybot_hot::lanes::Sizing::Pct(pct) => {
+                        let proportional_target = match (pol.sizing, his_avg) {
+                            (copybot_hot::lanes::Sizing::Pct(pct), Some(leader_avg)) => {
                                 let scale = lane.state.cap_scale.load(Ordering::Relaxed)
                                     as f64 / MICRO;
                                 recovery_target_shares(
-                                    his_sz,
-                                    his_avg,
-                                    our_avg,
-                                    pct,
-                                    scale,
-                                    lane.cfg.min_order_usd,
-                                    pol.max_effective_pct,
+                                    his_sz, leader_avg, our_avg, pct, scale,
+                                    lane.cfg.min_order_usd, pol.max_effective_pct,
                                     pol.compound,
                                 )
                             }
@@ -219,11 +185,11 @@ pub(crate) fn spawn(
                         };
                         let action = copybot_hot::sweep::decide(
                             &copybot_hot::sweep::SweepInputs {
-                                owned: held.get(&tok).copied().unwrap_or(0.0),
+                                owned: ours_claim,
                                 physical: physical_sz,
                                 leader: his_sz,
                                 mark: px,
-                                redeemable: p["redeemable"].as_bool().unwrap_or(false),
+                                redeemable: p.redeemable,
                                 just_sold: just_sold.as_deref() == Some(tok.as_str()),
                                 proportional_target,
                                 prior,
@@ -290,7 +256,7 @@ pub(crate) fn spawn(
                             continue;
                         }
                         let (ma, ta) = copybot_hot::order::amounts(limit, shares, 1);
-                        let neg = p["negativeRisk"].as_bool().unwrap_or(false);
+                        let neg = p.negative_risk;
                         let ord = copybot_hot::order::Order {
                             salt: copybot_hot::order::safe_salt(now_ms()),
                             maker: f3.clone(),

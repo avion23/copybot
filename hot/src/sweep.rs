@@ -19,6 +19,116 @@ pub struct SweepInputs {
 }
 pub const DUST_SHARES: f64 = crate::venue::DUST_SHARES;
 pub const SAME_OBSERVATION: f64 = 0.05;
+
+/// The two independently fetched venue snapshots must be complete before
+/// a sweep can decide that an absent leader position represents a real exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SweepEvidenceError {
+    Snapshot(crate::position_evidence::PositionError),
+    InvalidHolding(String),
+    MissingHeldAsset(String),
+    InvalidAveragePrice(String),
+    InvalidMark(String),
+    MissingRiskDomain(String),
+    MissingRedeemability(String),
+}
+impl std::fmt::Display for SweepEvidenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Snapshot(e) => write!(f, "position snapshot unavailable: {e}"),
+            Self::InvalidHolding(t) => write!(f, "invalid held position: {t}"),
+            Self::MissingHeldAsset(t) => write!(f, "held asset missing from venue snapshot: {t}"),
+            Self::InvalidAveragePrice(t) => write!(f, "invalid average price for: {t}"),
+            Self::InvalidMark(t) => write!(f, "invalid market price for: {t}"),
+            Self::MissingRiskDomain(t) => write!(f, "missing exchange risk domain for: {t}"),
+            Self::MissingRedeemability(t) => write!(f, "missing redeemability for: {t}"),
+        }
+    }
+}
+impl std::error::Error for SweepEvidenceError {}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LeaderPosition {
+    pub shares: f64,
+    pub average: Option<f64>,
+}
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OwnedPosition {
+    pub physical: f64,
+    pub average: f64,
+    pub mark: f64,
+    pub negative_risk: bool,
+    pub redeemable: bool,
+}
+fn price(row: &serde_json::Value, field: &str) -> Option<f64> {
+    row[field].as_f64()
+        .or_else(|| row[field].as_str().and_then(|v| v.parse::<f64>().ok()))
+        .filter(|p| p.is_finite() && *p > 0.0 && *p <= 1.0)
+}
+pub fn complete_leader(
+    snapshot: &crate::positions::Positions,
+) -> Result<std::collections::HashMap<String, LeaderPosition>, SweepEvidenceError> {
+    let balances = crate::position_evidence::complete_balances(snapshot)
+        .map_err(SweepEvidenceError::Snapshot)?;
+    let mut out = std::collections::HashMap::with_capacity(balances.len());
+    for (index, row) in snapshot.rows.iter().enumerate() {
+        let token = row["asset"].as_str()
+            .ok_or(SweepEvidenceError::Snapshot(
+                crate::position_evidence::PositionError::InvalidAsset { row: index },
+            ))?;
+        let shares = *balances.get(token).ok_or(SweepEvidenceError::Snapshot(
+            crate::position_evidence::PositionError::InvalidSize { row: index },
+        ))?;
+        let average = if shares > 0.0 {
+            Some(price(row, "avgPrice")
+                .ok_or_else(|| SweepEvidenceError::InvalidAveragePrice(token.to_owned()))?)
+        } else {
+            None
+        };
+        out.insert(token.to_owned(), LeaderPosition { shares, average });
+    }
+    Ok(out)
+}
+pub fn complete_owned(
+    snapshot: &crate::positions::Positions,
+    held: &std::collections::HashMap<String, f64>,
+) -> Result<std::collections::HashMap<String, OwnedPosition>, SweepEvidenceError> {
+    let balances = crate::position_evidence::complete_balances(snapshot)
+        .map_err(SweepEvidenceError::Snapshot)?;
+    let mut rows = std::collections::HashMap::with_capacity(snapshot.rows.len());
+    for (index, row) in snapshot.rows.iter().enumerate() {
+        let token = row["asset"].as_str().ok_or(SweepEvidenceError::Snapshot(
+            crate::position_evidence::PositionError::InvalidAsset { row: index },
+        ))?;
+        rows.insert(token, row);
+    }
+    let mut out = std::collections::HashMap::with_capacity(held.len());
+    for (token, amount) in held {
+        if !amount.is_finite() || *amount < 0.0 {
+            return Err(SweepEvidenceError::InvalidHolding(token.clone()));
+        }
+        if *amount <= 1e-9 {
+            continue;
+        }
+        let row = rows.get(token.as_str())
+            .ok_or_else(|| SweepEvidenceError::MissingHeldAsset(token.clone()))?;
+        let physical = *balances.get(token).ok_or_else(|| {
+            SweepEvidenceError::MissingHeldAsset(token.clone())
+        })?;
+        let average = price(row, "avgPrice")
+            .ok_or_else(|| SweepEvidenceError::InvalidAveragePrice(token.clone()))?;
+        let mark = price(row, "curPrice")
+            .ok_or_else(|| SweepEvidenceError::InvalidMark(token.clone()))?;
+        let negative_risk = row["negativeRisk"].as_bool()
+            .ok_or_else(|| SweepEvidenceError::MissingRiskDomain(token.clone()))?;
+        let redeemable = row["redeemable"].as_bool()
+            .ok_or_else(|| SweepEvidenceError::MissingRedeemability(token.clone()))?;
+        out.insert(token.clone(), OwnedPosition {
+            physical, average, mark, negative_risk, redeemable,
+        });
+    }
+    Ok(out)
+}
 pub fn excess_shares(owned: f64, physical: f64, target: f64) -> f64 {
     (owned.max(0.0).min(physical.max(0.0)) - target.max(0.0)).max(0.0)
 }
