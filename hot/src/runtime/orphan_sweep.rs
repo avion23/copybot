@@ -43,10 +43,20 @@ pub(crate) fn spawn(
         let pend6 = pending_log.clone();
         let paths6 = order_paths.clone();
         tokio::spawn(async move {
-            let http = reqwest::Client::builder()
+            let http = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .unwrap_or_default();
+            {
+                Ok(client) => client,
+                Err(_) => {
+                    eprintln!("[orphan] REFUSED: cannot initialize timed position client");
+                    e6.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "orphan_unavailable",
+                        "why": "http_client_initialization",
+                    }));
+                    return;
+                }
+            };
             let mut orphan_said: std::collections::HashMap<
                 (String, String),
                 (u64, u64),
@@ -106,34 +116,33 @@ pub(crate) fn spawn(
                         copybot_hot::ledger::now_secs(),
                     )
                     .await;
-                if !snap.may_act_destructively() {
-                    eprintln!(
-                        "[orphan] positions read incomplete ({}) — skipping this pass",
-                        snap.completeness.reason()
-                    );
-                    continue;
-                }
-                let mark_of = |tok: &str| {
-                    snap
-                        .rows
-                        .iter()
-                        .find(|p| p["asset"].as_str() == Some(tok))
-                        .and_then(|p| p["curPrice"].as_f64())
-                        .unwrap_or(0.0)
-                };
-                let neg_of = |tok: &str| {
-                    snap
-                        .rows
-                        .iter()
-                        .find(|p| p["asset"].as_str() == Some(tok))
-                        .and_then(|p| p["negativeRisk"].as_bool())
-                        .unwrap_or(false)
+                let held: std::collections::HashMap<String, f64> = list
+                    .iter()
+                    .map(|orphan| (orphan.token.clone(), orphan.ours))
+                    .collect();
+                let quotes = match copybot_hot::flatten::market_terms_for_held(&snap, &held) {
+                    Ok(quotes) => quotes,
+                    Err(error) => {
+                        eprintln!("[orphan] REFUSED: unverifiable market evidence: {error}");
+                        e6.emit(serde_json::json!({
+                            "t": now_ms(), "ev": "orphan_refused",
+                            "why": error.to_string(), "would_have_fired": list.len(),
+                            "held": list.len(),
+                        }));
+                        continue;
+                    }
                 };
                 for o in list {
+                    let Some(quote) = quotes.get(&o.token) else {
+                        e6.emit(serde_json::json!({
+                            "t": now_ms(), "ev": "orphan_refused",
+                            "why": "validated_market_quote_missing", "held": 1,
+                        }));
+                        continue;
+                    };
                     let sz = o.strandable();
-                    let m = mark_of(&o.token);
-                    let px = if m > 0.0 { m } else { 0.02 };
-                    let (shares, limit) = copybot_hot::venue::cleanup_fak_terms(sz, px);
+                    let m = quote.mark;
+                    let (shares, limit) = copybot_hot::venue::cleanup_fak_terms(sz, m);
                     if shares <= 0.0 {
                         continue;
                     }
@@ -190,7 +199,7 @@ pub(crate) fn spawn(
                         side: 1,
                         signature_type: st6,
                         timestamp: now_ms(),
-                        neg_risk: neg_of(&o.token),
+                        neg_risk: quote.negative_risk,
                     };
                     let sig = ord.sign_for_type(key);
                     let body = copybot_hot::order::json_body(&ord, &sig, &cr.key, "FAK");
