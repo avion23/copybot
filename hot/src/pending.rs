@@ -671,7 +671,7 @@ mod tests {
             &[("a".to_string(), crate::risk::RiskConfig::default())],
         );
         assert!(
-            reloaded.booked_orders.contains("samehash"),
+            reloaded.was_order_booked("samehash"),
             "the idempotency key must be rebuilt by replay or a restart re-opens the hole"
         );
         std::fs::remove_dir_all(&dir).ok();

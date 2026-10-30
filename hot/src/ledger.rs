@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use crate::risk::{LaneRisk, RiskConfig};
+#[path = "ledger_receipts.rs"]
+mod receipts;
+use receipts::StoredBooked;
 #[derive(Debug, Default, Clone)]
 pub struct Position {
     pub shares: f64,
@@ -106,7 +109,8 @@ pub struct Ledger {
     pub events: u64,
     pub write_failures: u64,
     pub last_write_error: Option<String>,
-    pub booked_orders: std::collections::HashSet<String>,
+    /// The sole canonical on-disk fill receipt for each submitted order digest.
+    booked_receipts: HashMap<String, StoredBooked>,
     settlement_keys: std::collections::HashSet<(String, String)>,
 }
 impl Ledger {
@@ -123,7 +127,7 @@ impl Ledger {
             events: 0,
             write_failures: 0,
             last_write_error: None,
-            booked_orders: std::collections::HashSet::new(),
+            booked_receipts: HashMap::new(),
             settlement_keys: std::collections::HashSet::new(),
         };
         l.replay();
@@ -476,6 +480,32 @@ impl Ledger {
         if !self.lanes.contains_key(lane_name) {
             return false;
         }
+        // The ledger is inventory truth. A crash after booking but before
+        // pending resolution may repeat a submitted order hash; replaying the
+        // same receipt must never add inventory twice.
+        let receipt = if ev == "fill" && row["order_hash"].as_str().is_some_and(|h| !h.is_empty()) {
+            match StoredBooked::from_fill_row(row) {
+                Some((hash, stored)) => {
+                    if let Some(previous) = self.booked_receipts.get(&hash) {
+                        if previous != &stored {
+                            self.last_write_error =
+                                Some("conflicting durable fill for existing order hash".into());
+                            self.corrupt_lines += 1;
+                        }
+                        return false;
+                    }
+                    Some((hash, stored))
+                }
+                None => {
+                    self.last_write_error =
+                        Some("hashed ledger fill has missing or invalid money evidence".into());
+                    self.corrupt_lines += 1;
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         let mut settlement_keys = Vec::new();
         if matches!(ev, "settle" | "realised_adjust") {
             for field in ["key", "alt_key"] {
@@ -496,10 +526,8 @@ impl Ledger {
             return false;
         }
         self.settlement_keys.extend(settlement_keys);
-        if let Some(h) = row["order_hash"].as_str() {
-            if !h.is_empty() {
-                self.booked_orders.insert(h.to_string());
-            }
+        if let Some((hash, stored)) = receipt {
+            self.booked_receipts.insert(hash, stored);
         }
         let Some(lane) = self.lanes.get_mut(lane_name) else {
             return false;
@@ -699,8 +727,19 @@ of …{} but only {:.4} tracked — excess IGNORED (replay-safe), investigate th
         resting: bool,
         px_provisional: bool,
     ) -> Option<Booked> {
-        if !order_hash.is_empty() && self.booked_orders.contains(order_hash) {
-            return Some(Booked { shares, price });
+        if !StoredBooked::valid_amounts(side, shares, price, fee) {
+            self.last_write_error = Some("refusing invalid fill economics".into());
+            return None;
+        }
+        if let Some(stored) = self.booked_receipts.get(order_hash) {
+            if stored.agrees(lane, token, side, shares, price, fee, resting) {
+                return Some(stored.receipt());
+            }
+            // A digest already booked with different money, market, side or
+            // fee cannot be "re-booked" by trusting a new caller's numbers.
+            self.last_write_error =
+                Some("conflicting evidence for an already booked order".into());
+            return None;
         }
         let mut row = serde_json::json!(
             { "ev" : "fill", "lane" : lane, "token" : token, "side" : side, "shares" :
@@ -715,6 +754,9 @@ of …{} but only {:.4} tracked — excess IGNORED (replay-safe), investigate th
             row["px_provisional"] = serde_json::json!(true);
         }
         if self.apply(&row, true) { Some(Booked { shares, price }) } else { None }
+    }
+    pub fn was_order_booked(&self, order_hash: &str) -> bool {
+        self.booked_receipts.contains_key(order_hash)
     }
     pub fn open_usd(&self, lane: &str) -> f64 {
         self.lanes

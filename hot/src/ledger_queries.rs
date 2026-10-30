@@ -17,7 +17,7 @@ pub fn equity_series_at(path: &str, lane: Option<&str>) -> Vec<(i64, f64)> {
             events: 0,
             write_failures: 0,
             last_write_error: None,
-            booked_orders: std::collections::HashSet::new(),
+            booked_receipts: HashMap::new(),
         };
         let mut out: Vec<(i64, f64)> = Vec::new();
         for line in raw.lines() {
