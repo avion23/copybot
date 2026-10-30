@@ -10,7 +10,7 @@ use runtime::telemetry::{now_ms, Emitter};
 use runtime::execution::submit_tracked;
 use runtime::control::{control_task, latch_buys};
 use runtime::operator::{actor_of, handle_arm_post, handle_flatten_post, handle_wallet_patch, seed_operator_file};
-use runtime::exits::{rescue_exit, rest_verdict, settle_cancelled_rest};
+use runtime::exits::{rescue_exit, rest_verdict};
 use runtime::http::{mutation_refusal, route_refusal};
 #[cfg(test)]
 use runtime::http::{header_of, ROUTES};
@@ -2671,32 +2671,14 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
             }
         }
     }
-    let mut tx_seen = copybot_hot::race::SeenTx::new(8192);
-    let mut behind = copybot_hot::race::BehindTally::default();
-    let mut since_race_report: u64 = 0;
-    const FEED_RACE_EVERY: u64 = 250_000;
+    let mut feed_race = runtime::telemetry::FeedRace::new();
     while let Some(raw) = rx.recv().await {
         let t0 = std::time::Instant::now();
         let queue_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| (d.as_nanos().saturating_sub(raw.seen_ns)) as f64 / 1000.0)
             .unwrap_or(0.0);
-        if let Some(behind_ns) = tx_seen.first_delivery_at(&raw.hash, raw.seen_ns) {
-            behind.record(&raw.source, behind_ns);
-            since_race_report += 1;
-            if since_race_report >= FEED_RACE_EVERY {
-                since_race_report = 0;
-                if !behind.is_empty() {
-                    emitter
-                        .emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "feed_race", "note" :
-                                "ms each feed arrived BEHIND the first feed to deliver the same transaction. If every feed sits inside a few ms, a faster source wins nothing measurable; a wide spread is real headroom.",
-                                "behind" : behind.drain_json(), }
-                            ),
-                        );
-                }
-            }
+        if feed_race.is_duplicate(&raw, &emitter) {
             continue;
         }
         feed_registry.record_win(&raw.source);
@@ -2734,70 +2716,10 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
                         }
                     }
                 }
-                if d.side == 1 && !resting_book.is_empty() {
-                    let his_taker_exit = d.role != "maker";
-                    let live: Vec<_> = resting_book
-                        .by_token(&d.token_id)
-                        .into_iter()
-                        .filter(|o| o.side == 0 || his_taker_exit)
-                        .collect();
-                    if !live.is_empty() {
-                        if let Some(cr) = creds.as_ref().as_ref() {
-                            let ids: Vec<String> = live
-                                .iter()
-                                .map(|o| o.order_id.clone())
-                                .collect();
-                            let (rb2, h2, cl2, ad2, cr2, e3) = (
-                                resting_book.clone(),
-                                http.clone(),
-                                clob.clone(),
-                                auth_addr.clone(),
-                                cr.clone(),
-                                emitter.clone(),
-                            );
-                            let tok2 = d.token_id.clone();
-                            let sg2 = signal_guard.clone();
-                            tokio::spawn(async move {
-                                let res = copybot_hot::resting::cancel_batch(
-                                        &h2,
-                                        &cl2,
-                                        &ad2,
-                                        &cr2,
-                                        &ids,
-                                    )
-                                    .await;
-                                futures_util::future::join_all(
-                                        res
-                                            .iter()
-                                            .filter(|(_, ok)| *ok)
-                                            .map(|(id, _)| {
-                                                settle_cancelled_rest(
-                                                    &h2,
-                                                    &cl2,
-                                                    &ad2,
-                                                    &cr2,
-                                                    &rb2,
-                                                    &sg2,
-                                                    &e3,
-                                                    id,
-                                                    "he_exited",
-                                                )
-                                            }),
-                                    )
-                                    .await;
-                                e3.emit(
-                                    serde_json::json!(
-                                        { "t" : now_ms(), "ev" : "cancel_sweep", "reason" :
-                                        copybot_hot::resting::CancelReason::HeExited.as_str(), "tok"
-                                        : tok2, "attempted" : ids.len(), "cancelled" : res.iter()
-                                        .filter(| (_, ok) | * ok).count(), "still_live" : rb2.len(),
-                                        }
-                                    ),
-                                );
-                            });
-                        }
-                    }
-                }
+                runtime::exits::cancel_rests_on_leader_exit(
+                    &d, &resting_book, &creds, &http, &clob,
+                    &auth_addr, &emitter, &signal_guard,
+                );
                 let key = FillKey {
                     tx: raw.hash.to_ascii_lowercase(),
                     token: d.token_id.clone(),

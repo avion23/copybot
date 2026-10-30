@@ -9,6 +9,83 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cancel_rests_on_leader_exit(
+    d: &copybot_hot::calldata::Decoded,
+    resting_book: &Arc<copybot_hot::resting::RestingBook>,
+    creds: &Arc<Option<copybot_hot::auth::ApiCreds>>,
+    http: &reqwest::Client,
+    clob: &String,
+    auth_addr: &String,
+    emitter: &Arc<Emitter>,
+    signal_guard: &Option<Arc<copybot_hot::signal_guard::SignalGuard>>,
+) {
+                if d.side == 1 && !resting_book.is_empty() {
+                    let his_taker_exit = d.role != "maker";
+                    let live: Vec<_> = resting_book
+                        .by_token(&d.token_id)
+                        .into_iter()
+                        .filter(|o| o.side == 0 || his_taker_exit)
+                        .collect();
+                    if !live.is_empty() {
+                        if let Some(cr) = creds.as_ref().as_ref() {
+                            let ids: Vec<String> = live
+                                .iter()
+                                .map(|o| o.order_id.clone())
+                                .collect();
+                            let (rb2, h2, cl2, ad2, cr2, e3) = (
+                                resting_book.clone(),
+                                http.clone(),
+                                clob.clone(),
+                                auth_addr.clone(),
+                                cr.clone(),
+                                emitter.clone(),
+                            );
+                            let tok2 = d.token_id.clone();
+                            let sg2 = signal_guard.clone();
+                            tokio::spawn(async move {
+                                let res = copybot_hot::resting::cancel_batch(
+                                        &h2,
+                                        &cl2,
+                                        &ad2,
+                                        &cr2,
+                                        &ids,
+                                    )
+                                    .await;
+                                futures_util::future::join_all(
+                                        res
+                                            .iter()
+                                            .filter(|(_, ok)| *ok)
+                                            .map(|(id, _)| {
+                                                settle_cancelled_rest(
+                                                    &h2,
+                                                    &cl2,
+                                                    &ad2,
+                                                    &cr2,
+                                                    &rb2,
+                                                    &sg2,
+                                                    &e3,
+                                                    id,
+                                                    "he_exited",
+                                                )
+                                            }),
+                                    )
+                                    .await;
+                                e3.emit(
+                                    serde_json::json!(
+                                        { "t" : now_ms(), "ev" : "cancel_sweep", "reason" :
+                                        copybot_hot::resting::CancelReason::HeExited.as_str(), "tok"
+                                        : tok2, "attempted" : ids.len(), "cancelled" : res.iter()
+                                        .filter(| (_, ok) | * ok).count(), "still_live" : rb2.len(),
+                                        }
+                                    ),
+                                );
+                            });
+                        }
+                    }
+                }
+}
+
 pub(crate) fn release_cancelled(
     guard: &Option<Arc<copybot_hot::signal_guard::SignalGuard>>,
     emitter: &Arc<Emitter>,

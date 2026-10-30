@@ -70,6 +70,48 @@ pub(crate) fn spawn_route_warm_probe(
         });
 }
 
+/// Owns feed-first-delivery classification, lag aggregation and event cadence.
+pub(crate) struct FeedRace {
+    seen: copybot_hot::race::SeenTx,
+    behind: copybot_hot::race::BehindTally,
+    since_report: u64,
+}
+
+impl FeedRace {
+    pub(crate) fn new() -> Self {
+        Self {
+            seen: copybot_hot::race::SeenTx::new(8192),
+            behind: copybot_hot::race::BehindTally::default(),
+            since_report: 0,
+        }
+    }
+
+    /// Returns true for a later delivery of a transaction already processed.
+    pub(crate) fn is_duplicate(
+        &mut self,
+        raw: &copybot_hot::feeds::RawTx,
+        emitter: &std::sync::Arc<Emitter>,
+    ) -> bool {
+        const FEED_RACE_EVERY: u64 = 250_000;
+        if let Some(behind_ns) = self.seen.first_delivery_at(&raw.hash, raw.seen_ns) {
+            self.behind.record(&raw.source, behind_ns);
+            self.since_report += 1;
+            if self.since_report >= FEED_RACE_EVERY {
+                self.since_report = 0;
+                if !self.behind.is_empty() {
+                    emitter.emit(serde_json::json!({
+                        "t": now_ms(), "ev": "feed_race",
+                        "note": "ms each feed arrived BEHIND the first feed to deliver the same transaction. If every feed sits inside a few ms, a faster source wins nothing measurable; a wide spread is real headroom.",
+                        "behind": self.behind.drain_json(),
+                    }));
+                }
+            }
+            return true;
+        }
+        false
+    }
+}
+
 pub(crate) fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
 }
