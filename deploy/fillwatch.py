@@ -422,4 +422,5 @@ def main():
         log('FILLWATCH ITSELF FAILED: %r — nothing halted' % e)
         return 2
 if __name__ == '__main__':
-    sys.exit(main())
+    from observer.lease import legacy_entrypoint
+    sys.exit(legacy_entrypoint(main, 'fillwatch', BOT_DIR, 2))

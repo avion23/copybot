@@ -6,11 +6,9 @@ unless that cutover has been explicitly carried out.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import fcntl
 import json
 import os
 from pathlib import Path
-import stat
 import sys
 import time
 
@@ -20,6 +18,7 @@ if _DEPLOY not in sys.path:
     sys.path.insert(0, _DEPLOY)
 
 from observer.adapters import AUDITS, AuditResult
+from observer.lease import ObserverLease
 
 
 # Start delays match the legacy timer inventory; intervals are minimum elapsed
@@ -30,43 +29,6 @@ CADENCES = {
     "buywatch": (420.0, 900.0),
 }
 WATCH_INTERVAL_SECS = 15.0
-
-
-class ObserverLease:
-    """Exclusive owner lease; a second Observer process cannot start."""
-
-    def __init__(self, path):
-        self.path = Path(path)
-        self._fd = None
-
-    def acquire(self):
-        if self._fd is not None:
-            raise RuntimeError("Observer owner lease already acquired")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
-        fd = os.open(self.path, flags, 0o600)
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
-                raise RuntimeError("Observer owner lease must be a regular owned file")
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except Exception:
-            os.close(fd)
-            raise
-        self._fd = fd
-        return self
-
-    def close(self):
-        if self._fd is not None:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-            os.close(self._fd)
-            self._fd = None
-
-    def __enter__(self):
-        return self.acquire()
-
-    def __exit__(self, _exc_type, _exc, _trace):
-        self.close()
 
 
 def report_event(event):

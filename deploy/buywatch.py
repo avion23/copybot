@@ -151,4 +151,5 @@ def main():
         log('BUYWATCH ITSELF FAILED: %r — nothing halted' % (e,))
         return 3
 if __name__ == '__main__':
-    sys.exit(main())
+    from observer.lease import legacy_entrypoint
+    sys.exit(legacy_entrypoint(main, 'buywatch', BOT_DIR, 3))

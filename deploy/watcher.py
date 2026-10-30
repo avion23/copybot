@@ -754,4 +754,5 @@ def main():
         time.sleep(15)
         session.poll()
 if __name__ == '__main__':
-    sys.exit(main() or 0)
+    from observer.lease import legacy_entrypoint
+    sys.exit(legacy_entrypoint(main, 'watcher', BOT_DIR, 2))

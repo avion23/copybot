@@ -20,9 +20,13 @@ one serialized background audit worker. No trading key is used.
 - The scheduler emits Observer **health** records. They do not assert an
   independently confirmed market event or imply that a halt was applied
 - The observer-owner exclusive file lock refuses a second Observer process.
-  The systemd unit declares Conflicts + After for all seven legacy sensor
-  services/timers; this is not a mechanism to detect manually launched
-  legacy Python processes
+  The legacy Guardian, watcher, fillwatch and buywatch CLI entrypoints now
+  take **shared** locks on the same file, allowing legacy sensors to run
+  together but excluding the Observer; likewise an active legacy sensor
+  blocks an Observer startup. This also protects manual legacy launches.
+- The systemd unit additionally declares Conflicts + After for all seven
+  legacy sensor services/timers; explicit stop/disable is still required
+  for a reliable boot-time cutover.
 
 ## Explicit operator cutover, on a deployment host only
 

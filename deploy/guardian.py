@@ -965,4 +965,5 @@ def main():
             disarm_all('guardian crashed: %s' % e, dry_run=False)
         return 3
 if __name__ == '__main__':
-    sys.exit(main())
+    from observer.lease import legacy_entrypoint
+    sys.exit(legacy_entrypoint(main, 'guardian', BOT_DIR, 3))
