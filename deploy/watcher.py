@@ -674,57 +674,84 @@ def sweep(grace, alert):
                 print('%s [WARN] MISS halting without corroboration: %s' % (time.strftime('%H:%M:%S'), _why), flush=True)
         alert('CRITICAL', 'MISS', f"his {f['side']} {f['size']:,.0f} in {f['title']} — {who} did NOT fire within {grace}s", lanes=[f.get('leader_lane')] if f.get('leader_lane') else None)
 
+class WatchSession:
+    """A single fill listener with a pollable, side-effect-preserving sweep.
+
+    The standalone watcher and future observer scheduler share this exact
+    adapter; neither may create an additional listener inside the session.
+    """
+
+    def __init__(self, grace=45):
+        self.grace = grace
+        self.worst = 0
+        self.started = False
+
+    def alert(self, level, kind, msg, lanes=None):
+        line = f"{time.strftime('%H:%M:%S')} [{level}] {kind}: {msg}"
+        print(line, flush=True)
+        if level == 'CRITICAL':
+            self.worst = 2
+            append_alert(level, kind, msg, lanes)
+        elif self.worst < 1:
+            self.worst = 1
+
+    def guarded_sweep(self):
+        try:
+            sweep(self.grace, self.alert)
+        except Exception as e:
+            self.alert('CRITICAL', 'SWEEP', f'watcher sweep failed: {e!r}')
+        try:
+            check_guardian(self.alert)
+        except Exception as e:
+            self.alert('WARN', 'GUARDIAN-CHECK', f'could not check the guardian: {e!r}')
+        try:
+            save_fills()
+        except OSError as e:
+            self.alert('CRITICAL', 'FILLS', f'cannot persist the fill buffer: {e}')
+        global _dropped_alerted
+        if fills_dropped > _dropped_alerted:
+            self.alert('CRITICAL', 'FILLS', f'{fills_dropped} unjudged leader fill(s) evicted by the {his_fills.maxlen}-row cap — MISS detection is INCOMPLETE; raise WATCHER_FILLS_MAX')
+            _dropped_alerted = fills_dropped
+
+    def start(self):
+        if self.started:
+            raise RuntimeError('watcher already started; refusing duplicate WebSocket listener')
+        restored = load_fills()
+        threading.Thread(target=ws_listen, daemon=True).start()
+        self.started = True
+        who, problem = armed_state()
+        lanes, _ = watched_leaders()
+        print(f"watcher up — armed: {who or problem or 'neither'}  grace={self.grace}s  restored {restored} unjudged fill(s)  watching {len(lanes)} leader(s): {', '.join((f'{n}=…{w[-6:]}' for w, n in sorted(lanes.items(), key=lambda kv: kv[1]))) or 'NONE'}", flush=True)
+
+    def poll(self, *, propagate_heartbeat_errors=False):
+        if not self.started:
+            raise RuntimeError('watcher has not started; refusing unobserved sweep')
+        self.guarded_sweep()
+        if propagate_heartbeat_errors:
+            # Preserve the old --once failure behavior.
+            who, problem = armed_state()
+            write_heartbeat(who, problem)
+        else:
+            try:
+                who, problem = armed_state()
+                write_heartbeat(who, problem)
+            except OSError as e:
+                self.alert('CRITICAL', 'HEARTBEAT', f'cannot persist watcher heartbeat: {e}')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--grace', type=int, default=45, help='seconds to allow between his fill and our fire')
     ap.add_argument('--once', action='store_true')
     a = ap.parse_args()
-    worst = [0]
-
-    def alert(level, kind, msg, lanes=None):
-        line = f"{time.strftime('%H:%M:%S')} [{level}] {kind}: {msg}"
-        print(line, flush=True)
-        if level == 'CRITICAL':
-            worst[0] = 2
-            append_alert(level, kind, msg, lanes)
-        elif worst[0] < 1:
-            worst[0] = 1
-
-    def guarded_sweep():
-        try:
-            sweep(a.grace, alert)
-        except Exception as e:
-            alert('CRITICAL', 'SWEEP', f'watcher sweep failed: {e!r}')
-        try:
-            check_guardian(alert)
-        except Exception as e:
-            alert('WARN', 'GUARDIAN-CHECK', f'could not check the guardian: {e!r}')
-        try:
-            save_fills()
-        except OSError as e:
-            alert('CRITICAL', 'FILLS', f'cannot persist the fill buffer: {e}')
-        global _dropped_alerted
-        if fills_dropped > _dropped_alerted:
-            alert('CRITICAL', 'FILLS', f'{fills_dropped} unjudged leader fill(s) evicted by the {his_fills.maxlen}-row cap — MISS detection is INCOMPLETE; raise WATCHER_FILLS_MAX')
-            _dropped_alerted = fills_dropped
-    restored = load_fills()
-    threading.Thread(target=ws_listen, daemon=True).start()
-    who, problem = armed_state()
-    lanes, _ = watched_leaders()
-    print(f"watcher up — armed: {who or problem or 'neither'}  grace={a.grace}s  restored {restored} unjudged fill(s)  watching {len(lanes)} leader(s): {', '.join((f'{n}=…{w[-6:]}' for w, n in sorted(lanes.items(), key=lambda kv: kv[1]))) or 'NONE'}", flush=True)
+    session = WatchSession(a.grace)
+    session.start()
     if a.once:
         time.sleep(a.grace + 15)
-        guarded_sweep()
-        who, problem = armed_state()
-        write_heartbeat(who, problem)
-        return worst[0]
+        session.poll(propagate_heartbeat_errors=True)
+        return session.worst
     while True:
         time.sleep(15)
-        guarded_sweep()
-        try:
-            who, problem = armed_state()
-            write_heartbeat(who, problem)
-        except OSError as e:
-            alert('CRITICAL', 'HEARTBEAT', f'cannot persist watcher heartbeat: {e}')
+        session.poll()
 if __name__ == '__main__':
     sys.exit(main() or 0)
