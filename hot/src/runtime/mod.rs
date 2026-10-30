@@ -10,6 +10,7 @@ pub(crate) mod dashboard_pool;
 pub(crate) mod dashboard_trades;
 pub(crate) mod equity_monitor;
 pub(crate) mod execution;
+pub(crate) mod feed_inputs;
 pub(crate) mod exits;
 pub(crate) mod exit_sweep;
 pub(crate) mod flatten_task;

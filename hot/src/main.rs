@@ -4,6 +4,8 @@ mod runtime;
 mod feed_loop;
 #[path = "dashboard.rs"]
 mod dashboard;
+#[path = "startup.rs"]
+mod startup;
 use runtime::dashboard_model::{DashboardLane, PhysicalWallet, wallet_equity_pnl};
 #[cfg(test)]
 use runtime::dashboard_model::marked_position_value;
@@ -25,7 +27,7 @@ use copybot_hot::control::Control;
 use copybot_hot::ledger::Ledger;
 use copybot_hot::calldata::{decode_all, participants};
 use copybot_hot::config::{addr20, Root};
-use copybot_hot::feeds::{FeedConfig, FeedStats, RawTx};
+use copybot_hot::feeds::{FeedStats, RawTx};
 use copybot_hot::lanes::{resolve_route, Route, Router, MICRO};
 use copybot_hot::order::{amounts, json_body, order_signer, safe_salt, Order};
 use copybot_hot::operator_access::{OperatorAccess, OperatorAction};
@@ -36,98 +38,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
-    eprintln!("Abomination81 Copybot — execution engine");
-    let operator_access = match OperatorAccess::from_environment() {
-        Ok(access) => Arc::new(access),
-        Err(error) => {
-            eprintln!("OPERATOR CONFIG ERROR: {error}");
-            std::process::exit(2);
-        }
-    };
-    let cfg_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "deploy/copybot2.toml".into());
-    let root = match Root::load(&cfg_path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("CONFIG ERROR: {e}");
-            std::process::exit(2);
-        }
-    };
-    let lanes = match root.build_lanes() {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("CONFIG ERROR: {e}");
-            std::process::exit(2);
-        }
-    };
-    let shadow = root.bot.mode == "shadow";
-    let live = root.bot.mode == "live" || shadow;
-    let funder = root.bot.funder.clone();
-    let signer = root.bot.signer.clone();
-    let sig_type = root.bot.signature_type;
-    if addr20(&funder).is_err() || addr20(&signer).is_err() {
-        eprintln!("CONFIG ERROR: funder/signer must be 20-byte hex addresses");
-        std::process::exit(2);
-    }
-    let _execution_lease = if live && !shadow {
-        match copybot_hot::lease::ExecutionLease::acquire_for_funder(&funder) {
-            Ok(lease) => {
-                eprintln!("[lease] acquired {}", lease.path.display());
-                Some(lease)
-            }
-            Err(e) => {
-                eprintln!("REFUSING TO START: {e}");
-                std::process::exit(2);
-            }
-        }
-    } else {
-        None
-    };
-    let pk_hex = std::env::var("PRIVATE_KEY").unwrap_or_default();
-    let pk = match hex::decode(pk_hex.trim_start_matches("0x")) {
-        Ok(b) if b.len() == 32 => {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&b);
-            Some(k)
-        }
-        _ => None,
-    };
-    let pk = match (shadow, pk) {
-        (true, None) => {
-            eprintln!(
-                "[shadow] no PRIVATE_KEY — signing with a THROWAWAY key so orders \
-actually reach the venue and are refused. This key controls no funds."
-            );
-            let mut k = [0u8; 32];
-            for (i, b) in k.iter_mut().enumerate() {
-                *b = (i as u8).wrapping_add(1);
-            }
-            Some(k)
-        }
-        (_, other) => other,
-    };
-    let signer_addr: String = match pk.as_ref().map(copybot_hot::auth::address_from_key)
-    {
-        Some(Ok(a)) => {
-            if !a.eq_ignore_ascii_case(&signer) {
-                eprintln!(
-                    "[auth] ⚠️  config signer {signer} does NOT own PRIVATE_KEY \
-({a}) — using the DERIVED owner address for authentication and signing. Fix the config."
-                );
-            }
-            a
-        }
-        Some(Err(e)) => {
-            eprintln!("[auth] cannot derive signer address: {e}");
-            signer.clone()
-        }
-        None => signer.clone(),
-    };
-    if live && !shadow && pk.is_none() {
-        eprintln!("REFUSING TO START: mode=live but PRIVATE_KEY is unset or malformed");
-        std::process::exit(2);
-    }
+    let startup::Identity {
+        operator_access, root, lanes, shadow, live,
+        funder, sig_type, pk, signer_addr, _execution_lease,
+    } = startup::load();
     let emitter = Arc::new(Emitter::new(root.bot.events_path.clone(), !live || shadow));
     let prints = Arc::new(copybot_hot::book::TradePrints::new());
     let levels = Arc::new(copybot_hot::book::Levels::new());
@@ -151,33 +65,7 @@ actually reach the venue and are refused. This key controls no funds."
     let router = Arc::new(Router::new(lanes));
     let book = Arc::new(RaceBook::new());
     let stats = Arc::new(FeedStats::default());
-    let feeds: Vec<FeedConfig> = root
-        .feed
-        .iter()
-        .map(|f| FeedConfig {
-            name: f.name.clone(),
-            url: f.url.clone(),
-            sockets: f.sockets,
-        })
-        .collect();
-    let total_sockets: usize = feeds.iter().map(|f| f.sockets).sum();
-    emitter
-        .emit(
-            serde_json::json!(
-                { "t" : now_ms(), "ev" : "boot", "mode" : root.bot.mode, "lanes" : router
-                .snapshot().iter().map(| l | serde_json::json!({ "name" : l.cfg.name,
-                "wallet" : format!("0x{}", hex::encode(l.cfg.wallet20)), "sizing" :
-                format!("{:?}", l.policy().sizing), "execution" : format!("{:?}", l.cfg
-                .execution), "daily_usd" : l.policy().caps.daily_usd, })).collect::< Vec
-                < _ >> (), "feeds" : feeds.iter().map(| f | format!("{}x{}", f.name, f
-                .sockets)).collect::< Vec < _ >> (), "sockets" : total_sockets, "note" :
-                if shadow {
-                "SHADOW — full live path, credentials forced OFF, every \
-                             order will be rejected 401"
-                } else if live { "LIVE — lanes still need arming in the control file" }
-                else { "DRY — nothing will be submitted" }, }
-            ),
-        );
+    let feeds = runtime::feed_inputs::configure(&root, &router, &emitter, shadow, live);
     let resting_book = Arc::new(copybot_hot::resting::RestingBook::new());
     let sell_tranches = Arc::new(copybot_hot::lanes::TrancheLedger::new(4096));
     let fire_rate = Arc::new(
@@ -190,36 +78,12 @@ actually reach the venue and are refused. This key controls no funds."
     let incidents = Arc::new(
         std::sync::Mutex::new(copybot_hot::incidents::Incidents::open(&incidents_path)),
     );
-    {
-        let g = incidents.lock().unwrap();
-        if let Some(e) = g.unreadable() {
-            eprintln!(
-                "[incidents] CANNOT READ {incidents_path}: {e} — EVERY lane is \
-                       latched for buys until this is fixed (exits still mirror)"
-            );
-        } else if !g.is_empty() {
-            for i in g.open_incidents() {
-                eprintln!(
-                    "[incidents] OPEN: {} — {} ({}) raised at {}; buys stay halted \
-                           until cleared",
-                    i.lane, i.why, i.kind, i.t
-                );
-            }
-        }
-    }
+    startup::report_incidents(&incidents, &incidents_path);
     let funding_path = format!("{}.funding", root.bot.control_path);
     let funding = Arc::new(
         std::sync::Mutex::new(copybot_hot::funding::Funding::open(&funding_path)),
     );
-    match funding.lock().unwrap().basis() {
-        Some(b) => eprintln!("[funding] declared external funding: ${b:.2}"),
-        None => {
-            eprintln!(
-                "[funding] NO external funding declared — physical P&L will \
-                           read UNKNOWN until you record a deposit (see run/*.funding)"
-            )
-        }
-    }
+    startup::report_funding(&funding);
     let wal_path = format!("{}.wal", root.bot.control_path);
     let wal = match copybot_hot::wal::Wal::open(&wal_path) {
         Ok(w) => Arc::new(w),
@@ -255,54 +119,11 @@ actually reach the venue and are refused. This key controls no funds."
         wal_recovery.absorbed("signal_guard", 0);
         None
     };
-    let books = Arc::new(BookCache::new());
-    let watch_tokens: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(
-        std::sync::Mutex::new(Vec::new()),
+    let runtime::feed_inputs::Feeds {
+        books, watch_tokens, rx, watched_addrs, feed_registry, _handles,
+    } = runtime::feed_inputs::spawn(
+        &feeds, &stats, &prints, &levels, &emitter, root.bot.recycle_secs,
     );
-    {
-        tokio::spawn(
-            copybot_hot::book::run_book_feed_multi(
-                books.clone(),
-                watch_tokens.clone(),
-                Some(prints.clone()),
-                Some(levels.clone()),
-                3,
-            ),
-        );
-    }
-    let (tx, rx) = mpsc::unbounded_channel::<RawTx>();
-    let watched_addrs = Arc::new(copybot_hot::feeds::WatchedAddresses::new());
-    let (_handles, feed_registry) = copybot_hot::feeds::spawn_all(
-        &feeds,
-        tx.clone(),
-        stats.clone(),
-        watched_addrs.clone(),
-    );
-    let feed_registry = Arc::new(feed_registry);
-    if root.bot.recycle_secs > 0 {
-        let (reg, ev) = (feed_registry.clone(), emitter.clone());
-        let every = root.bot.recycle_secs;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(every)).await;
-                let ranked = reg.wins_snapshot();
-                let losers = reg.score_and_recycle(2, 20);
-                if !losers.is_empty() {
-                    ev.emit(
-                        serde_json::json!(
-                            { "t" : now_ms(), "ev" : "socket_recycle", "recycled" :
-                            losers, "ranking" : ranked.iter().take(6).map(| (n, w) |
-                            serde_json::json!({ "s" : n, "wins" : w })).collect::< Vec <
-                            _ >> (), }
-                        ),
-                    );
-                }
-            }
-        });
-        eprintln!(
-            "[feeds] socket scoring on: ranking every {every}s, protecting the top 2"
-        );
-    }
     let risk_cfgs: Vec<(String, copybot_hot::risk::RiskConfig)> = root
         .lane
         .iter()
