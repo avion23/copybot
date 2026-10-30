@@ -1,6 +1,7 @@
 //! Effectful runtime adapters composed by the binary entrypoint.
 
 pub(crate) mod accounting;
+pub(crate) mod bankroll_monitor;
 pub(crate) mod control;
 pub(crate) mod custody_monitor;
 pub(crate) mod dashboard_model;

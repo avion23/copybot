@@ -2595,32 +2595,7 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
         );
     }
     let latency = Arc::new(copybot_hot::latency::Latency::new());
-    tokio::spawn(
-        copybot_hot::latency::spawn_baseline_probe(
-            latency.clone(),
-            http.clone(),
-            clob.clone(),
-            Duration::from_secs(30),
-        ),
-    );
-    {
-        let (l2, e3) = (latency.clone(), emitter.clone());
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let snap = l2.snapshot();
-                if snap["series"].as_object().map(|m| m.is_empty()).unwrap_or(true) {
-                    continue;
-                }
-                e3.emit(
-                    serde_json::json!(
-                        { "t" : now_ms(), "ev" : "latency", "lat" : snap, "ledger" : e3
-                        .ledger_status() }
-                    ),
-                );
-            }
-        });
-    }
+    runtime::telemetry::spawn_latency_probes(&latency, &http, &clob, &emitter);
     if live {
         runtime::orphan_sweep::spawn(
             &control, &router, &emitter, &funder, pk, &signer_addr,
@@ -2672,7 +2647,6 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
             &control, &router, &emitter, &funder, &pending_log, &errors_path, &drift_by_lane,
         );
     }
-    let seed_bankrolls = registry.clone();
     let seed_registry = registry.clone();
     if live && !shadow {
         let (cs, cl, ad, wallet, cell) = (
@@ -2767,84 +2741,8 @@ and its age is real"
             }
         });
     }
-    {
-        let (rt, em, reg) = (router.clone(), emitter.clone(), seed_bankrolls.clone());
-        let ctl_b = control.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(120));
-            loop {
-                tick.tick().await;
-                for lane in rt.snapshot().iter() {
-                    let Some(seed) = reg.seed_of(&lane.cfg.name) else { continue };
-                    let realised = match ctl_b.lock() {
-                        Ok(g) => {
-                            g.ledger
-                                .lanes
-                                .get(&lane.cfg.name)
-                                .map(|b| b.risk.realised_pnl)
-                        }
-                        Err(_) => None,
-                    };
-                    let Some(realised) = realised else {
-                        eprintln!(
-                            "[bankroll] missing lane ledger for {} — scale unchanged",
-                            lane.cfg.name
-                        );
-                        continue;
-                    };
-                    let live = copybot_hot::budget::virtual_bankroll(seed, realised);
-                    let want = copybot_hot::budget::bankroll_scale(live, seed);
-                    let old = lane.state.cap_scale.load(Ordering::Relaxed) as f64
-                        / copybot_hot::lanes::MICRO;
-                    let next = copybot_hot::budget::slew(old, want);
-                    if (next - old).abs() > 1e-4 {
-                        lane.state
-                            .cap_scale
-                            .store(
-                                (next * copybot_hot::lanes::MICRO) as i64,
-                                Ordering::Relaxed,
-                            );
-                        em.emit(
-                            serde_json::json!(
-                                { "ev" : "bankroll", "lane" : & lane.cfg.name,
-                                "realised_pnl" : (realised * 100.0).round() / 100.0,
-                                "virtual_bankroll" : (live * 100.0).round() / 100.0, "seed"
-                                : seed, "scale_from" : (old * 1000.0).round() / 1000.0,
-                                "scale_to" : (next * 1000.0).round() / 1000.0, "slewed" :
-                                (next - want).abs() > 1e-6, "t" : now_ms() }
-                            ),
-                        );
-                    }
-                }
-            }
-        });
-    }
-    {
-        let (h, c, e) = (order_paths.clone(), clob.clone(), emitter.clone());
-        tokio::spawn(async move {
-            loop {
-                let t = std::time::Instant::now();
-                let mut ok = true;
-                let mut rtts: Vec<f64> = Vec::new();
-                for (_name, cl) in h.iter() {
-                    for _ in 0..2 {
-                        let t1 = std::time::Instant::now();
-                        ok &= cl.get(format!("{c}/time")).send().await.is_ok();
-                        rtts.push(t1.elapsed().as_micros() as f64 / 1000.0);
-                    }
-                }
-                rtts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                e.emit(
-                    serde_json::json!(
-                        { "t" : now_ms(), "ev" : "warm", "ok" : ok, "rtt_ms" : t
-                        .elapsed().as_micros() as f64 / 1000.0, "best_ms" : rtts.first(),
-                        "worst_ms" : rtts.last(), }
-                    ),
-                );
-                tokio::time::sleep(Duration::from_secs(25)).await;
-            }
-        });
-    }
+    runtime::bankroll_monitor::spawn(&control, &router, &emitter, &registry);
+    runtime::telemetry::spawn_route_warm_probe(&order_paths, &clob, &emitter);
     let politics: Arc<std::sync::RwLock<std::collections::HashSet<[u8; 32]>>> = Arc::new(
         std::sync::RwLock::new(std::collections::HashSet::new()),
     );

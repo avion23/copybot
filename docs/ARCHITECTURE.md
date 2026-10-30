@@ -346,6 +346,10 @@ The existing 60-second custody comparison task now lives in `runtime/custody_mon
 
 `runtime/position_reconciliation.rs` now requires `position_evidence::complete_balances` before performing any custody gap comparison or durable ledger recon-fill. This rejects pagination failures, missing/duplicate token identities and malformed, negative or non-finite sizes; a malformed row can no longer vanish from `positions::by_asset` and falsely authorize releasing a held position as a phantom. The existing `recon_skipped_incomplete` event carries a typed reason, and the timed HTTP client must construct successfully rather than silently switching to a default. The existing 5-second cadence, complete-empty skip, 120/1,800-second quiet gates, pending-order exclusions and ledger writer are unchanged. The offline all-row balance probe runs alongside nine locked gates; this is **not** a live custody measurement or a completed A5 Observer redesign.
 
+### A3: bankroll policy pulse and telemetry probes (COPYBOT-3)
+
+The existing 120-second realised-P&L virtual-bankroll scaling worker now lives in `runtime/bankroll_monitor.rs` (67 lines) with explicit registry, `Control`, `Router` and `Emitter` dependencies. The 30-second baseline network probe, 60-second latency-series emitter and 25-second order-route warm measurement now launch through `runtime::telemetry`, sharing the original `Latency`, HTTP client, order paths, clob URL and event ledger. All tasks retain their original startup order, cadence, locks, feed targets and event formats; the binary retains a single `Latency` instance consumed by its dashboard. This A3 separation decreases `main.rs` from 3,957 to 3,855 lines. It does not modify allocation caps, order paths, monitoring authority or live performance characteristics, and adds no tests.
+
 ## COPYBOT-2 execution status
 
 The continuation brief labels its phases **A3 module extraction, A4 typed money-path errors, A5 one Observer contract, A6 read-only/authenticated operator surface, A7 leader lead-time evidence**. These labels supersede the older roadmap numbering below; its unfinished invariants still apply.

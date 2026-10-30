@@ -1,7 +1,74 @@
 //! Event persistence and bounded stdout mirroring at the runtime edge.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+
+// Probes reuse the event-ledger emitter; they never alter trading state.
+
+pub(crate) fn spawn_latency_probes(
+    latency: &std::sync::Arc<copybot_hot::latency::Latency>,
+    http: &reqwest::Client,
+    clob: &String,
+    emitter: &std::sync::Arc<Emitter>,
+) {
+    tokio::spawn(
+        copybot_hot::latency::spawn_baseline_probe(
+            latency.clone(),
+            http.clone(),
+            clob.clone(),
+            Duration::from_secs(30),
+        ),
+    );
+    {
+        let (l2, e3) = (latency.clone(), emitter.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let snap = l2.snapshot();
+                if snap["series"].as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                    continue;
+                }
+                e3.emit(
+                    serde_json::json!(
+                        { "t" : now_ms(), "ev" : "latency", "lat" : snap, "ledger" : e3
+                        .ledger_status() }
+                    ),
+                );
+            }
+        });
+    }
+}
+
+pub(crate) fn spawn_route_warm_probe(
+    order_paths: &std::sync::Arc<Vec<(String, reqwest::Client)>>,
+    clob: &String,
+    emitter: &std::sync::Arc<Emitter>,
+) {
+        let (h, c, e) = (order_paths.clone(), clob.clone(), emitter.clone());
+        tokio::spawn(async move {
+            loop {
+                let t = std::time::Instant::now();
+                let mut ok = true;
+                let mut rtts: Vec<f64> = Vec::new();
+                for (_name, cl) in h.iter() {
+                    for _ in 0..2 {
+                        let t1 = std::time::Instant::now();
+                        ok &= cl.get(format!("{c}/time")).send().await.is_ok();
+                        rtts.push(t1.elapsed().as_micros() as f64 / 1000.0);
+                    }
+                }
+                rtts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                e.emit(
+                    serde_json::json!(
+                        { "t" : now_ms(), "ev" : "warm", "ok" : ok, "rtt_ms" : t
+                        .elapsed().as_micros() as f64 / 1000.0, "best_ms" : rtts.first(),
+                        "worst_ms" : rtts.last(), }
+                    ),
+                );
+                tokio::time::sleep(Duration::from_secs(25)).await;
+            }
+        });
+}
 
 pub(crate) fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
