@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import stat
 import threading
+import time
 
 from observer.contract import Observation
 from observer.policy import OccurrenceDeduper, alert_level
@@ -105,7 +106,8 @@ class AlertRouter:
     This is not an email notifier or an order/halt authority.
     """
 
-    def __init__(self, run_dir, *, watcher_path=None, buywatch_path=None):
+    def __init__(self, run_dir, *, watcher_path=None, buywatch_path=None,
+                 watcher_log_path=None):
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.canonical_path = self.run_dir / "observer_alerts.jsonl"
@@ -113,10 +115,18 @@ class AlertRouter:
                              else self.run_dir / "watcher_alerts.jsonl")
         self.buywatch_path = (Path(buywatch_path) if buywatch_path is not None
                               else self.run_dir / "buywatch_alerts.jsonl")
+        self.watcher_log_path = (
+            Path(watcher_log_path) if watcher_log_path is not None
+            else self.run_dir / "watcher.log"
+        )
         self._lock = threading.Lock()
         self._seq = self._read_watcher_seq()
         # Validate the destination before installing a sensor sink.
         fd = self._open(self.canonical_path, create=True, strict=True)
+        os.close(fd)
+        # Guardian still reads the legacy watcher log after the old watcher
+        # service is stopped. This compatibility file must exist at cutover.
+        fd = self._open(self.watcher_log_path, create=True)
         os.close(fd)
 
     @staticmethod
@@ -168,6 +178,28 @@ class AlertRouter:
         finally:
             os.close(fd)
 
+    def _write_watcher_log(self, stamp, level, kind, message, lanes):
+        """Only alert lines, in the exact Guardian-readable legacy format."""
+        marker = "[lanes=%s] " % ",".join(sorted(set(lanes))) if lanes else ""
+        clean_kind = kind.replace("\n", " ").replace("\r", " ")
+        clean_message = message.replace("\n", " ").replace("\r", " ")
+        line = "%s %s[%s] %s: %s\n" % (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp)),
+            marker, level, clean_kind, clean_message,
+        )
+        data = line.encode("utf-8")
+        fd = self._open(self.watcher_log_path, create=True)
+        try:
+            cursor = 0
+            while cursor < len(data):
+                count = os.write(fd, data[cursor:])
+                if count <= 0:
+                    raise OSError("Observer watcher-log projection made no progress")
+                cursor += count
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     def record(self, source, record):
         """Commit one legacy projection and one canonical alert, serially."""
         if source not in ("watcher", "fillwatch", "buywatch"):
@@ -205,6 +237,10 @@ class AlertRouter:
                 sidecar["src"] = source
                 self._write(self.watcher_path, sidecar)
                 self._seq = next_seq
+                if source == "watcher":
+                    self._write_watcher_log(
+                        stamp, level, kind, message, lanes,
+                    )
             else:
                 # This format is read using the original timestamp cursor.
                 self._write(self.buywatch_path, sidecar)

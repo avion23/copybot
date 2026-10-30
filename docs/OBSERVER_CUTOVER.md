@@ -22,7 +22,10 @@ one serialized background audit worker. No trading key is used.
 - When explicitly enabled, watcher/fillwatch/buywatch critical alerts
   flow through one `AlertRouter` to protected `run/observer_alerts.jsonl`;
   the same writer maintains `watcher_alerts.jsonl` and
-  `buywatch_alerts.jsonl` for Guardian's existing alert cursors. Legacy
+  `buywatch_alerts.jsonl` for Guardian's existing alert cursors. It also
+  projects watcher critical-alert lines to `run/watcher.log` for the
+  existing Guardian log-reader after the legacy watcher's stdout is stopped.
+  This projection does not reproduce every informational watcher print. Legacy
   standalone services retain their original independent writers.
 - When explicitly enabled, checked corroborations from the four sensors
   use one `run/observer_observations.jsonl` journal (owner-only 0600, fsynced)
