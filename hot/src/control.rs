@@ -287,6 +287,20 @@ this fill is booked at our LIMIT — dearer than truth on a buy, cheaper on a se
         router: &Arc<Router>,
         in_flight: &crate::pending::InFlight,
     ) {
+        // This cache refresh must not replace reservations between admission
+        // checks and their accounting mutations. A poisoned owner refuses
+        // new admission and visibly disarms every lane instead of guessing.
+        let _admission = match router.admission_owner().enter() {
+            Ok(guard) => guard,
+            Err(error) => {
+                eprintln!("order admission owner unavailable: {error:?}");
+                for lane in router.snapshot() {
+                    lane.state.armed.store(false, Ordering::Relaxed);
+                    lane.state.halted.store(true, Ordering::Relaxed);
+                }
+                return;
+            }
+        };
         let intent = self.operator_intent();
         let halts = self.operator_halts();
         let persistence_fault = !self.ledger.persistence_ok();

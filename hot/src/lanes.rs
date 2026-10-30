@@ -7,6 +7,12 @@ use crate::calldata::Decoded;
 use crate::venue::{ceil_shares, sell_terms, whole};
 pub type Micro = i64;
 pub const MICRO: f64 = 1e6;
+fn checked_micro(value: f64) -> Result<Micro, Skip> {
+    if !value.is_finite() || value < 0.0 || value >= Micro::MAX as f64 {
+        return Err(Skip::InvalidMoneyAmount);
+    }
+    Ok(value as Micro)
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Sizing {
     Shares(f64),
@@ -33,6 +39,9 @@ pub enum Skip {
     SellAlreadyReserved,
     NotReady,
     InvalidFeeEstimate,
+    InvalidSignalEvidence,
+    InvalidMoneyAmount,
+    OrderStateUnavailable,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Route {
@@ -339,16 +348,34 @@ impl Lane {
         *self.sell_reservations.lock().unwrap() = m;
     }
 }
+/// One admission gate for the decision/reservation caches and the
+/// ledger-derived control refresh. No second writer can reset spent/open or
+/// sell reservations while another thread is checking and reserving an order.
+/// Durable pending/WAL ownership remains a separate migration seam.
+#[derive(Default)]
+pub struct OrderAdmissionOwner {
+    serial: Mutex<()>,
+}
+impl OrderAdmissionOwner {
+    pub fn enter(&self) -> Result<std::sync::MutexGuard<'_, ()>, Skip> {
+        self.serial.lock().map_err(|_| Skip::OrderStateUnavailable)
+    }
+}
 pub struct Router {
     lanes: std::sync::RwLock<Vec<std::sync::Arc<Lane>>>,
     owner: Mutex<HashMap<String, (usize, i64)>>,
+    admission: OrderAdmissionOwner,
 }
 impl Router {
+    pub fn admission_owner(&self) -> &OrderAdmissionOwner {
+        &self.admission
+    }
     pub fn new(lanes: Vec<Lane>) -> Self {
         let lanes = lanes.into_iter().map(std::sync::Arc::new).collect();
         Router {
             lanes: std::sync::RwLock::new(lanes),
             owner: Mutex::new(HashMap::new()),
+            admission: OrderAdmissionOwner::default(),
         }
     }
     pub fn snapshot(&self) -> Vec<std::sync::Arc<Lane>> {
@@ -459,6 +486,14 @@ impl Router {
         d: &Decoded,
         progress: Progress,
     ) -> Result<Intent, Skip> {
+        let _admission = self.admission.enter()?;
+        if d.side != 0 && d.side != 1
+            || !d.price.is_finite() || !(0.0..=1.0).contains(&d.price)
+            || !d.fill_size.is_finite() || d.fill_size <= 0.0
+            || !d.order_size.is_finite() || d.order_size < d.fill_size
+        {
+            return Err(Skip::InvalidSignalEvidence);
+        }
         let lane = match self.lane(lane_ix) {
             Some(l) => l,
             None => return Err(Skip::Disarmed),
@@ -519,6 +554,9 @@ impl Router {
                 .max(d.price * c.sell_floor_frac)
                 .max(0.01);
             let (shares, limit) = sell_terms(want.min(held), desired, 0.06);
+            if !shares.is_finite() || !limit.is_finite() {
+                return Err(Skip::InvalidMoneyAmount);
+            }
             if shares <= 0.0 {
                 return Err(Skip::DustAfterSizing);
             }
@@ -570,6 +608,9 @@ impl Router {
             shares = 0.0;
         }
         let mut usd = shares * limit;
+        if !usd.is_finite() || !shares.is_finite() {
+            return Err(Skip::InvalidMoneyAmount);
+        }
         if usd < c.min_order_usd {
             if !c.min_fill_floor || !first_clip {
                 return Err(Skip::BelowVenueMinimum);
@@ -594,26 +635,32 @@ impl Router {
         if shares < crate::venue::VENUE_MIN_SHARES || usd < c.min_order_usd {
             return Err(Skip::BelowVenueMinimum);
         }
-        let usd_micro = (usd * MICRO) as Micro;
+        let usd_micro = checked_micro(usd * MICRO)?;
         let Some(cost) = crate::budget::buy_budget_cost(shares, limit) else {
             return Err(Skip::InvalidFeeEstimate);
         };
-        let budget_micro = (cost * MICRO).ceil() as Micro;
-        let day_cap = (pol.caps.daily_usd * scale * MICRO) as Micro;
-        if lane.state.spent_today.load(Ordering::Relaxed) + budget_micro > day_cap {
+        let budget_micro = checked_micro((cost * MICRO).ceil())?;
+        let day_cap = checked_micro(pol.caps.daily_usd * scale * MICRO)?;
+        let new_day = lane.state.spent_today.load(Ordering::Relaxed)
+            .checked_add(budget_micro).ok_or(Skip::InvalidMoneyAmount)?;
+        if new_day > day_cap {
             return Err(Skip::DailyBudget);
         }
-        let open_cap = (pol.caps.max_open_usd * scale * MICRO) as Micro;
-        if lane.state.open_usd.load(Ordering::Relaxed) + budget_micro > open_cap {
+        let open_cap = checked_micro(pol.caps.max_open_usd * scale * MICRO)?;
+        let new_open = lane.state.open_usd.load(Ordering::Relaxed)
+            .checked_add(budget_micro).ok_or(Skip::InvalidMoneyAmount)?;
+        if new_open > open_cap {
             return Err(Skip::MaxOpen);
         }
         {
             let mut pt = lane.per_token.lock().unwrap();
             let spent = *pt.get(&d.token_id).unwrap_or(&0);
-            if spent + budget_micro > (pol.caps.per_market_usd * scale * MICRO) as Micro {
+            let new_market = spent.checked_add(budget_micro)
+                .ok_or(Skip::InvalidMoneyAmount)?;
+            if new_market > checked_micro(pol.caps.per_market_usd * scale * MICRO)? {
                 return Err(Skip::PerMarketCap);
             }
-            pt.insert(d.token_id.clone(), spent + budget_micro);
+            pt.insert(d.token_id.clone(), new_market);
         }
         lane.state.spent_today.fetch_add(budget_micro, Ordering::Relaxed);
         lane.state.open_usd.fetch_add(budget_micro, Ordering::Relaxed);

@@ -45,6 +45,10 @@ pub(crate) fn load() -> Identity {
     let funder = root.bot.funder.clone();
     let signer = root.bot.signer.clone();
     let sig_type = root.bot.signature_type;
+    if !matches!(sig_type, 0 | 1 | 2) {
+        eprintln!("CONFIG ERROR: unsupported order signature type");
+        std::process::exit(2);
+    }
     if addr20(&funder).is_err() || addr20(&signer).is_err() {
         eprintln!("CONFIG ERROR: funder/signer must be 20-byte hex addresses");
         std::process::exit(2);
@@ -72,41 +76,25 @@ pub(crate) fn load() -> Identity {
         }
         _ => None,
     };
-    let pk = match (shadow, pk) {
-        (true, None) => {
-            eprintln!(
-                "[shadow] no PRIVATE_KEY — signing with a THROWAWAY key so orders \
-actually reach the venue and are refused. This key controls no funds."
-            );
-            let mut k = [0u8; 32];
-            for (i, b) in k.iter_mut().enumerate() {
-                *b = (i as u8).wrapping_add(1);
-            }
-            Some(k)
-        }
-        (_, other) => other,
-    };
+    // Shadow is an order-submitting execution mode, NOT a dry run.
+    // Neither it nor live mode may invent a throwaway signing identity.
+    if live && pk.is_none() {
+        eprintln!("REFUSING TO START: execution mode requires a valid signer key");
+        std::process::exit(2);
+    }
     let signer_addr: String = match pk.as_ref().map(copybot_hot::auth::address_from_key)
     {
-        Some(Ok(a)) => {
-            if !a.eq_ignore_ascii_case(&signer) {
-                eprintln!(
-                    "[auth] ⚠️  config signer {signer} does NOT own PRIVATE_KEY \
-({a}) — using the DERIVED owner address for authentication and signing. Fix the config."
-                );
-            }
-            a
+        Some(Ok(a)) if a.eq_ignore_ascii_case(&signer) => a,
+        Some(Ok(_)) => {
+            eprintln!("REFUSING TO START: configured signer does not match signer key");
+            std::process::exit(2);
         }
-        Some(Err(e)) => {
-            eprintln!("[auth] cannot derive signer address: {e}");
-            signer.clone()
+        Some(Err(_)) => {
+            eprintln!("REFUSING TO START: signer key cannot derive an identity");
+            std::process::exit(2);
         }
         None => signer.clone(),
     };
-    if live && !shadow && pk.is_none() {
-        eprintln!("REFUSING TO START: mode=live but PRIVATE_KEY is unset or malformed");
-        std::process::exit(2);
-    }
     Identity { operator_access, root, lanes, shadow, live, funder, sig_type, pk, signer_addr, _execution_lease }
 }
 
