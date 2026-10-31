@@ -131,6 +131,10 @@ impl Control {
         }
         next
     }
+    /// Obsolete pre-A4 fallback retained ONLY for historical unit tests.
+    /// This symbol must not exist in a production build: it can default
+    /// unknown fees to zero and prices to the limit.
+    #[cfg(test)]
     pub fn book_response(
         &mut self,
         lane: &str,

@@ -264,6 +264,7 @@ impl Ledger {
         }
         booked
     }
+    #[must_use = "a neutral custody correction is not real until durable ledger fsync"]
     pub fn record_recon_fill(
         &mut self,
         lane: &str,
@@ -272,12 +273,18 @@ impl Ledger {
         shares: f64,
         price: f64,
         fee: f64,
-    ) {
+    ) -> bool {
+        if side > 1 || !shares.is_finite() || shares <= 0.0
+            || !price.is_finite() || !(0.0..=1.0).contains(&price)
+            || fee != 0.0
+        {
+            return false;
+        }
         let row = serde_json::json!(
             { "ev" : "fill", "lane" : lane, "token" : token, "side" : side, "shares" :
             shares, "price" : price, "fee" : fee, "recon" : true, "t" : now_secs() }
         );
-        self.apply(&row, true);
+        self.apply(&row, true)
     }
     pub fn realised_reset(&mut self, lane: &str, why: &str) {
         let row = serde_json::json!(
@@ -518,7 +525,8 @@ impl Ledger {
             None
         };
         let mut settlement_keys = Vec::new();
-        if matches!(ev, "settle" | "realised_adjust") {
+        if matches!(ev, "settle" | "realised_adjust")
+            || (ev == "merge" && row["key"].as_str().is_some()) {
             for field in ["key", "alt_key"] {
                 if let Some(key) = row[field].as_str() {
                     settlement_keys.push((lane_name.to_string(), key.to_string()));
@@ -828,7 +836,22 @@ of …{} but only {:.4} tracked — excess IGNORED (replay-safe), investigate th
         mark_b: f64,
         tx_hash: &str,
     ) -> Option<(Booked, Booked)> {
-        if !(pairs.is_finite() && pairs > 0.0) {
+        // A successful on-chain merge MUST be one fsynced event. The former
+        // two separate :a/:b SELL appends could crash after only one leg,
+        // losing half the pair while reporting ledger truth on restart.
+        if !(pairs.is_finite() && pairs > 0.0)
+            || token_a.is_empty() || token_b.is_empty() || token_a == token_b
+            || tx_hash.is_empty() || !self.persistence_ok()
+            || self.mergeable(lane, token_a, token_b) + 1e-6 < pairs
+        {
+            return None;
+        }
+        // Existing pre-D624 two-legged receipts are not automatically safe
+        // to replay or rebook, even if one leg alone survived a crash.
+        if self.was_order_booked(&format!("{tx_hash}:a"))
+            || self.was_order_booked(&format!("{tx_hash}:b"))
+        {
+            self.last_write_error = Some("legacy merge leg needs owner reconciliation".into());
             return None;
         }
         let total = mark_a + mark_b;
@@ -840,33 +863,16 @@ of …{} but only {:.4} tracked — excess IGNORED (replay-safe), investigate th
             0.5
         };
         let price_b = 1.0 - price_a;
-        let a = self
-            .book_fill_ex_px(
-                lane,
-                token_a,
-                1,
-                pairs,
-                price_a,
-                0.0,
-                None,
-                &format!("{tx_hash}:a"),
-                false,
-                false,
-            )?;
-        let b = self
-            .book_fill_ex_px(
-                lane,
-                token_b,
-                1,
-                pairs,
-                price_b,
-                0.0,
-                None,
-                &format!("{tx_hash}:b"),
-                false,
-                false,
-            )?;
-        Some((a, b))
+        let row = serde_json::json!({
+            "ev": "merge", "lane":lane, "yes":token_a, "no":token_b,
+            "shares":pairs, "tx":tx_hash, "key":format!("atomic_merge:{lane}:{tx_hash}"),
+            "why":"confirmed_onchain_pair_merge", "t":now_secs(),
+        });
+        // Ledger.apply is one durable append+fsync before it adjusts both
+        // positions/P&L in memory, and the keyed row dedupes across reboot.
+        if !self.apply(&row, true) { return None; }
+        Some((Booked { shares:pairs, price:price_a },
+              Booked { shares:pairs, price:price_b }))
     }
     pub fn realised_windows_at(
         path: &str,

@@ -414,23 +414,32 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                             emitter.emit(fire_ev.clone());
                         }
                         if live {
-                            // FAK submissions may never use legacy limit/zero-fee
-                            // accounting. Without a successfully replayed owner,
-                            // refuse BEFORE HTTP POST and latch the buy side.
-                            if order_type == "FAK" {
-                                if let Err(reason) =
-                                    runtime::accounting::fak_owner_submit_ready(fak_journal.as_ref())
-                                {
-                                    latch_buys(&lane, &incidents, "fak_owner_unavailable",
-                                        "FAK execution needs an intact durable money journal before POST");
-                                    emitter.emit(serde_json::json!({
-                                        "t":now_ms(), "ev":"submit_precondition_failed",
-                                        "lane":lane_name, "tok":intent.token_id,
-                                        "why":format!("FAK owner unavailable: {reason:?}"),
-                                        "buys_halted":true,
-                                    }));
-                                    continue;
-                                }
+                            // Every order type needs one boot-replayed
+                            // canonical money owner. No FAK/GTC POST or shadow
+                            // submission while the lease is absent/poisoned.
+                            if let Err(reason) =
+                                runtime::accounting::fak_owner_submit_ready(fak_journal.as_ref())
+                            {
+                                latch_buys(&lane, &incidents, "money_owner_unavailable",
+                                    "all execution needs intact money journal before POST");
+                                emitter.emit(serde_json::json!({
+                                    "t":now_ms(), "ev":"submit_precondition_failed",
+                                    "lane":lane_name, "tok":intent.token_id,
+                                    "why":format!("money owner unavailable: {reason:?}"),
+                                    "buys_halted":true,
+                                }));
+                                continue;
+                            }
+                            if !copybot_hot::order_state_owner::has_strict_terminal_money_booker(order_type) {
+                                latch_buys(&lane, &incidents, "gtc_money_unverified",
+                                    "resting GTC execution has no cumulative exact-fee owner; refusing POST");
+                                emitter.emit(serde_json::json!({
+                                    "t":now_ms(), "ev":"submit_precondition_failed",
+                                    "lane":lane_name, "tok":intent.token_id,
+                                    "why":"GTC terminal monetary provenance unavailable",
+                                    "buys_halted":true,
+                                }));
+                                continue;
                             }
                             let Some(sig) = sig else {
                                 latch_buys(
@@ -600,7 +609,6 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                             let side_for_resp = intent.side;
                             let limit_for_resp = limit;
                             let shares_for_resp = intent.shares;
-                            let his_price_for_resp = d.price;
                             let rb_c = resting_book.clone();
                             let wake_c = sweep_tx.clone();
                             let router_c = router.clone();
@@ -694,7 +702,7 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                                     }
                                 };
                                 let booked = match &outcome {
-                                    Outcome::Matched { body, winner, ms } => {
+                                    Outcome::Matched { body: _, winner, ms } => {
                                         let (durable, filled) = if otype_c == "FAK" {
                                             runtime::accounting::book_matched_fak_race(
                                                 fak_journal_c.as_ref(),
@@ -702,13 +710,14 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                                                 &hash_c, &ln, &outcome, &results, paths.len(),
                                             )
                                         } else {
-                                            // GTC/resting follow-on paths are not yet
-                                            // journal-migrated. Do not mislabel them as A4.
-                                            book_and_resolve(
-                                                &c2, &pend_c, &router_c, &inc_c, &e2,
-                                                &ln, &tok_for_resp, side_for_resp,
-                                                limit_for_resp, body,
-                                                Some(his_price_for_resp), &hash_c, true,
+                                            // A resting GTC can execute in multiple
+                                            // fills with separate fees. A matched reply
+                                            // alone is NOT a terminal booked receipt:
+                                            // retain the signed reservation until an
+                                            // independent complete fill/fee attestation.
+                                            runtime::accounting::refuse_unproved_resting_money(
+                                                &pend_c, &router_c, &inc_c, &e2,
+                                                &ln, &hash_c, "GTC matched body lacks proven terminal cumulative price and charged fee",
                                             )
                                         };
                                         if side_for_resp == 0 && durable && otype_c != "GTC" {
@@ -745,7 +754,7 @@ not release {unfilled} unfilled shares: {e:?} — this order stays under-copied"
                                                 }
                                             }
                                         }
-                                        if side_for_resp == 1 {
+                                        if side_for_resp == 1 && durable {
                                             let _ = wake_c.send(tok_for_resp.clone());
                                         }
                                         serde_json::json!(

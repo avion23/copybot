@@ -1,6 +1,6 @@
 //! Rest-cancellation settlement and the existing bounded exit-rescue loop.
 
-use super::accounting::{book_and_resolve, book_matched_fak_race, fak_owner_submit_ready};
+use super::accounting::{book_matched_fak_race, fak_owner_submit_ready, refuse_unproved_resting_money};
 use super::control::latch_buys;
 use super::execution::submit_tracked;
 use super::telemetry::{now_ms, Emitter};
@@ -208,21 +208,16 @@ pub(crate) async fn settle_cancelled_rest(
     };
     match verdict {
         Verdict::Filled { shares: filled, .. } => {
-            rb.remove(&o.order_id);
-            let unfilled = (o.shares - filled).max(0.0);
-            if unfilled > 1e-9 {
-                let mut give = o.clone();
-                give.shares = unfilled;
-                release_cancelled(guard, emitter, &give, reason);
-            }
-            emitter
-                .emit(
-                    serde_json::json!(
-                        { "t" : now_ms(), "ev" : "rest_cancelled", "lane" : o.lane, "tok"
-                        : & o.token[..o.token.len().min(14)], "reason" : reason, "filled"
-                        : filled, "released" : unfilled }
-                    ),
-                );
+            // Venue status says some inventory changed, but does not carry
+            // independently verified per-fill fee nor terminal cumulative
+            // receipts. Keep the rest and signal-guard reservation instead
+            // of reporting a phantom booked fill or freeing buying power.
+            emitter.emit(serde_json::json!({
+                "t": now_ms(), "ev": "rest_money_unverified",
+                "lane": o.lane, "tok": &o.token[..o.token.len().min(14)],
+                "reason": reason, "observed_filled_shares": filled,
+                "reservation_retained": true,
+            }));
         }
         Verdict::NotFilled => {
             rb.remove(&o.order_id);
@@ -408,12 +403,13 @@ pub(crate) async fn rescue_exit(
                         paths.len(),
                     )
                 } else {
-                    // Preserve the existing legacy GTC rescue semantics.
-                    // The retry reservation is non-resting; GTC exits remain
-                    // outside this FAK-only journal migration.
-                    book_and_resolve(
-                        control, pend, router, incidents, emitter, lane, token,
-                        1, limit, body, None, &retry_hash, false,
+                    // No synthetic zero-fee/limit-priced booking on a
+                    // GTC rescue. Keep the durable pending row and halt buys;
+                    // complete independent fee evidence is not available.
+                    let _ = body;
+                    refuse_unproved_resting_money(
+                        pend, router, incidents, emitter, lane, &retry_hash,
+                        "GTC rescue has no authenticated cumulative fill/fee proof",
                     )
                 };
                 if !booked {

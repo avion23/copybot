@@ -102,9 +102,128 @@ impl<'a> OrderStateOwner<'a> {
     }
 }
 
+
+/// Live-state money authority. Every remaining ledger-only payout, merge and
+/// neutral custody correction must hold the SAME process-exclusive journal
+/// lease and the same Control/PendingLog mutex pair as witnessed FAK booking.
+/// Ledger's one fsynced keyed event is the durable payout/merge fact; a
+/// pending order is NEVER released by these operations.
+/// A FAK has one witnessed terminal HTTP match with two amount legs and an
+/// explicit fee; GTC may rest and fill repeatedly without cumulative fee
+/// evidence in our current venue client. Never submit what we cannot book.
+pub fn has_strict_terminal_money_booker(order_type: &str) -> bool {
+    order_type == "FAK"
+}
+
+pub struct CanonicalMoneyOwner<'a> {
+    _lease: &'a crate::order_commit::AtomicFakJournal,
+    pub ledger: &'a mut Ledger,
+    pub pending: &'a PendingLog,
+}
+
+impl<'a> CanonicalMoneyOwner<'a> {
+    pub fn new(
+        lease: &'a crate::order_commit::AtomicFakJournal,
+        ledger: &'a mut Ledger,
+        pending: &'a PendingLog,
+    ) -> Result<Self, String> {
+        lease.verify_owner().map_err(|e| format!("money owner lease invalid: {e:?}"))?;
+        if ledger.path.is_empty() || !ledger.persistence_ok()
+            || !pending.durable_path_configured()
+            || pending.unreadable_sources > 0 || !pending.persistence_ok()
+        {
+            return Err("money owner ledger or pending persistence untrusted".into());
+        }
+        Ok(Self { _lease: lease, ledger, pending })
+    }
+    fn no_pending(&self, token: &str) -> Result<(), String> {
+        if self.pending.open_rows().iter().any(|p| p.token == token) {
+            return Err("money event overlaps an unresolved order for this token".into());
+        }
+        Ok(())
+    }
+    pub fn redeem(
+        &mut self, lane: &str, token: &str,
+        redemption: &crate::settlement::Redemption,
+        snapshot: &crate::positions::Positions, stale: bool,
+    ) -> Result<bool, String> {
+        self.no_pending(token)?;
+        // A confirmed redemption creates ONE keyed, fsynced ledger event.
+        // No independent PendingLog resolution or invented fee is permitted.
+        self.ledger.settle_redeemed_open(
+            lane, token, redemption, snapshot, stale,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn correct_redeemed_release(
+        &mut self, lane: &str, token: &str, shares: f64,
+        proceeds: f64, avg_cost: f64, key: &str,
+        redemption_t: i64,
+    ) -> Result<bool, String> {
+        self.no_pending(token)?;
+        if key.is_empty() || !shares.is_finite() || shares <= 0.0
+            || !proceeds.is_finite() || proceeds < 0.0
+            || !avg_cost.is_finite() || avg_cost < 0.0
+            || redemption_t <= 0
+        {
+            return Err("redemption correction identity or amounts unprovable".into());
+        }
+        let previous = self.ledger.last_recon_release(lane, token, 0)
+            .ok_or_else(|| "no durable neutral release to correct".to_string())?;
+        if previous.0 + 1e-6 < shares || previous.2 > redemption_t
+            || (previous.1 - avg_cost).abs() > 1e-6
+        {
+            return Err("redemption correction does not match prior durable release".into());
+        }
+        Ok(self.ledger.record_realised_adjustment_tx(
+            lane, token, shares, proceeds, avg_cost,
+            "redemption corroborated neutral share release", key,
+        ))
+    }
+    pub fn neutral_reconcile(
+        &mut self, lane: &str, token: &str, side: u8,
+        shares: f64, price: f64,
+    ) -> Result<(), String> {
+        self.no_pending(token)?;
+        if side > 1 || !shares.is_finite() || shares <= 0.0
+            || !price.is_finite() || !(0.0..=1.0).contains(&price)
+        {
+            return Err("neutral custody correction has invalid amount or price".into());
+        }
+        if side == 1
+            && self.ledger.holdings(lane).get(token).copied().unwrap_or(0.0) + 1e-6 < shares
+        {
+            return Err("neutral release exceeds proven ledger inventory".into());
+        }
+        if !self.ledger.record_recon_fill(lane, token, side, shares, price, 0.0) {
+            return Err("neutral custody correction could not be fsynced".into());
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn merge_pair(
+        &mut self, lane: &str, token_a: &str, token_b: &str,
+        pairs: f64, mark_a: f64, mark_b: f64, tx: &str,
+    ) -> Result<(crate::ledger::Booked, crate::ledger::Booked), String> {
+        self.no_pending(token_a)?;
+        self.no_pending(token_b)?;
+        self.ledger.book_merge(
+            lane, token_a, token_b, pairs, mark_a, mark_b, tx,
+        ).ok_or_else(|| "atomic keyed merge pair booking refused".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_terminal_fak_is_currently_eligible_for_new_order_submissions() {
+        assert!(has_strict_terminal_money_booker("FAK"));
+        assert!(!has_strict_terminal_money_booker("GTC"));
+        assert!(!has_strict_terminal_money_booker("GTD"));
+        assert!(!has_strict_terminal_money_booker(""));
+    }
+
     use crate::pending::OrderStage;
     use crate::risk::RiskConfig;
     use std::path::PathBuf;

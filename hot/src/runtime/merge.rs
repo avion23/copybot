@@ -1,6 +1,6 @@
 //! Native merge execution, reconciliation task and historical pair-ledger seeding.
 
-use super::accounting::{book_matched_fak_race, fak_owner_submit_ready};
+use super::accounting::{book_matched_fak_race, fak_owner_submit_ready, with_canonical_money};
 use super::control::latch_buys;
 use super::execution::submit_tracked;
 use super::exits::rescue_exit;
@@ -493,6 +493,13 @@ disagreed — skipping rather than liquidating",
                         let before_b = phys_of(&ours, &o.token_b);
                         let outcome = if !merge_enabled5 {
                             MergeOutcome::DidNotHappen
+                        } else if let Err(error) = fak_owner_submit_ready(fak5.as_ref()) {
+                            e5.emit(serde_json::json!({
+                                "t":now_ms(), "ev":"merge_unavailable",
+                                "lane":lane.cfg.name, "condition":o.condition_id,
+                                "why":format!("canonical owner unverified: {error:?}"),
+                            }));
+                            MergeOutcome::Unresolved
                         } else {
                             let neg = neg_of(&o.token_a);
                             let r = run_merge_native(
@@ -509,23 +516,13 @@ disagreed — skipping rather than liquidating",
                             match r {
                                 Ok(tx) => {
                                     let (ma, mb) = (mark_of(&o.token_a), mark_of(&o.token_b));
-                                    let booked = c5
-                                        .lock()
-                                        .ok()
-                                        .and_then(|mut g| {
-                                            g
-                                                .ledger
-                                                .book_merge(
-                                                    &lane.cfg.name,
-                                                    &o.token_a,
-                                                    &o.token_b,
-                                                    pairs,
-                                                    ma,
-                                                    mb,
-                                                    &tx,
-                                                )
-                                        })
-                                        .is_some();
+                                    let booked = with_canonical_money(
+                                        fak5.as_ref(), &c5, &pend5,
+                                        |owner| owner.merge_pair(
+                                            &lane.cfg.name, &o.token_a, &o.token_b,
+                                            pairs, ma, mb, &tx,
+                                        ),
+                                    ).is_ok();
                                     e5.emit(
                                         serde_json::json!(
                                             { "t" : now_ms(), "ev" : "merge_executed", "lane" : lane.cfg
@@ -608,23 +605,13 @@ read was incomplete — cannot tell whether it landed; holding the matched pair"
                                                     let key = format!(
                                                         "mergeresolve:{}:{}", o.condition_id, pairs
                                                     );
-                                                    let booked = c5
-                                                        .lock()
-                                                        .ok()
-                                                        .and_then(|mut g| {
-                                                            g
-                                                                .ledger
-                                                                .book_merge(
-                                                                    &lane.cfg.name,
-                                                                    &o.token_a,
-                                                                    &o.token_b,
-                                                                    pairs,
-                                                                    ma,
-                                                                    mb,
-                                                                    &key,
-                                                                )
-                                                        })
-                                                        .is_some();
+                                                    let booked = with_canonical_money(
+                                                        fak5.as_ref(), &c5, &pend5,
+                                                        |owner| owner.merge_pair(
+                                                            &lane.cfg.name, &o.token_a, &o.token_b,
+                                                            pairs, ma, mb, &key,
+                                                        ),
+                                                    ).is_ok();
                                                     if booked {
                                                         MergeOutcome::Merged
                                                     } else {

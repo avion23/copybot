@@ -11,7 +11,7 @@ use runtime::dashboard_model::{DashboardLane, PhysicalWallet, wallet_equity_pnl}
 use runtime::dashboard_model::marked_position_value;
 #[cfg(test)]
 use runtime::reconcile::recovery_target_shares;
-use runtime::accounting::{book_and_resolve, halt_buys_on_persistence_fault_with};
+use runtime::accounting::halt_buys_on_persistence_fault_with;
 use runtime::telemetry::{now_ms, Emitter};
 use runtime::execution::submit_tracked;
 use runtime::control::latch_buys;
@@ -241,6 +241,7 @@ out right now, so treat this as urgent. {why}"
         );
     }
     if let Ok(reason) = std::env::var("RESET_REALISED") {
+        if live { eprintln!("[ledger] REFUSING LIVE RESET_REALISED without canonical journal authority"); std::process::exit(2); }
         let r = reason.trim();
         if r.is_empty() || r == "0" || r == "1" || r.eq_ignore_ascii_case("false")
             || r.eq_ignore_ascii_case("true")
@@ -440,8 +441,8 @@ the rescue ladder. Attribute it, or flatten by hand, rather than leaving it."
         live && !shadow, &root.bot.control_path,
         &control, &pending_log, &router, &incidents,
     );
-    runtime::accounting::recover_booked_pending_at_boot(
-        &control, &pending_log, &router, &incidents, &emitter,
+    runtime::accounting::audit_unowned_boot_receipts(
+        fak_journal.as_ref(), &control, &pending_log, &router, &incidents, &emitter,
     );
     let pending_tokens = pending_log.lock().unwrap().open_tokens();
     if !pending_tokens.is_empty() {
@@ -709,11 +710,13 @@ strategy's. Tell us whose it is, or flatten it by hand."
                     );
                     continue;
                 }
-                control
-                    .lock()
-                    .unwrap()
-                    .ledger
-                    .record_recon_fill(&name, tok, 0, diff, px, 0.0);
+                if let Err(reason) = runtime::accounting::with_canonical_money(
+                    fak_journal.as_ref(), &control, &pending_log,
+                    |owner| owner.neutral_reconcile(&name, tok, 0, diff, px),
+                ) {
+                    eprintln!("[recon] REFUSING boot adoption: {reason}");
+                    continue;
+                }
                 router.claim_existing(tok, lane_ix);
                 adopted += 1;
                 if !proven {
@@ -746,12 +749,10 @@ ${value_usd:.2}) with NO provenance — below the ${UNATTRIBUTED_MIN_USD:.2} mat
                         continue;
                     }
                     let px = control.lock().unwrap().ledger.avg_cost(&name, tok);
-                    control
-                        .lock()
-                        .unwrap()
-                        .ledger
-                        .record_recon_fill(&name, tok, 1, gone, px, 0.0);
-                    released += 1;
+                    if runtime::accounting::with_canonical_money(
+                        fak_journal.as_ref(), &control, &pending_log,
+                        |owner| owner.neutral_reconcile(&name, tok, 1, gone, px),
+                    ).is_ok() { released += 1; }
                 }
             }
             if adopted > 0 || released > 0 {
@@ -933,11 +934,8 @@ still be holding something, check that the funder address is right."
         );
     }
     if live {
-        runtime::accounting::spawn_settlement_booking(&control, &router, &emitter, &funder);
-    }
-    if live {
         runtime::accounting::spawn_redemption_correction(
-            &control, &router, &emitter, &funder, &pending_log,
+            &control, &router, &emitter, &funder, &pending_log, &fak_journal,
         );
     }
     if live {
@@ -949,6 +947,7 @@ still be holding something, check that the funder address is right."
     if live {
         runtime::position_reconciliation::spawn(
             &control, &router, &emitter, &funder, &pending_log, &errors_path, &drift_by_lane,
+            &fak_journal,
         );
     }
     if live && !shadow {

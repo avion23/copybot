@@ -1,5 +1,6 @@
 //! Periodic custody reconciliation; incomplete snapshots never authorize correction.
 
+use super::accounting::with_canonical_money;
 use super::reconcile::{RECON_QUIET_SECS, RECON_RELEASE_QUIET_SECS, RECON_SECS};
 use super::telemetry::{now_ms, Emitter};
 use copybot_hot::{control::Control, lanes::Router, pending::PendingLog};
@@ -84,8 +85,15 @@ pub(crate) fn spawn_shadow(
             for (name, rows) in planned {
                 let adopted = rows.len();
                 for (token, diff, avg) in rows {
-                    c2.lock().unwrap().ledger
-                        .record_fill(&name, &token, 0, diff, avg, 0.0);
+                    // Shadow does not own a live money journal. Observe
+                    // the inventory discrepancy, never invent a booked
+                    // position from a portfolio snapshot without provenance.
+                    e2.emit(serde_json::json!({
+                        "t":now_ms(), "ev":"shadow_recon_would_adopt",
+                        "lane":name, "token":token,
+                        "shares":diff, "price":avg,
+                        "booked":false,
+                    }));
                 }
                 if adopted > 0 {
                     e2.emit(serde_json::json!({
@@ -106,12 +114,14 @@ pub(crate) fn spawn(
     pending: &Arc<Mutex<PendingLog>>,
     errors_path: &str,
     drift_by_lane: &Arc<Mutex<HashMap<String, f64>>>,
+    money_journal: &Option<Arc<copybot_hot::order_commit::AtomicFakJournal>>,
 ) {
     let (ctl, rt, em, fund, pend) = (
         control.clone(), router.clone(), emitter.clone(), funder.to_owned(), pending.clone(),
     );
     let errpath = errors_path.to_owned();
     let drift_w = drift_by_lane.clone();
+    let money_lease = money_journal.clone();
     tokio::spawn(async move {
         let http = match reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -185,7 +195,16 @@ pub(crate) fn spawn(
                     .releasable(&name, &chain, RECON_RELEASE_QUIET_SECS, now)
                     .into_iter().filter(|(t, _, _)| !inflight.contains(t)).collect();
                 for (tok, gone, px) in phantoms {
-                    ctl.lock().unwrap().ledger.record_recon_fill(&name, &tok, 1, gone, px, 0.0);
+                    if let Err(error) = with_canonical_money(
+                        money_lease.as_ref(), &ctl, &pend,
+                        |owner| owner.neutral_reconcile(&name, &tok, 1, gone, px),
+                    ) {
+                        em.emit(serde_json::json!({
+                            "t":now_ms(), "ev":"recon_deferred",
+                            "lane":name, "tok":tok, "reason":error,
+                        }));
+                        continue;
+                    }
                     eprintln!(
                         "[recon] {name}: released phantom …{} ({gone:.4} sh) — \
 the chain has not shown it for {RECON_RELEASE_QUIET_SECS}s",
@@ -214,7 +233,16 @@ needed selling."
                     .adoptable(&name, &chain, RECON_QUIET_SECS, now, 0.05)
                     .into_iter().filter(|(t, _, _)| !inflight.contains(t)).collect();
                 for (tok, extra, px) in surplus {
-                    ctl.lock().unwrap().ledger.record_recon_fill(&name, &tok, 0, extra, px, 0.0);
+                    if let Err(error) = with_canonical_money(
+                        money_lease.as_ref(), &ctl, &pend,
+                        |owner| owner.neutral_reconcile(&name, &tok, 0, extra, px),
+                    ) {
+                        em.emit(serde_json::json!({
+                            "t":now_ms(), "ev":"recon_deferred",
+                            "lane":name, "tok":tok, "reason":error,
+                        }));
+                        continue;
+                    }
                     eprintln!(
                         "[recon] {name}: adopted …{} ({extra:.4} sh) — the chain \
 has shown it for {RECON_QUIET_SECS}s and we hold the market",

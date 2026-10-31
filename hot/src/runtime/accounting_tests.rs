@@ -287,6 +287,135 @@ fn direct_merge_and_flatten_unknown_fee_refuse_without_legacy_fallback() {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[test]
+fn unproved_gtc_match_never_books_or_releases_reservation() {
+    let (dir,c,p,r,i,e,_path) = fixture("gtc-defer");
+    {
+        let mut pend = p.lock().unwrap();
+        pend.resolve("h1","no_fill",None).unwrap();
+        pend.record(Pending {
+            lane:"alpha".into(), token:"rest-tok".into(), side:0,
+            order_hash:"gtc".into(), shares:8.0, limit:0.6,
+            ts:12, why:"resting".into(), resting:true,
+        }).unwrap();
+    }
+    let (booked, shares) = refuse_unproved_resting_money(
+        &p,&r,&i,&e,"alpha","gtc","no exact charged fee",
+    );
+    assert!(!booked);
+    assert_eq!(shares, 0.0);
+    assert!(p.lock().unwrap().is_open("gtc"));
+    assert!(!c.lock().unwrap().ledger.was_order_booked("gtc"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn one_owned_atomic_merge_pair_row_survives_reopen_without_split_leg() {
+    let (dir,c,p,r,i,_e,path) = fixture("merge-atomic");
+    let mut ledger=c.lock().unwrap();
+    assert!(ledger.ledger.book_fill_ex(
+        "alpha","yes",0,5.0,0.40,0.0,None,"seed-yes",false,
+    ).is_some());
+    assert!(ledger.ledger.book_fill_ex(
+        "alpha","no",0,5.0,0.55,0.0,None,"seed-no",false,
+    ).is_some());
+    drop(ledger);
+    let lease=open_fak_journal_for_live(true,&path,&c,&p,&r,&i).unwrap();
+    let result=with_canonical_money(Some(&lease),&c,&p,|owner|
+        owner.merge_pair("alpha","yes","no",5.0,0.4,0.6,"onchain-merge-tx")
+    ).expect("atomic merge pair fsync");
+    assert_eq!(result.0.shares,5.0);
+    assert_eq!(result.1.shares,5.0);
+    assert!(!c.lock().unwrap().ledger.was_order_booked("onchain-merge-tx:a"));
+    assert!(!c.lock().unwrap().ledger.was_order_booked("onchain-merge-tx:b"));
+    assert!(with_canonical_money(Some(&lease),&c,&p,|owner|
+        owner.merge_pair("alpha","yes","no",5.0,0.4,0.6,"onchain-merge-tx")
+    ).is_err(), "same tx cannot book a second pair");
+    let raw=std::fs::read_to_string(dir.join("ledger.jsonl")).unwrap();
+    assert_eq!(raw.lines().filter(|line|
+        line.contains(r#""key":"atomic_merge:alpha:onchain-merge-tx""#)
+    ).count(),1);
+    drop(lease);
+    let replay=Ledger::new(dir.join("ledger.jsonl").to_str().unwrap(),
+        &[("alpha".into(),RiskConfig::default())]);
+    assert_eq!(replay.holdings("alpha").get("yes").copied().unwrap_or(0.0),0.0);
+    assert_eq!(replay.holdings("alpha").get("no").copied().unwrap_or(0.0),0.0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn redeemed_payout_requires_lease_no_pending_and_one_keyed_fsync() {
+    use copybot_hot::settlement::Redemption;
+    use copybot_hot::positions::Positions;
+    let (dir,c,p,r,i,_e,path)=fixture("redemption");
+    let _=c.lock().unwrap().ledger.book_fill_ex(
+        "alpha","tok",0,10.0,0.4,0.0,None,"seed",false,
+    ).unwrap();
+    let t=copybot_hot::ledger::now_secs()+1;
+    let redemption=Redemption{
+        tx:"0xredemption".into(), condition_id:"0xmarket".into(),
+        outcome_index:0,asset:"tok".into(),size:10.0,usdc:10.0,ts:t,
+    };
+    let positions=Positions::empty(t+1);
+    let lease=open_fak_journal_for_live(true,&path,&c,&p,&r,&i).unwrap();
+    assert!(with_canonical_money(Some(&lease),&c,&p,|owner|
+        owner.redeem("alpha","tok",&redemption,&positions,false)
+    ).is_err(), "signed pending row cannot be settled beneath admission");
+    p.lock().unwrap().resolve("h1","no_fill",None).unwrap();
+    assert!(with_canonical_money(None,&c,&p,|owner|
+        owner.redeem("alpha","tok",&redemption,&positions,false)
+    ).is_err(), "no owner must never book settlement");
+    assert_eq!(with_canonical_money(Some(&lease),&c,&p,|owner|
+        owner.redeem("alpha","tok",&redemption,&positions,false)
+    ).unwrap(),true);
+    assert_eq!(with_canonical_money(Some(&lease),&c,&p,|owner|
+        owner.redeem("alpha","tok",&redemption,&positions,false)
+    ).unwrap(),false);
+    assert!(c.lock().unwrap().ledger.holdings("alpha").get("tok").is_none());
+    drop(lease);
+    let replay=Ledger::new(dir.join("ledger.jsonl").to_str().unwrap(),
+        &[("alpha".into(),RiskConfig::default())]);
+    assert_eq!(replay.holdings("alpha").get("tok").copied().unwrap_or(0.0),0.0);
+    assert_eq!(replay.lanes["alpha"].risk.realised_pnl,6.0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn neutral_custody_adjustment_needs_canonical_lease_and_no_pending() {
+    let (dir,c,p,r,i,_e,path)=fixture("neutral");
+    let lease=open_fak_journal_for_live(true,&path,&c,&p,&r,&i).unwrap();
+    assert!(with_canonical_money(Some(&lease),&c,&p,|owner|
+        owner.neutral_reconcile("alpha","tok",0,1.0,0.4)
+    ).is_err(), "unresolved pending blocks independent custody adjustment");
+    p.lock().unwrap().resolve("h1","no_fill",None).unwrap();
+    with_canonical_money(Some(&lease),&c,&p,|owner|
+        owner.neutral_reconcile("alpha","tok",0,1.0,0.4)
+    ).unwrap();
+    assert_eq!(c.lock().unwrap().ledger.holdings("alpha")["tok"],1.0);
+    assert!(with_canonical_money(None,&c,&p,|owner|
+        owner.neutral_reconcile("alpha","tok",1,1.0,0.4)
+    ).is_err(), "missing lease cannot release inventory");
+    drop(lease);
+    let replay=Ledger::new(dir.join("ledger.jsonl").to_str().unwrap(),
+        &[("alpha".into(),RiskConfig::default())]);
+    assert_eq!(replay.holdings("alpha")["tok"],1.0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn boot_never_closes_legacy_ledger_booked_pending_without_owner_fact() {
+    let (dir,c,p,r,i,e,path) = fixture("legacy-boot");
+    let booked = c.lock().unwrap().ledger.book_fill_ex(
+        "alpha","tok",0,9.0,0.45,0.0,None,"h1",false,
+    ).unwrap();
+    assert_eq!(booked.shares,9.0);
+    let journal=open_fak_journal_for_live(true,&path,&c,&p,&r,&i).unwrap();
+    assert!(journal.commits().unwrap().is_empty());
+    audit_unowned_boot_receipts(Some(&journal),&c,&p,&r,&i,&e);
+    assert!(p.lock().unwrap().is_open("h1"),
+        "unproved old fee=0 ledger receipt must not release original pending");
+    assert!(c.lock().unwrap().ledger.was_order_booked("h1"));
+    drop(journal);
+    std::fs::remove_dir_all(dir).unwrap();
+}
     #[test]
     fn journal_only_crash_is_recovered_at_boot_without_network_or_post() {
         let (dir, c, p, r, i, _e, path) = fixture("restart");

@@ -10,8 +10,8 @@ use std::time::Duration;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_pending(
     log: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
-    control: &Arc<std::sync::Mutex<Control>>,
-    router: &Arc<Router>,
+    _control: &Arc<std::sync::Mutex<Control>>,
+    _router: &Arc<Router>,
     emitter: &Arc<Emitter>,
     clob: &str,
     creds: &Arc<Option<copybot_hot::auth::ApiCreds>>,
@@ -85,122 +85,22 @@ pub(crate) async fn resolve_pending(
         }
         match verdict {
             Verdict::Filled { shares, price } => {
-                // The order-status/trades recovery API here has NO verified
-                // per-fill fee. An unfilled FAK journal row therefore cannot
-                // be booked at fee=0 (nor at a provisional limit price).
-                // Keep it reserved for independently proven money evidence.
-                if copybot_hot::pending::unproven_fak_money(
-                    p.resting, price.is_finite() && price > 0.0, false,
-                ) {
-                    emitter.emit(serde_json::json!({
-                        "t": now_ms(), "ev": "pending_fak_money_unverified",
-                        "lane": p.lane, "order_hash": p.order_hash,
-                        "reason": "venue recovery lacks proven fee; booking deferred",
-                    }));
-                    continue;
-                }
-                // A verified venue match advances the durable reservation
-                // before any ledger booking. Unknown outcomes stay reserved.
-                if let Err(error) = log.lock().unwrap().advance(
-                    &p.order_hash, copybot_hot::pending::OrderStage::Accepted,
-                ) {
-                    emitter.emit(serde_json::json!({
-                        "t": now_ms(), "ev": "pending_state_unavailable",
-                        "lane": p.lane, "reason": error,
-                    }));
-                    continue;
-                }
-                let (px, px_provisional) = copybot_hot::pending::recovered_price(
-                    p.resting,
-                    price,
-                    p.limit,
-                );
-                let mut sz = shares;
-                if p.side == 1 {
-                    let held = control
-                        .lock()
-                        .unwrap()
-                        .ledger
-                        .holdings(&p.lane)
-                        .get(&p.token)
-                        .copied()
-                        .unwrap_or(0.0);
-                    sz = sz.min(held);
-                }
-                let receipt = if sz > 0.0 {
-                    let r = control
-                        .lock()
-                        .unwrap()
-                        .ledger
-                        .book_fill_ex_px(
-                            &p.lane,
-                            &p.token,
-                            p.side,
-                            sz,
-                            px,
-                            0.0,
-                            None,
-                            &p.order_hash,
-                            p.resting,
-                            px_provisional,
-                        );
-                    if r.is_some() && p.side == 0 {
-                        if let Some(ix) = router
-                            .snapshot()
-                            .iter()
-                            .position(|l| l.cfg.name == p.lane)
-                        {
-                            router.claim_existing(&p.token, ix);
-                        }
-                    }
-                    r
-                } else {
-                    // A zero bookable balance does not prove that an observed
-                    // fill did not take place; retain the identity for review.
-                    emitter.emit(serde_json::json!({
-                        "t": now_ms(), "ev": "pending_unattributed",
-                        "lane": p.lane, "tok": p.token,
-                        "reason": "venue match has no bookable shares",
-                    }));
-                    continue;
-                };
-                let Some(r) = receipt else {
-                    eprintln!(
-                        "[pending] {} could NOT book a recovered fill — row kept open",
-                        p.lane
-                    );
-                    emitter
-                        .emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "pending_recover_failed", "lane" :
-                                p.lane, "tok" : & p.token[..p.token.len().min(14)], "shares"
-                                : sz, "price" : px }
-                            ),
-                        );
-                    continue;
-                };
-                if let Err(e) = log
-                    .lock()
-                    .unwrap()
-                    .resolve_booked(&p.order_hash, "filled", r)
-                {
-                    eprintln!(
-                        "[pending] {} fill IS booked but its row stayed open: {e}", p
-                        .lane
-                    );
-                }
-                eprintln!(
-                    "[pending] {} RECOVERED a lost fill: {sz:.4} sh @ {px:.4} on …{}",
-                    p.lane, & p.token[p.token.len().saturating_sub(8)..]
-                );
-                emitter
-                    .emit(
-                        serde_json::json!(
-                            { "t" : now_ms(), "ev" : "pending_recovered", "lane" : p
-                            .lane, "tok" : & p.token[..p.token.len().min(14)], "side" : p
-                            .side, "shares" : sz, "price" : px, "why" : p.why }
-                        ),
-                    );
+                // Neither status nor /data/trades supplies an independently
+                // proved per-order charged fee. Resting GTC may also fill in
+                // multiple pieces. Never invent fee=0, fall back to the
+                // submitted limit, clamp a SELL, or close PendingLog here.
+                emitter.emit(serde_json::json!({
+                    "t": now_ms(), "ev": "pending_money_unverified",
+                    "lane": p.lane, "order_hash": p.order_hash,
+                    "resting": p.resting,
+                    "observed_shares": shares,
+                    "observed_price": if price.is_finite() && price > 0.0 {
+                        Some(price)
+                    } else { None },
+                    "reason": "venue recovery lacks authenticated cumulative filled amount and charged fee",
+                    "reservation_retained": true,
+                }));
+                continue;
             }
             Verdict::NotFilled => {
                 if let Err(error) = log.lock().unwrap().resolve(
@@ -253,52 +153,40 @@ pub(crate) async fn resolve_pending(
 /// Repair only already-booked FAK reservations after a crash between ledger
 /// fsync and pending-log resolution. This is one coordinated recovery edge;
 /// both files remain independently durable until the full owner migration.
-pub(crate) fn recover_booked_pending_at_boot(
+/// A previously booked order WITHOUT a canonical journal commitment is a
+/// legacy split-brain residue, not an authority for freeing a reservation.
+/// D615–D623 proven fills are repaired through the journal before this audit.
+pub(crate) fn audit_unowned_boot_receipts(
+    journal: Option<&Arc<copybot_hot::order_commit::AtomicFakJournal>>,
     control: &Arc<std::sync::Mutex<Control>>,
     pending: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
     router: &Arc<Router>,
     incidents: &Arc<std::sync::Mutex<copybot_hot::incidents::Incidents>>,
     emitter: &Arc<Emitter>,
 ) {
-    let result = {
-        let ctl = control.lock().unwrap();
-        let mut journal = pending.lock().unwrap();
-        copybot_hot::order_state_owner::OrderStateOwner::new(
-            &ctl.ledger, &mut journal,
-        ).reconcile_restart()
+    let Ok(commits) = journal.ok_or("canonical journal not bootstrapped")
+        .and_then(|j| j.commits().map_err(|_| "journal replay unavailable"))
+    else { return; /* no live owner => no live orders may be posted */ };
+    let certified: std::collections::HashSet<String> = commits.into_iter()
+        .map(|c| c.order_hash).collect();
+    let legacy = {
+        let control = control.lock().unwrap();
+        let pending = pending.lock().unwrap();
+        pending.open_rows().into_iter()
+            .filter(|p| control.ledger.was_order_booked(&p.order_hash)
+                && !certified.contains(&p.order_hash))
+            .map(|p| p.order_hash).collect::<Vec<_>>()
     };
-    match result {
-        Ok(report) => {
-            if report.recovered > 0 || report.retained_resting > 0 {
-                eprintln!(
-                    "[order_owner] restart: {} booked FAK reservation(s) durably closed; {} resting order(s) still reserved for venue proof",
-                    report.recovered, report.retained_resting
-                );
-                emitter.emit(serde_json::json!({
-                    "t": now_ms(), "ev":"order_owner_restart",
-                    "booked_fak_closed": report.recovered,
-                    "resting_kept": report.retained_resting,
-                    "unverified_kept": report.missing_ledger_receipts,
-                }));
-            }
+    if !legacy.is_empty() {
+        for lane in router.snapshot().iter() {
+            latch_buys(lane, incidents, "legacy_unjournaled_fill",
+                "booked order is not part of canonical money journal; reservations retained");
         }
-        Err(refusal) => {
-            // Never free outstanding budget if either durable source cannot
-            // prove a coherent full order identity and booked amount.
-            eprintln!(
-                "[order_owner] REFUSING restart reconciliation: {refusal:?}; unresolved reservations remain, new buys halted"
-            );
-            for lane in router.snapshot().iter() {
-                latch_buys(
-                    lane, incidents, "order_owner_restart",
-                    "ledger/pending booking evidence conflicts or cannot persist",
-                );
-            }
-            emitter.emit(serde_json::json!({
-                "t": now_ms(), "ev":"order_owner_restart_refusal",
-                "why": format!("{refusal:?}"),
-            }));
-        }
+        emitter.emit(serde_json::json!({
+            "t":now_ms(), "ev":"owner_boot_legacy_receipt_refusal",
+            "uncertified_booked_pending_count":legacy.len(),
+            "reservation_retained":true,
+        }));
     }
 }
 
@@ -380,6 +268,30 @@ pub(crate) fn open_fak_journal_for_live(
     }
 }
 
+/// A single process-exclusive ledger/PendingLog critical section for every
+/// payout, custody correction and pair merge. The journal lease guards the
+/// authority; each Ledger mutation is one fsynced event, with replay keys
+/// for redemptions and pair merges. No second PendingLog write follows a
+/// payout or merge, so there is no cross-file terminal transition to race.
+pub(crate) fn with_canonical_money<R>(
+    journal: Option<&Arc<copybot_hot::order_commit::AtomicFakJournal>>,
+    control: &Arc<std::sync::Mutex<Control>>,
+    pending: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
+    action: impl FnOnce(
+        &mut copybot_hot::order_state_owner::CanonicalMoneyOwner<'_>
+    ) -> Result<R, String>,
+) -> Result<R, String> {
+    let lease = journal.ok_or_else(|| "canonical money journal not bootstrapped".to_string())?;
+    let mut ctl = control.lock()
+        .map_err(|_| "money Ledger mutex poisoned".to_string())?;
+    let pending_guard = pending.lock()
+        .map_err(|_| "money PendingLog mutex poisoned".to_string())?;
+    let mut owner = copybot_hot::order_state_owner::CanonicalMoneyOwner::new(
+        lease, &mut ctl.ledger, &pending_guard,
+    )?;
+    action(&mut owner)
+}
+
 /// Cheap canonical-FAK-owner admission check. No journal file is created,
 /// and this never submits an order. Replaced or unlinked inodes refuse before
 /// the caller can sign/POST or reserve a new FAK trade.
@@ -443,172 +355,41 @@ pub(crate) fn book_matched_fak_race(
     (booked, shares)
 }
 
-pub(crate) fn book_and_resolve(
-    control: &Arc<std::sync::Mutex<Control>>,
-    pend: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
+/// A GTC partial/matched status without independently verified charged fee
+/// is *not* a durable fill commitment. Keep every signed reservation until
+/// cumulative order evidence can safely be recorded by the canonical owner.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refuse_unproved_resting_money(
+    pending: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
     router: &Arc<Router>,
     incidents: &Arc<std::sync::Mutex<copybot_hot::incidents::Incidents>>,
     emitter: &Arc<Emitter>,
     lane: &str,
-    token: &str,
-    side: u8,
-    limit: f64,
-    body: &str,
-    his_price: Option<f64>,
-    order_hash: &str,
-    resting: bool,
+    hash: &str,
+    why: &str,
 ) -> (bool, f64) {
-    let receipt = control
-        .lock()
-        .unwrap()
-        .book_response(lane, token, side, limit, body, his_price, order_hash, resting);
-    let mut resolve_err: Option<String> = None;
-    let had_receipt = receipt.is_some();
-    let still_open_after: usize;
-    let filled_shares = receipt.as_ref().map(|r| r.shares).unwrap_or(0.0);
-    let booked = match receipt {
-        Some(r) => {
-            if let Err(e) = pend.lock().unwrap().resolve_booked(order_hash, "matched", r)
-            {
-                resolve_err = Some(e.to_string());
-                eprintln!(
-                    "[{lane}] fill IS booked but its pending row stayed open: {e}"
-                );
-            }
-            true
-        }
-        None => {
-            eprintln!(
-                "[{lane}] NOT BOOKED: {} {} @ {limit} — refusal inside a 200, an \
-                       AMBIGUOUS reply, or a failed ledger append. The pending row stays \
-                       OPEN for the resolver; if it is still unbooked later, this is \
-                       unattributed inventory.",
-                if side == 0 { "BUY" } else { "SELL" }, & token[..token.len().min(14)]
-            );
-            false
-        }
-    };
-    still_open_after = pend.lock().unwrap().len();
-    let orphaned = had_receipt && resolve_err.is_none()
-        && pend.lock().unwrap().is_open(order_hash);
-    if orphaned {
-        eprintln!(
-            "[{lane}] ⛔ ORPHANED PENDING ROW: fill booked, resolve reported success, \
-                   and the row {order_hash} is STILL OPEN. Its shares remain reserved."
-        );
+    let retained = pending.lock().map(|p| p.is_open(hash)).unwrap_or(false);
+    for l in router.snapshot().iter() {
+        latch_buys(l, incidents, "gtc_money_unverified",
+            "GTC fill lacks independently verified cumulative shares, price and fee");
     }
-    emitter
-        .emit(
-            serde_json::json!(
-                { "t" : now_ms(), "ev" : "book_resolve", "lane" : lane, "tok" : &
-                token[..token.len().min(14)], "side" : if side == 0 { "BUY" } else {
-                "SELL" }, "booked" : booked, "had_receipt" : had_receipt, "resolve_err" :
-                resolve_err, "orphaned" : orphaned, "pending_open_after" :
-                still_open_after, "order_hash" : order_hash, }
-            ),
-        );
-    halt_buys_on_persistence_fault_with(control, router, Some(pend), incidents);
-    (booked, filled_shares)
+    emitter.emit(serde_json::json!({
+        "t": now_ms(), "ev": "gtc_money_unverified", "lane": lane,
+        "order_hash": hash, "reservation_retained": retained,
+        "reason": why, "booked": false,
+    }));
+    (false, 0.0)
 }
-
 
 #[cfg(test)]
 #[path = "accounting_tests.rs"]
 mod d619_tests;
 
 
-pub(crate) fn spawn_settlement_booking(
-    control: &Arc<std::sync::Mutex<Control>>,
-    router: &Arc<Router>,
-    emitter: &Arc<Emitter>,
-    funder: &String,
-) {
-        let (ctl, rt, em, fund) = (
-            control.clone(),
-            router.clone(),
-            emitter.clone(),
-            funder.clone(),
-        );
-        tokio::spawn(async move {
-            let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default();
-            let mut tick = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                tick.tick().await;
-                let url = format!(
-                    "https://data-api.polymarket.com/positions?user={fund}\
-&sizeThreshold=0.0001&limit=500&redeemable=true"
-                );
-                let rows: Vec<serde_json::Value> = match http.get(&url).send().await {
-                    Ok(r) if r.status().is_success() => {
-                        r.json().await.unwrap_or_default()
-                    }
-                    _ => continue,
-                };
-                let mut payout: std::collections::HashMap<String, f64> = Default::default();
-                for p in &rows {
-                    let view = copybot_hot::settlement::PositionView {
-                        redeemable: p["redeemable"].as_bool().unwrap_or(false),
-                        cur_price: p["curPrice"]
-                            .as_f64()
-                            .or_else(|| {
-                                p["curPrice"].as_str().and_then(|x| x.parse().ok())
-                            })
-                            .unwrap_or(f64::NAN),
-                    };
-                    if let (Some(tok), Some(pay)) = (
-                        p["asset"].as_str(),
-                        copybot_hot::settlement::resolved_payout(view),
-                    ) {
-                        if !tok.is_empty() {
-                            payout.insert(tok.to_string(), pay);
-                        }
-                    }
-                }
-                if payout.is_empty() {
-                    continue;
-                }
-                for lane in rt.snapshot().iter() {
-                    let name = lane.cfg.name.clone();
-                    let held = ctl.lock().unwrap().ledger.holdings(&name);
-                    for tok in held.keys() {
-                        let Some(&pay) = payout.get(tok) else { continue };
-                        let mut g = ctl.lock().unwrap();
-                        let before = g
-                            .ledger
-                            .lanes
-                            .get(&name)
-                            .map(|b| b.risk.realised_pnl)
-                            .unwrap_or(0.0);
-                        if !g.ledger.record_settlement(&name, tok, pay) {
-                            continue;
-                        }
-                        let after = g
-                            .ledger
-                            .lanes
-                            .get(&name)
-                            .map(|b| b.risk.realised_pnl)
-                            .unwrap_or(0.0);
-                        drop(g);
-                        eprintln!(
-                            "[settle] {name}: token …{} resolved at {pay:.3} \
-                                   -> realised {:+.2}",
-                            & tok[tok.len().saturating_sub(8)..], after - before
-                        );
-                        em.emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "settle", "lane" : name, "tok" : &
-                                tok[..tok.len().min(14)], "payout" : pay, "realised_delta" :
-                                ((after - before) * 100.0).round() / 100.0 }
-                            ),
-                        );
-                    }
-                }
-            }
-        });
-}
+// The old periodic redeemable-price settlement writer is intentionally gone:
+// a read-only position marked redeemable is NOT an on-chain redemption or
+// proof of funds. Only the explicit redemption+complete-balance path below
+// may book a terminal payout through the canonical owner.
 
 pub(crate) fn spawn_redemption_correction(
     control: &Arc<std::sync::Mutex<Control>>,
@@ -616,6 +397,7 @@ pub(crate) fn spawn_redemption_correction(
     emitter: &Arc<Emitter>,
     funder: &String,
     pending_log: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
+    money_journal: &Option<Arc<copybot_hot::order_commit::AtomicFakJournal>>,
 ) {
     const SETTLE_CLOCK_SLOP_SECS: i64 = 120;
         let (ctl, rt, em, fund) = (
@@ -625,6 +407,7 @@ pub(crate) fn spawn_redemption_correction(
             funder.clone(),
         );
         let settlement_pending = pending_log.clone();
+        let money_lease = money_journal.clone();
         tokio::spawn(async move {
             let http = reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -745,15 +528,15 @@ older history is not covered and may require offline reconciliation"
                             );
                             continue;
                         }
-                        let pending = settlement_pending.lock().unwrap().open_tokens()
-                            .iter().any(|(_, token)| token == tok);
-                        let mut guard = ctl.lock().unwrap();
-                        if guard.ledger.holdings(name).get(tok).copied().unwrap_or(0.0) > 1e-9 {
-                            let stale = copybot_hot::ledger::now_secs() - settlement_snapshot.as_of > 120;
-                            let result = guard.ledger.settle_redeemed_open(
-                                name, tok, r, &settlement_snapshot, pending || stale,
+                        let still_held = ctl.lock().unwrap().ledger.holdings(name)
+                            .get(tok).copied().unwrap_or(0.0) > 1e-9;
+                        if still_held {
+                            let stale = copybot_hot::ledger::now_secs()
+                                - settlement_snapshot.as_of > 120;
+                            let result = with_canonical_money(
+                                money_lease.as_ref(), &ctl, &settlement_pending,
+                                |owner| owner.redeem(name, tok, r, &settlement_snapshot, stale),
                             );
-                            drop(guard);
                             match result {
                                 Ok(true) => {
                                     corrected.insert(key.clone());
@@ -769,7 +552,6 @@ older history is not covered and may require offline reconciliation"
                             }
                             continue;
                         }
-                        drop(guard);
                         let Some(&(released, avg_cost, rel_t)) = releases
                             .get(&(name.clone(), tok.to_string())) else { continue };
                         if rel_t < r.ts - SETTLE_CLOCK_SLOP_SECS {
@@ -780,22 +562,16 @@ older history is not covered and may require offline reconciliation"
                             continue;
                         }
                         let proceeds = shares * payout_per_share;
-                        let mut g = ctl.lock().unwrap();
-                        let written = g.ledger
-                            .record_realised_adjustment_tx(
-                                name,
-                                tok,
-                                shares,
-                                proceeds,
-                                avg_cost,
-                                "redemption observed after an earlier P&L-neutral \
-                             reconciliation release; corrected to the real on-chain payout",
-                                &key,
-                            );
-                        drop(g);
-                        if !written {
+                        let written = with_canonical_money(
+                            money_lease.as_ref(), &ctl, &settlement_pending,
+                            |owner| owner.correct_redeemed_release(
+                                name, tok, shares, proceeds, avg_cost, &key, r.ts,
+                            ),
+                        );
+                        if !matches!(written, Ok(true)) {
                             em.emit(serde_json::json!({"t": now_ms(), "ev": "settle_deferred",
-                                "lane": name, "token": tok, "reason": "adjustment not written or already booked"}));
+                                "lane": name, "token": tok,
+                                "reason": format!("canonical adjustment refused: {written:?}")}));
                             continue;
                         }
                         corrected.insert(key.clone());
