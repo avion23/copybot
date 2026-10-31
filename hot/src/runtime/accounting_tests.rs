@@ -84,7 +84,30 @@ use super::*;
         let guard = c.lock().unwrap();
         assert_eq!(guard.ledger.recorded_order("h1").unwrap().fee, 0.015);
         drop(guard);
+        // Reuse this existing FAK test to prove heterogeneous, sequential
+        // FAK + confirmed-redemption frames share ONE journal hash chain.
+        // Both hashes below are offline fixtures, not venue attestations.
+        let t = copybot_hot::ledger::now_secs() + 1;
+        let source = copybot_hot::settlement::Redemption {
+            tx:format!("0x{}", "a".repeat(64)),
+            condition_id:format!("0x{}", "b".repeat(64)),
+            outcome_index:0, asset:"tok".into(), size:9.0,usdc:9.0,ts:t,
+        };
+        let zero = copybot_hot::positions::Positions::empty(t+1);
+        assert_eq!(with_canonical_money(Some(&journal), &c, &p, |owner|
+            owner.redeem("alpha", "tok", &source, &zero, false)
+        ).unwrap(),true);
+        assert_eq!(journal.commits().unwrap().len(),1);
+        assert_eq!(journal.money_commits().unwrap().len(),1);
+        assert_eq!(std::fs::read_to_string(journal.path()).unwrap().lines().count(),2);
         drop(journal);
+        let reopened=copybot_hot::order_commit::AtomicFakJournal::open(
+            dir.join("ctl.fak_commit")).unwrap();
+        assert_eq!(reopened.commits().unwrap().len(),1);
+        assert_eq!(reopened.money_commits().unwrap().len(),1);
+        assert_eq!(reopened.repair_money(&mut c.lock().unwrap().ledger,&p.lock().unwrap())
+            .unwrap().already_projected,1);
+        drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -352,7 +375,8 @@ fn redeemed_payout_requires_lease_no_pending_and_one_keyed_fsync() {
     ).unwrap();
     let t=copybot_hot::ledger::now_secs()+1;
     let redemption=Redemption{
-        tx:"0xredemption".into(), condition_id:"0xmarket".into(),
+        tx:format!("0x{}", "a".repeat(64)),
+        condition_id:format!("0x{}", "b".repeat(64)),
         outcome_index:0,asset:"tok".into(),size:10.0,usdc:10.0,ts:t,
     };
     let positions=Positions::empty(t+1);
@@ -367,6 +391,7 @@ fn redeemed_payout_requires_lease_no_pending_and_one_keyed_fsync() {
     assert_eq!(with_canonical_money(Some(&lease),&c,&p,|owner|
         owner.redeem("alpha","tok",&redemption,&positions,false)
     ).unwrap(),true);
+    assert_eq!(lease.money_commits().unwrap().len(),1);
     assert_eq!(with_canonical_money(Some(&lease),&c,&p,|owner|
         owner.redeem("alpha","tok",&redemption,&positions,false)
     ).unwrap(),false);
@@ -376,6 +401,36 @@ fn redeemed_payout_requires_lease_no_pending_and_one_keyed_fsync() {
         &[("alpha".into(),RiskConfig::default())]);
     assert_eq!(replay.holdings("alpha").get("tok").copied().unwrap_or(0.0),0.0);
     assert_eq!(replay.lanes["alpha"].risk.realised_pnl,6.0);
+    let lease=open_fak_journal_for_live(true,&path,&c,&p,&r,&i).unwrap();
+    assert_eq!(lease.money_commits().unwrap().len(),1);
+    assert_eq!(lease.repair_money(&mut c.lock().unwrap().ledger,&p.lock().unwrap())
+        .unwrap().already_projected,1);
+    drop(lease);
+    std::fs::remove_dir_all(dir).unwrap();
+
+    // Same existing regression also exercises a crash after journal fsync
+    // and before Ledger append. Boot must project that exact source once.
+    let (dir,c,p,r,i,_e,path)=fixture("redemption-crash");
+    p.lock().unwrap().resolve("h1","no_fill",None).unwrap();
+    assert!(c.lock().unwrap().ledger.book_fill_ex(
+        "alpha","tok",0,10.0,0.4,0.0,None,"seed",false,
+    ).is_some());
+    let t=copybot_hot::ledger::now_secs()+1;
+    let source=Redemption{ts:t,..redemption};
+    let fact=copybot_hot::order_commit::MoneyCommit::Redeemed {
+        lane:"alpha".into(),token:"tok".into(),redemption:source,
+        shares:10.0,basis_cost:4.0,payout:1.0,proceeds:10.0,
+        zero_snapshot_as_of:t+1,ledger_t:t,
+    };
+    let journal=copybot_hot::order_commit::AtomicFakJournal::open(
+        dir.join("ctl.fak_commit")).unwrap();
+    journal.append_money(fact).unwrap();
+    drop(journal);
+    let recovered=open_fak_journal_for_live(true,&path,&c,&p,&r,&i).unwrap();
+    assert_eq!(c.lock().unwrap().ledger.lanes["alpha"].risk.realised_pnl,6.0);
+    assert_eq!(recovered.repair_money(&mut c.lock().unwrap().ledger,&p.lock().unwrap())
+        .unwrap().already_projected,1);
+    drop(recovered);
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[test]
@@ -386,17 +441,19 @@ fn neutral_custody_adjustment_needs_canonical_lease_and_no_pending() {
         owner.neutral_reconcile("alpha","tok",0,1.0,0.4)
     ).is_err(), "unresolved pending blocks independent custody adjustment");
     p.lock().unwrap().resolve("h1","no_fill",None).unwrap();
-    with_canonical_money(Some(&lease),&c,&p,|owner|
+    let refusal=with_canonical_money(Some(&lease),&c,&p,|owner|
         owner.neutral_reconcile("alpha","tok",0,1.0,0.4)
-    ).unwrap();
-    assert_eq!(c.lock().unwrap().ledger.holdings("alpha")["tok"],1.0);
+    ).unwrap_err();
+    assert!(refusal.contains("transactionHash") && refusal.contains("logIndex"));
+    assert!(c.lock().unwrap().ledger.holdings("alpha").get("tok").is_none());
+    assert!(lease.money_commits().unwrap().is_empty());
     assert!(with_canonical_money(None,&c,&p,|owner|
         owner.neutral_reconcile("alpha","tok",1,1.0,0.4)
     ).is_err(), "missing lease cannot release inventory");
     drop(lease);
     let replay=Ledger::new(dir.join("ledger.jsonl").to_str().unwrap(),
         &[("alpha".into(),RiskConfig::default())]);
-    assert_eq!(replay.holdings("alpha")["tok"],1.0);
+    assert!(replay.holdings("alpha").get("tok").is_none());
     std::fs::remove_dir_all(dir).unwrap();
 }
 

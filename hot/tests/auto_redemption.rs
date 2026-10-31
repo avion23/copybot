@@ -1,5 +1,7 @@
 use copybot_hot::{
     ledger::Ledger,
+    order_commit::AtomicFakJournal,
+    pending::PendingLog,
     positions::{Completeness, Positions},
     risk::RiskConfig,
     settlement::{self, Redemption},
@@ -9,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct Fixture {
     dir: std::path::PathBuf,
     ledger: Ledger,
+    journal: AtomicFakJournal,
 }
 impl Fixture {
     fn new() -> Self {
@@ -20,7 +23,8 @@ impl Fixture {
         ));
         std::fs::create_dir(&dir).unwrap();
         let ledger = Ledger::new(dir.join("ledger.jsonl").to_str().unwrap(), &cfgs());
-        Self { dir, ledger }
+        let journal = AtomicFakJournal::open(dir.join("money.jsonl")).unwrap();
+        Self { dir, ledger, journal }
     }
     fn buy(&mut self) {
         assert!(self.ledger.record_fill("test", "123", 0, 100.0, 0.4, 0.0));
@@ -28,7 +32,8 @@ impl Fixture {
     fn redemption(&self, payout: f64) -> Redemption {
         let now = copybot_hot::ledger::now_secs();
         let rows = serde_json::json!([{"type":"REDEEM", "asset":"123",
-            "conditionId":"synthetic-condition", "transactionHash":"synthetic-tx",
+            "conditionId":format!("0x{}", "b".repeat(64)),
+            "transactionHash":format!("0x{}", "a".repeat(64)),
             "outcomeIndex":0, "size":100.0, "usdcSize":100.0*payout, "timestamp":now}]);
         settlement::parse_redemptions(&rows).remove(0)
     }
@@ -45,7 +50,7 @@ fn cfgs() -> Vec<(String, RiskConfig)> {
     vec![("test".into(), RiskConfig::default())]
 }
 fn flat(r: &Redemption) -> Positions {
-    Positions::empty(r.ts)
+    Positions::empty(r.ts + 1)
 }
 fn assert_closed(f: &Fixture, pnl: f64) {
     assert!(f.ledger.holdings("test").is_empty());
@@ -63,12 +68,12 @@ fn smoke_buy_auto_redeem_empty_wallet_duplicate_and_restart() {
         assert_eq!(r.token(&["123".into(), "456".into()]), Some("123"));
         assert!(f
             .ledger
-            .settle_redeemed_open("test", "123", &r, &flat(&r), false)
+            .settle_redeemed_open("test", "123", &r, &flat(&r), false, &f.journal)
             .unwrap());
         assert_closed(&f, pnl);
         assert!(!f
             .ledger
-            .settle_redeemed_open("test", "123", &r, &flat(&r), false)
+            .settle_redeemed_open("test", "123", &r, &flat(&r), false, &f.journal)
             .unwrap());
         let raw = std::fs::read_to_string(&f.ledger.path).unwrap();
         assert_eq!(
@@ -84,7 +89,7 @@ fn smoke_buy_auto_redeem_empty_wallet_duplicate_and_restart() {
         assert_closed(&f, pnl);
         assert!(!f
             .ledger
-            .settle_redeemed_open("test", "123", &r, &flat(&r), false)
+            .settle_redeemed_open("test", "123", &r, &flat(&r), false, &f.journal)
             .unwrap());
         assert!(!f.ledger.record_realised_adjustment_tx(
             "test",
@@ -117,7 +122,7 @@ fn existing_settlement_poll_and_legacy_rows_cannot_be_credited_again() {
     assert!(!f.ledger.record_settlement("test", "123", 1.0));
     assert!(!f
         .ledger
-        .settle_redeemed_open("test", "123", &r, &flat(&r), false)
+        .settle_redeemed_open("test", "123", &r, &flat(&r), false, &f.journal)
         .unwrap());
     assert_closed(&f, 60.0);
     // Replay old keyless settlements and duplicate rows safely too.
@@ -159,7 +164,7 @@ fn incomplete_stale_malformed_nonzero_and_pending_evidence_do_not_close() {
     let mut partial = flat(&r);
     partial.completeness = Completeness::Truncated { pages: 1, cap: 1 };
     let mut stale = flat(&r);
-    stale.as_of -= 1;
+    stale.as_of -= 2;
     let mut held = flat(&r);
     held.rows = vec![serde_json::json!({"asset":"123","size":1.0})];
     let mut malformed = flat(&r);
@@ -167,12 +172,12 @@ fn incomplete_stale_malformed_nonzero_and_pending_evidence_do_not_close() {
     for snap in [failed, partial, stale, held, malformed] {
         assert!(f
             .ledger
-            .settle_redeemed_open("test", "123", &r, &snap, false)
+            .settle_redeemed_open("test", "123", &r, &snap, false, &f.journal)
             .is_err());
     }
     assert!(f
         .ledger
-        .settle_redeemed_open("test", "123", &r, &flat(&r), true)
+        .settle_redeemed_open("test", "123", &r, &flat(&r), true, &f.journal)
         .is_err());
     assert_eq!(f.ledger.holdings("test")["123"], 100.0);
     assert_eq!(f.ledger.lanes["test"].risk.realised_pnl, 0.0);
@@ -204,14 +209,14 @@ fn ambiguous_amount_time_token_and_pooled_claim_are_deferred() {
     for bad in [partial, old, wrong, aggregate, invalid] {
         assert!(f
             .ledger
-            .settle_redeemed_open("test", "123", &bad, &flat(&r), false)
+            .settle_redeemed_open("test", "123", &bad, &flat(&r), false, &f.journal)
             .is_err());
     }
     f.ledger.ensure_lane("second", RiskConfig::default());
     assert!(f.ledger.record_fill("second", "123", 0, 10.0, 0.4, 0.0));
     assert!(f
         .ledger
-        .settle_redeemed_open("test", "123", &r, &flat(&r), false)
+        .settle_redeemed_open("test", "123", &r, &flat(&r), false, &f.journal)
         .is_err());
     assert_eq!(f.ledger.holdings("test")["123"], 100.0);
 }
@@ -225,7 +230,7 @@ fn failed_write_keeps_holdings_and_pnl_and_does_not_consume_dedupe_key() {
     f.ledger.path = f.dir.to_string_lossy().into_owned(); // opening directory for append fails
     assert!(f
         .ledger
-        .settle_redeemed_open("test", "123", &r, &flat(&r), false)
+        .settle_redeemed_open("test", "123", &r, &flat(&r), false, &f.journal)
         .is_err());
     assert!(!f.ledger.record_settlement("test", "123", 1.0));
     assert_eq!(
@@ -237,7 +242,7 @@ fn failed_write_keeps_holdings_and_pnl_and_does_not_consume_dedupe_key() {
     f.ledger.path = original;
     assert!(f
         .ledger
-        .settle_redeemed_open("test", "123", &r, &flat(&r), false)
+        .settle_redeemed_open("test", "123", &r, &flat(&r), false, &f.journal)
         .unwrap());
     f.reload();
     assert_closed(&f, 60.0);
@@ -276,7 +281,7 @@ fn partial_neutral_release_does_not_strand_unbooked_basis() {
     f.ledger.record_recon_fill("test", "123", 1, 25.0, 0.4, 0.0);
     assert!(f
         .ledger
-        .settle_redeemed_open("test", "123", &r, &flat(&r), false)
+        .settle_redeemed_open("test", "123", &r, &flat(&r), false, &f.journal)
         .unwrap_err()
         .contains("neutral reconciliation release"));
     assert_eq!(f.ledger.holdings("test")["123"], 75.0);
@@ -291,34 +296,32 @@ fn partial_neutral_release_does_not_strand_unbooked_basis() {
 }
 
 #[test]
-fn legacy_full_release_correction_still_books_once_after_restart() {
+fn confirmed_release_correction_uses_one_journal_source_after_restart() {
     let mut f = Fixture::new();
     f.buy();
-    let r = f.redemption(1.0);
-    f.ledger
-        .record_recon_fill("test", "123", 1, 100.0, 0.4, 0.0);
+    // A historical neutral release is test state, not new custody evidence.
+    assert!(f.ledger.record_recon_fill("test", "123", 1, 100.0, 0.4, 0.0));
     assert_closed(&f, 0.0);
-    assert!(f.ledger.record_realised_adjustment_tx(
-        "test",
-        "123",
-        100.0,
-        100.0,
-        0.4,
-        "legacy neutral release",
-        &r.lane_key("test")
-    ));
+    let r = f.redemption(1.0);
+    let snapshot = flat(&r);
+    let pending = PendingLog::open(f.dir.join("pending.jsonl").to_str().unwrap());
+    let correct = |ledger: &mut Ledger, journal: &AtomicFakJournal| {
+        let mut owner = copybot_hot::order_state_owner::CanonicalMoneyOwner::new(
+            journal, ledger, &pending,
+        ).unwrap();
+        owner.correct_redeemed_release(
+            "test", "123", 100.0, 100.0, 0.4, &r, &snapshot, false,
+        )
+    };
+    assert_eq!(correct(&mut f.ledger, &f.journal).unwrap(), true);
+    assert_eq!(f.journal.money_commits().unwrap().len(), 1);
     assert_closed(&f, 60.0);
+    assert_eq!(correct(&mut f.ledger, &f.journal).unwrap(), false);
     f.reload();
     assert_closed(&f, 60.0);
-    assert!(!f.ledger.record_realised_adjustment_tx(
-        "test",
-        "123",
-        100.0,
-        100.0,
-        0.4,
-        "duplicate",
-        &r.lane_key("test")
-    ));
+    assert_eq!(f.journal.repair_money(&mut f.ledger, &pending).unwrap().already_projected, 1);
+    assert_eq!(correct(&mut f.ledger, &f.journal).unwrap(), false);
+    assert_eq!(f.journal.money_commits().unwrap().len(), 1);
     assert_closed(&f, 60.0);
 }
 
@@ -361,13 +364,13 @@ async fn http_smoke_empty_portfolio_closes_but_http_failure_does_not() {
             "synthetic-wallet",
             "0",
             "&includeArchived=true",
-            r.ts,
+            r.ts + 1,
         )
         .await;
         server.await.unwrap();
         let result = f
             .ledger
-            .settle_redeemed_open("test", "123", &r, &snapshot, false);
+            .settle_redeemed_open("test", "123", &r, &snapshot, false, &f.journal);
         if expected {
             assert!(result.unwrap());
             f.reload();

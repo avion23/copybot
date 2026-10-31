@@ -103,11 +103,10 @@ impl<'a> OrderStateOwner<'a> {
 }
 
 
-/// Live-state money authority. Every remaining ledger-only payout, merge and
-/// neutral custody correction must hold the SAME process-exclusive journal
-/// lease and the same Control/PendingLog mutex pair as witnessed FAK booking.
-/// Ledger's one fsynced keyed event is the durable payout/merge fact; a
-/// pending order is NEVER released by these operations.
+/// Live-state money authority: the SAME journal lease and Control/Pending
+/// locks guard FAK, redemption, correction and native-merge writers.
+/// Redemption and correction commit immutable source money to this journal
+/// before projecting to Ledger; unproved neutral drift is never booked.
 /// A FAK has one witnessed terminal HTTP match with two amount legs and an
 /// explicit fee; GTC may rest and fill repeatedly without cumulative fee
 /// evidence in our current venue client. Never submit what we cannot book.
@@ -151,34 +150,51 @@ impl<'a> CanonicalMoneyOwner<'a> {
         // A confirmed redemption creates ONE keyed, fsynced ledger event.
         // No independent PendingLog resolution or invented fee is permitted.
         self.ledger.settle_redeemed_open(
-            lane, token, redemption, snapshot, stale,
+            lane, token, redemption, snapshot, stale, self._lease,
         )
     }
     #[allow(clippy::too_many_arguments)]
     pub fn correct_redeemed_release(
         &mut self, lane: &str, token: &str, shares: f64,
-        proceeds: f64, avg_cost: f64, key: &str,
-        redemption_t: i64,
+        proceeds: f64, avg_cost: f64,
+        redemption: &crate::settlement::Redemption,
+        snapshot: &crate::positions::Positions, stale: bool,
     ) -> Result<bool, String> {
         self.no_pending(token)?;
-        if key.is_empty() || !shares.is_finite() || shares <= 0.0
-            || !proceeds.is_finite() || proceeds < 0.0
-            || !avg_cost.is_finite() || avg_cost < 0.0
-            || redemption_t <= 0
+        let key = redemption.lane_key(lane);
+        if self.ledger.has_money_key(lane, &key)
+            || self.ledger.has_money_key(lane, &crate::settlement::cross_writer_key(lane,token))
         {
-            return Err("redemption correction identity or amounts unprovable".into());
+            return Ok(false);
+        }
+        if !redemption.is_bookable() || redemption.asset != token || stale
+            || !snapshot.confirms_zero(token, redemption.ts)
+            || !shares.is_finite() || shares <= 0.0 || shares > redemption.size + 1e-6
+            || !proceeds.is_finite() || proceeds < 0.0
+            || (proceeds - shares * redemption.usdc / redemption.size).abs() > 1e-7
+            || !avg_cost.is_finite() || avg_cost < 0.0
+        {
+            return Err("redemption correction lacks matching source, amount or complete zero snapshot".into());
         }
         let previous = self.ledger.last_recon_release(lane, token, 0)
             .ok_or_else(|| "no durable neutral release to correct".to_string())?;
-        if previous.0 + 1e-6 < shares || previous.2 > redemption_t
+        if previous.0 + 1e-6 < shares || previous.2 > redemption.ts
             || (previous.1 - avg_cost).abs() > 1e-6
         {
             return Err("redemption correction does not match prior durable release".into());
         }
-        Ok(self.ledger.record_realised_adjustment_tx(
-            lane, token, shares, proceeds, avg_cost,
-            "redemption corroborated neutral share release", key,
-        ))
+        let commit = crate::order_commit::MoneyCommit::Correction {
+            lane: lane.into(), token: token.into(), redemption: redemption.clone(),
+            shares, proceeds, avg_cost, neutral_release_t: previous.2,
+            zero_snapshot_as_of: snapshot.as_of, ledger_t: crate::ledger::now_secs(),
+        };
+        self._lease.append_money(commit.clone())
+            .map_err(|e| format!("redemption correction journal refused: {e:?}"))?;
+        if !self.ledger.apply(&commit.ledger_row(), true) {
+            self.ledger.last_write_error = Some("journaled correction Ledger projection refused".into());
+            return Err("redemption correction projection failed; journal liability retained".into());
+        }
+        Ok(true)
     }
     pub fn neutral_reconcile(
         &mut self, lane: &str, token: &str, side: u8,
@@ -195,10 +211,12 @@ impl<'a> CanonicalMoneyOwner<'a> {
         {
             return Err("neutral release exceeds proven ledger inventory".into());
         }
-        if !self.ledger.record_recon_fill(lane, token, side, shares, price, 0.0) {
-            return Err("neutral custody correction could not be fsynced".into());
-        }
-        Ok(())
+        // Portfolio drift is a balance observation, not a single causal
+        // custody transfer. The caller supplies neither a verified chain
+        // transaction hash/log index nor an unambiguous lane attribution.
+        // Do not invent an append/replay key from the poll time or share count.
+        let _ = (lane, token, side, shares, price);
+        Err("neutral custody unresolved: missing verified transactionHash, logIndex, exact token/share direction and single-lane basis attribution".into())
     }
     #[allow(clippy::too_many_arguments)]
     pub fn merge_pair(

@@ -236,7 +236,7 @@ pub(crate) fn open_fak_journal_for_live(
     let path = format!("{control_path}.fak_commit");
     let result = copybot_hot::order_commit::AtomicFakJournal::open(&path)
         .and_then(|journal| {
-            let repaired = {
+            let (repaired, repaired_money) = {
                 let mut ctl = control.lock().map_err(|_| {
                     copybot_hot::order_commit::JournalRefusal::Unsafe(
                         "ledger owner mutex poisoned".into(),
@@ -247,14 +247,17 @@ pub(crate) fn open_fak_journal_for_live(
                         "pending owner mutex poisoned".into(),
                     )
                 })?;
-                journal.repair_legacy(&mut ctl.ledger, &mut pend)
-            }?;
-            Ok((journal, repaired))
+                let fak = journal.repair_legacy(&mut ctl.ledger, &mut pend)?;
+                let money = journal.repair_money(&mut ctl.ledger, &pend)?;
+                (fak, money)
+            };
+            Ok((journal, repaired, repaired_money))
         });
     match result {
-        Ok((journal, repaired)) => {
-            eprintln!("[fak_owner] boot replay: {} fills, {} closed, {} already closed",
-                repaired.fills_booked, repaired.pending_closed, repaired.already_closed);
+        Ok((journal, repaired, money)) => {
+            eprintln!("[money_owner] boot replay: {} FAK fills, {} pending closed, {} already closed; {} redemptions/corrections projected, {} already projected",
+                repaired.fills_booked, repaired.pending_closed, repaired.already_closed,
+                money.projected, money.already_projected);
             Some(Arc::new(journal))
         }
         Err(error) => {
@@ -565,7 +568,9 @@ older history is not covered and may require offline reconciliation"
                         let written = with_canonical_money(
                             money_lease.as_ref(), &ctl, &settlement_pending,
                             |owner| owner.correct_redeemed_release(
-                                name, tok, shares, proceeds, avg_cost, &key, r.ts,
+                                name, tok, shares, proceeds, avg_cost, r,
+                                &settlement_snapshot,
+                                copybot_hot::ledger::now_secs() - settlement_snapshot.as_of > 120,
                             ),
                         );
                         if !matches!(written, Ok(true)) {

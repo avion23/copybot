@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy)]
 pub struct PositionView {
     pub redeemable: bool,
@@ -9,7 +9,7 @@ pub fn resolved_payout(pos: PositionView) -> Option<f64> {
         Some(pos.cur_price)
     } else { None }
 }
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Redemption {
     #[serde(rename = "transactionHash", default)]
     pub tx: String,

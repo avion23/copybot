@@ -335,6 +335,7 @@ impl Ledger {
         redemption: &crate::settlement::Redemption,
         snapshot: &crate::positions::Positions,
         pending: bool,
+        journal: &crate::order_commit::AtomicFakJournal,
     ) -> Result<bool, String> {
         let key = redemption.lane_key(lane);
         let alt_key = crate::settlement::cross_writer_key(lane, token);
@@ -380,13 +381,29 @@ impl Ledger {
         let row = serde_json::json!({
             "ev": "settle", "lane": lane, "token": token,
             "payout": redemption.usdc / redemption.size,
-            "shares": pos.shares, "proceeds": pos.shares * redemption.usdc / redemption.size,
+            "shares": pos.shares, "basis_cost": pos.cost,
+            "proceeds": pos.shares * redemption.usdc / redemption.size,
             "key": key, "alt_key": alt_key, "redemption_tx": redemption.tx,
-            "redemption_t": redemption.ts, "t": now_secs(),
+            "redemption_t": redemption.ts, "zero_snapshot_as_of": snapshot.as_of,
+            "t": now_secs(),
             "why": "auto-redemption confirmed by activity and complete zero-balance snapshot"
         });
+        let fact = crate::order_commit::MoneyCommit::Redeemed {
+            lane: lane.into(), token: token.into(), redemption: redemption.clone(),
+            shares: pos.shares, basis_cost: pos.cost,
+            payout: redemption.usdc / redemption.size,
+            proceeds: pos.shares * redemption.usdc / redemption.size,
+            zero_snapshot_as_of: snapshot.as_of,
+            ledger_t: row["t"].as_i64().ok_or("missing ledger source time")?,
+        };
+        if fact.ledger_row() != row {
+            return Err("redemption journal projection differs from Ledger money".into());
+        }
+        journal.append_money(fact)
+            .map_err(|e| format!("redemption money journal refused: {e:?}"))?;
         if !self.apply(&row, true) {
-            return Err("settlement ledger write failed or settlement already recorded".into());
+            self.last_write_error = Some("journaled settlement Ledger projection refused".into());
+            return Err("settlement ledger projection failed; journal liability retained".into());
         }
         Ok(true)
     }
@@ -491,7 +508,10 @@ impl Ledger {
         }
         found
     }
-    fn apply(&mut self, row: &serde_json::Value, durable: bool) -> bool {
+    pub(crate) fn has_money_key(&self, lane: &str, key: &str) -> bool {
+        self.settlement_keys.contains(&(lane.to_string(), key.to_string()))
+    }
+    pub(crate) fn apply(&mut self, row: &serde_json::Value, durable: bool) -> bool {
         let lane_name = row["lane"].as_str().unwrap_or("");
         let ev = row["ev"].as_str().unwrap_or("");
         let token = row["token"].as_str().unwrap_or("").to_string();

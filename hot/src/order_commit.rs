@@ -25,6 +25,9 @@ const ONE: f64 = 1_000_000.0;
 const MAX_EXACT_MICROS: u64 = (1u64 << 53) - 1;
 // Generated as hexadecimal zeroes, never as an on-chain address/identity.
 const GENESIS_DIGIT: &str = "0";
+#[path = "order_commit_money.rs"]
+mod money;
+pub use money::{MoneyCommit, MoneyRepairCount};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,7 +137,10 @@ struct Frame {
     version: u8,
     seq: u64,
     previous_checksum: String,
-    commit: FakFillCommit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit: Option<FakFillCommit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    money: Option<MoneyCommit>,
     checksum: String,
 }
 fn checksum(seq: u64, previous: &str, commit: &FakFillCommit) -> Result<String, JournalRefusal> {
@@ -150,6 +156,8 @@ struct State {
     writer: File,
     frames: Vec<FakFillCommit>,
     hashes: HashMap<String, FakFillCommit>,
+    money_frames: Vec<MoneyCommit>,
+    money_keys: HashMap<String, MoneyCommit>,
     sequence: u64,
     last_checksum: String,
     poisoned: bool,
@@ -282,6 +290,8 @@ impl AtomicFakJournal {
         }
         let mut frames = Vec::new();
         let mut hashes = HashMap::new();
+        let mut money_frames = Vec::new();
+        let mut money_keys = HashMap::new();
         let mut prev = GENESIS_DIGIT.repeat(64);
         let mut seq = 0u64;
         // Every newline delimits exactly one committed frame. In particular,
@@ -294,9 +304,14 @@ impl AtomicFakJournal {
             }
             let row: Frame = serde_json::from_slice(raw)
                 .map_err(|_| JournalRefusal::Corrupt { line, reason: "invalid JSON frame" })?;
-            row.commit.validate().map_err(|_| JournalRefusal::Corrupt {
-                line, reason: "invalid or unproved money fields",
-            })?;
+            if row.commit.is_some() == row.money.is_some() {
+                return Err(JournalRefusal::Corrupt { line, reason: "one monetary event per frame required" });
+            }
+            if let Some(c) = &row.commit { c.validate() }
+            else { row.money.as_ref().expect("checked variant").validate() }
+                .map_err(|_| JournalRefusal::Corrupt {
+                    line, reason: "invalid or unproved money fields",
+                })?;
             let expected = seq.checked_add(1).ok_or(JournalRefusal::Corrupt {
                 line, reason: "sequence overflow",
             })?;
@@ -305,26 +320,40 @@ impl AtomicFakJournal {
                     line, reason: "sequence, version or hash chain mismatch",
                 });
             }
-            let correct = checksum(expected, &prev, &row.commit)?;
+            let correct = match (&row.commit, &row.money) {
+                (Some(c), None) => checksum(expected, &prev, c)?,
+                (None, Some(m)) => money::money_checksum(expected, &prev, m)?,
+                _ => unreachable!("checked exclusive monetary event"),
+            };
             if row.checksum != correct {
                 return Err(JournalRefusal::Corrupt { line, reason: "checksum mismatch" });
             }
-            if hashes.insert(row.commit.order_hash.clone(), row.commit.clone()).is_some() {
-                return Err(JournalRefusal::Corrupt {
-                    line, reason: "duplicate order digest was appended to disk",
-                });
+            if let Some(c) = row.commit {
+                if hashes.insert(c.order_hash.clone(), c.clone()).is_some() {
+                    return Err(JournalRefusal::Corrupt {
+                        line, reason: "duplicate order digest was appended to disk",
+                    });
+                }
+                frames.push(c);
+            }
+            if let Some(m) = row.money {
+                if money_keys.insert(m.key(), m.clone()).is_some() {
+                    return Err(JournalRefusal::Corrupt {
+                        line, reason: "duplicate redemption source was appended to disk",
+                    });
+                }
+                money_frames.push(m);
             }
             prev = correct;
             seq = expected;
-            frames.push(row.commit);
         }
         Ok(Self {
             path, lease_path,
             state: Mutex::new(State {
                 #[cfg(unix)]
                 _process_lease: process_lease,
-                writer, frames, hashes, sequence: seq,
-                last_checksum: prev, poisoned: false,
+                writer, frames, hashes, money_frames, money_keys,
+                sequence: seq, last_checksum: prev, poisoned: false,
             }),
         })
     }
@@ -373,7 +402,7 @@ impl AtomicFakJournal {
         let hash = checksum(seq, &previous_checksum, &commit)?;
         let row = Frame {
             version: VERSION, seq, previous_checksum,
-            commit: commit.clone(), checksum: hash.clone(),
+            commit: Some(commit.clone()), money: None, checksum: hash.clone(),
         };
         let mut encoded = serde_json::to_vec(&row)
             .map_err(|e| JournalRefusal::Io(format!("encode frame: {e}")))?;
