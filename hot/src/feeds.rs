@@ -272,6 +272,7 @@ pub fn spawn_all(
 ) -> (Vec<tokio::task::JoinHandle<()>>, FeedRegistry) {
     let mut handles = Vec::new();
     let mut per = std::collections::HashMap::new();
+    let shared = Arc::new(std::sync::Mutex::new(crate::leader_recovery::SharedLeaderLogs::default()));
     for f in feeds {
         for i in 0..f.sockets {
             let name = format!("{}{}", f.name, i);
@@ -285,10 +286,11 @@ pub fn spawn_all(
             let tx = tx.clone();
             let watched = watched.clone();
             let channel = FeedChannel::from_name(&f.name);
+            let shared = shared.clone();
             handles
                 .push(
                     tokio::spawn(async move {
-                        run_socket(name, url, tx, sink, watched, channel).await;
+                        run_socket(name, url, tx, sink, watched, channel, shared).await;
                     }),
                 );
         }
@@ -300,7 +302,7 @@ pub fn spawn_all(
         .find(|f|FeedChannel::from_name(&f.name)==FeedChannel::LeaderOrderFilledLogs) {
         let provider=provider.url.clone();
         handles.push(tokio::spawn(crate::leader_recovery::corroborate_data_api(
-            provider,tx,watched,
+            provider,tx,watched,shared,
         )));
     }
     (handles, FeedRegistry { per, total })
@@ -323,6 +325,7 @@ async fn run_socket(
     stats: StatsSink,
     watched: Arc<WatchedAddresses>,
     channel: FeedChannel,
+    shared: crate::leader_recovery::SharedSeen,
 ) {
     const HEALTHY_SESSION: Duration = Duration::from_secs(60);
     let mut consecutive_failures: u32 = 0;
@@ -334,7 +337,7 @@ async fn run_socket(
             FeedChannel::PendingTransactions => pump(&name, &url, &tx, &stats, watched.clone()).await,
             FeedChannel::LeaderOrderFilledLogs => {
                 crate::leader_recovery::pump_leader_logs(&name, &url, &tx, &stats, watched.clone(),
-                    &mut recovery).await
+                    &mut recovery, &shared).await
             }
         };
         let ran = started.elapsed();
