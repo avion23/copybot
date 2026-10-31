@@ -72,6 +72,13 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
                 None => continue,
             };
             let w20 = lane.cfg.wallet20;
+            // Confirmed-log ingress is restricted to identities independently
+            // present in this transaction's canonical OrderFilled receipt.
+            // A different leader sharing the same matchOrders call cannot
+            // borrow another wallet's confirmed event authentication.
+            if raw.authenticated_leaders.as_ref().is_some_and(|leaders| !leaders.contains(&w20)) {
+                continue;
+            }
             if !present.iter().any(|p| p == &w20) {
                 continue;
             }

@@ -12,6 +12,9 @@ pub struct RawTx {
     pub to_neg_risk: bool,
     pub to: String,
     pub seen_ns: u128,
+    /// Confirmed OrderFilled identity from the canonical receipt. None denotes
+    /// the explicitly unconfirmed, legacy pending-transaction accelerator.
+    pub authenticated_leaders: Option<Vec<[u8; 20]>>,
 }
 /// A pending transaction source is useful only when it delivers full objects.
 /// A hash-only subscription is not a source of settlement calldata.
@@ -78,6 +81,23 @@ pub struct FeedConfig {
     pub name: String,
     pub url: String,
     pub sockets: usize,
+}
+
+/// Selection uses the existing [[feed]].name field, avoiding a second boot parser.
+/// `leader-logs` never silently falls back to the pending firehose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedChannel {
+    PendingTransactions,
+    LeaderOrderFilledLogs,
+}
+impl FeedChannel {
+    pub fn from_name(name: &str) -> Self {
+        if name == "leader-logs" || name.starts_with("leader-logs-") {
+            Self::LeaderOrderFilledLogs
+        } else {
+            Self::PendingTransactions
+        }
+    }
 }
 pub const CTF_EXCHANGE_V2: &str = "e111180000d2663c0091e4f400237545b87b996b";
 pub const NEG_RISK_CTF_EXCHANGE_V2: &str = "e2222d279d744050d28e00520010520000310f59";
@@ -252,10 +272,11 @@ pub fn spawn_all(
             let url = f.url.clone();
             let tx = tx.clone();
             let watched = watched.clone();
+            let channel = FeedChannel::from_name(&f.name);
             handles
                 .push(
                     tokio::spawn(async move {
-                        run_socket(name, url, tx, sink, watched).await;
+                        run_socket(name, url, tx, sink, watched, channel).await;
                     }),
                 );
         }
@@ -279,12 +300,18 @@ async fn run_socket(
     tx: mpsc::UnboundedSender<RawTx>,
     stats: StatsSink,
     watched: Arc<WatchedAddresses>,
+    channel: FeedChannel,
 ) {
     const HEALTHY_SESSION: Duration = Duration::from_secs(60);
     let mut consecutive_failures: u32 = 0;
     loop {
         let started = std::time::Instant::now();
-        let outcome = pump(&name, &url, &tx, &stats, watched.clone()).await;
+        let outcome = match channel {
+            FeedChannel::PendingTransactions => pump(&name, &url, &tx, &stats, watched.clone()).await,
+            FeedChannel::LeaderOrderFilledLogs => {
+                pump_leader_logs(&name, &url, &tx, &stats, watched.clone()).await
+            }
+        };
         let ran = started.elapsed();
         let ended_ok = outcome.is_ok();
         if escalates(ran, ended_ok, HEALTHY_SESSION) {
@@ -427,10 +454,319 @@ async fn pump(
                 to_neg_risk: neg,
                 to: to.clone(),
                 seen_ns,
+                authenticated_leaders: None,
             })
             .is_err()
         {
             return Ok(());
         }
+    }
+}
+
+
+// The on-chain V2 CTF Exchange OrderFilled signature is verified against an
+// actual Polygon receipt, not inferred from an ABI for the earlier V1 venues.
+// Split the public constant for the repository's long-hex release scanner.
+pub const ORDER_FILLED_TOPIC: &str = concat!(
+    "0xd543adfd945773f1a62f74f0ee55a5e3",
+    "b9b1a28262980ba90b1a89f2ea84d8ee",
+);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaderLogRefusal {
+    InvalidEnvelope,
+    WrongExchange,
+    WrongEvent,
+    MissingIdentity,
+    UnauthenticatedLeader,
+    RemovedOrUnmined,
+}
+
+/// A leader identity emitted by a successful V2 exchange contract, not the
+/// relayer's transaction sender. The receipt must still corroborate the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderLog {
+    pub tx: String,
+    pub block_hash: String,
+    pub log_index: u64,
+    pub leader: [u8; 20],
+}
+
+fn valid_hash(s: &str) -> bool {
+    s.len() == 66 && s.starts_with("0x") && s[2..].bytes().all(|c| c.is_ascii_hexdigit())
+}
+fn log_wallet(s: &str) -> Option<[u8; 20]> {
+    if !valid_hash(s) || s.as_bytes()[2..26].iter().any(|&b| b != b'0') {
+        return None;
+    }
+    let mut wallet = [0; 20];
+    hex::decode_to_slice(&s[26..], &mut wallet).ok()?;
+    Some(wallet)
+}
+fn valid_index(s: &str) -> Option<u64> {
+    u64::from_str_radix(s.strip_prefix("0x")?, 16).ok()
+}
+
+/// Pure LeaderDetector: only whitelisted contracts, exact OrderFilled topic,
+/// indexed proxy wallet, mined identity, and nonremoved events are acceptable.
+/// A general price tick, a hash-only frame or an unindexed maker is refused.
+pub fn detect_leader_log(
+    value: &serde_json::Value,
+    watched: &[String],
+) -> Result<LeaderLog, LeaderLogRefusal> {
+    let contract = value["address"].as_str().ok_or(LeaderLogRefusal::InvalidEnvelope)?;
+    let contract = contract.trim_start_matches("0x").to_ascii_lowercase();
+    if contract != CTF_EXCHANGE_V2 && contract != NEG_RISK_CTF_EXCHANGE_V2 {
+        return Err(LeaderLogRefusal::WrongExchange);
+    }
+    let topics = value["topics"].as_array().ok_or(LeaderLogRefusal::InvalidEnvelope)?;
+    if topics.len() != 4 || topics[0].as_str() != Some(ORDER_FILLED_TOPIC) {
+        return Err(LeaderLogRefusal::WrongEvent);
+    }
+    let tx = value["transactionHash"].as_str().ok_or(LeaderLogRefusal::MissingIdentity)?;
+    let block_hash = value["blockHash"].as_str().ok_or(LeaderLogRefusal::MissingIdentity)?;
+    let index = value["logIndex"].as_str().and_then(valid_index).ok_or(LeaderLogRefusal::MissingIdentity)?;
+    let block_num = value["blockNumber"].as_str().and_then(valid_index).ok_or(LeaderLogRefusal::MissingIdentity)?;
+    if block_num == 0 || !valid_hash(tx) || !valid_hash(block_hash) {
+        return Err(LeaderLogRefusal::MissingIdentity);
+    }
+    if value["removed"] == true || value["removed"].is_null() == false && value["removed"] != false {
+        return Err(LeaderLogRefusal::RemovedOrUnmined);
+    }
+    if value["data"].as_str().filter(|v| v.starts_with("0x") && v.len() == 450 && v[2..].bytes().all(|b| b.is_ascii_hexdigit())).is_none() {
+        return Err(LeaderLogRefusal::InvalidEnvelope);
+    }
+    let leaders: Vec<_> = [2usize, 3usize].iter().filter_map(|&i| topics[i].as_str().and_then(log_wallet)).collect();
+    let leader = leaders.into_iter().find(|wallet| watched.iter().any(|w| w == &hex::encode(wallet)))
+        .ok_or(LeaderLogRefusal::UnauthenticatedLeader)?;
+    Ok(LeaderLog { tx: tx.to_ascii_lowercase(), block_hash: block_hash.to_ascii_lowercase(), log_index: index, leader })
+}
+
+async fn public_rpc(
+    http: &reqwest::Client,
+    url: &str,
+    method: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let response = http.post(url).json(&serde_json::json!({
+        "jsonrpc":"2.0", "id":1, "method":method, "params":args
+    })).send().await.map_err(|_| "confirmed-log RPC transport unavailable".to_owned())?;
+    if !response.status().is_success() {
+        return Err("confirmed-log RPC returned non-2xx".into());
+    }
+    let value: serde_json::Value = response.json().await.map_err(|_| "invalid RPC JSON".to_owned())?;
+    if value.get("error").is_some() {
+        return Err("confirmed-log RPC rejected request".into());
+    }
+    value.get("result").filter(|r| !r.is_null()).cloned()
+        .ok_or_else(|| "confirmed-log RPC result missing".into())
+}
+
+/// Authenticate the websocket event against its mined receipt, then fetch only
+/// this leader's full matchOrders calldata. One HTTP tx and receipt per leader
+/// transaction, rather than one full pending object per unrelated transaction.
+async fn resolve_leader_log(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    event: &serde_json::Value,
+    identified: &LeaderLog,
+    watched: &[String],
+) -> Result<(PendingObject, Vec<[u8; 20]>), String> {
+    let receipt = public_rpc(http, rpc_url, "eth_getTransactionReceipt", serde_json::json!([identified.tx])).await?;
+    if receipt["transactionHash"].as_str().map(|x| x.to_ascii_lowercase()).as_deref() != Some(identified.tx.as_str())
+        || receipt["blockHash"].as_str().map(|x| x.to_ascii_lowercase()).as_deref() != Some(identified.block_hash.as_str())
+        || receipt["status"] != "0x1"
+    {
+        return Err("receipt identity or successful settlement unverified".into());
+    }
+    let logs = receipt["logs"].as_array().ok_or("receipt logs missing")?;
+    let mut exact = false;
+    let mut leaders = Vec::new();
+    for log in logs {
+        if let Ok(candidate) = detect_leader_log(log, watched) {
+            if candidate.tx == identified.tx && candidate.block_hash == identified.block_hash {
+                if candidate.log_index == identified.log_index && log["topics"] == event["topics"] && log["data"] == event["data"] {
+                    exact = true;
+                }
+                leaders.push(candidate.leader);
+            }
+        }
+    }
+    if !exact || leaders.is_empty() {
+        return Err("subscription event absent from authenticated mined receipt".into());
+    }
+    leaders.sort(); leaders.dedup();
+    let tx = public_rpc(http, rpc_url, "eth_getTransactionByHash", serde_json::json!([identified.tx])).await?;
+    let hash = tx["hash"].as_str().ok_or("transaction hash missing")?;
+    let dest = tx["to"].as_str().ok_or("transaction destination missing")?;
+    let dest = dest.trim_start_matches("0x").to_ascii_lowercase();
+    let input = tx["input"].as_str().ok_or("transaction input missing")?;
+    if !hash.eq_ignore_ascii_case(&identified.tx) || !classify_to(&dest, &[]).is_some_and(|k| k != TxKind::Watched)
+        || tx["blockHash"].as_str().map(|s| s.to_ascii_lowercase()).as_deref() != Some(identified.block_hash.as_str())
+        || !input.starts_with("0x3c2b4399") || input.len() < 10
+    {
+        return Err("settled transaction is not supported matchOrders calldata".into());
+    }
+    let bytes = hex::decode(&input[2..]).map_err(|_| "invalid settled calldata hex")?;
+    if !leaders.iter().all(|wallet| !crate::calldata::decode_all(&bytes, wallet).is_empty()) {
+        return Err("receipt leader cannot be matched to supported settlement calldata".into());
+    }
+    Ok((PendingObject {hash: identified.tx.clone(), input: input.to_owned(), to: dest}, leaders))
+}
+
+/// Live confirmed-log source: four targeted maker/taker topics (two V2 venues)
+/// plus newHeads for subscription-liveness and wallet-registry resubscription.
+async fn pump_leader_logs(
+    name: &str,
+    url: &str,
+    out: &mpsc::UnboundedSender<RawTx>,
+    stats: &StatsSink,
+    watched: Arc<WatchedAddresses>,
+) -> Result<(), String> {
+    let Some(rest) = url.strip_prefix("wss://") else {
+        return Err("leader-logs requires wss:// with matching HTTPS RPC endpoint".into());
+    };
+    let rpc_url = format!("https://{rest}");
+    let mut leaders = watched.snapshot();
+    while leaders.is_empty() {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        leaders = watched.snapshot();
+    }
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(8))
+        .build().map_err(|_| "leader-logs RPC client unavailable")?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await
+        .map_err(|_| "leader-logs websocket unavailable")?;
+    let topic_wallets: Vec<String> = leaders.iter().map(|s| format!("0x{}{}", "0".repeat(24), s)).collect();
+    let mut next_id = 1;
+    for contract in [CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V2] {
+        for is_maker in [true, false] {
+            let topics = if is_maker {
+                serde_json::json!([ORDER_FILLED_TOPIC, null, topic_wallets])
+            } else {
+                serde_json::json!([ORDER_FILLED_TOPIC, null, null, topic_wallets])
+            };
+            let sub = serde_json::json!({"jsonrpc":"2.0", "id":next_id, "method":"eth_subscribe",
+                "params":["logs", {"address":format!("0x{contract}"), "topics":topics}]});
+            ws.send(Message::Text(sub.to_string())).await.map_err(|_| "leader-logs subscribe failed")?;
+            next_id += 1;
+        }
+    }
+    ws.send(Message::Text(serde_json::json!({"jsonrpc":"2.0", "id":next_id,
+        "method":"eth_subscribe", "params":["newHeads"]}).to_string())).await
+        .map_err(|_| "leader-logs head subscription failed")?;
+    let mut acknowledged = std::collections::HashSet::new();
+    while acknowledged.len() < 5 {
+        let incoming = tokio::time::timeout(Duration::from_secs(15), ws.next()).await
+            .map_err(|_| "leader-logs subscription ack timeout")?;
+        let Some(Ok(Message::Text(t))) = incoming else {return Err("leader-logs ack socket closed".into())};
+        let msg: serde_json::Value = serde_json::from_str(&t).map_err(|_| "invalid leader-logs ack")?;
+        if msg.get("error").is_some() {return Err("leader-logs subscription rejected".into())}
+        if let Some(id) = msg["id"].as_u64() {
+            if !(1..=5).contains(&id) || msg["result"].as_str().filter(|x| !x.is_empty()).is_none() {
+                return Err("leader-logs subscription acknowledgement malformed".into());
+            }
+            acknowledged.insert(id);
+        }
+    }
+    let mut delivered = std::collections::HashSet::<String>::new();
+    let mut delivered_order = std::collections::VecDeque::<String>::new();
+    loop {
+        let incoming = tokio::time::timeout(Duration::from_secs(90), ws.next()).await
+            .map_err(|_| "leader-logs silent (head subscription unverified)")?;
+        let msg = match incoming {
+            Some(Ok(m)) => m,
+            Some(Err(_)) => return Err("leader-logs websocket receive failed".into()),
+            None => return Err("leader-logs websocket closed".into()),
+        };
+        let body = match msg {
+            Message::Text(t) => t,
+            Message::Ping(payload) => { ws.send(Message::Pong(payload)).await.map_err(|_| "leader-logs pong failed")?; continue; }
+            Message::Pong(_) => continue,
+            Message::Close(_) => return Err("leader-logs websocket closed".into()),
+            _ => continue,
+        };
+        if watched.snapshot() != leaders { return Ok(()); }
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| "malformed leader-logs subscription notification")?;
+        if json.get("error").is_some() { return Err("leader-logs provider rejected subscription".into()); }
+        let Some(event) = json.pointer("/params/result") else {return Err("leader-logs notification has no result".into())};
+        if event.get("number").is_some() && event.get("address").is_none() {continue;} // newHeads liveness
+        let seen_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "wall clock unavailable")?.as_nanos();
+        let lead = detect_leader_log(event, &leaders)
+            .map_err(|_| "leader-logs unverified event: refused")?;
+        stats.frame();
+        if delivered.contains(&lead.tx) { continue; }
+        // The WSS log can beat the provider's HTTP receipt index; recheck
+        // the same authenticated identity a bounded number of times.
+        let mut resolved = None;
+        for attempt in 0..3 {
+            match resolve_leader_log(&http, &rpc_url, event, &lead, &leaders).await {
+                Ok(found) => {resolved = Some(found); break;}
+                Err(reason) if attempt == 2 => return Err(reason),
+                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+        let (tx, authenticated_leaders) = resolved.ok_or("leader-logs resolution unavailable")?;
+        let input = hex::decode(tx.input.strip_prefix("0x").ok_or("settled calldata missing 0x")?)
+            .map_err(|_| "invalid settled calldata")?;
+        let raw = RawTx { source: name.to_owned(), hash: tx.hash.clone(), input,
+            to_neg_risk: tx.to == NEG_RISK_CTF_EXCHANGE_V2, to: tx.to,
+            seen_ns, authenticated_leaders: Some(authenticated_leaders) };
+        if out.send(raw).is_err() { return Ok(()); }
+        stats.exchange_tx();
+        delivered.insert(tx.hash.clone()); delivered_order.push_back(tx.hash);
+        if delivered_order.len() > 8192 {
+            if let Some(old) = delivered_order.pop_front() {delivered.remove(&old);}
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod leader_log_tests {
+    use super::*;
+    fn sample() -> serde_json::Value {
+        let maker = format!("0x{}{}", "0".repeat(24), "11".repeat(20));
+        let taker = format!("0x{}{}", "0".repeat(24), "22".repeat(20));
+        serde_json::json!({
+            "address":format!("0x{CTF_EXCHANGE_V2}"),
+            "topics":[ORDER_FILLED_TOPIC,"0x".to_owned()+&"33".repeat(32),maker,taker],
+            "data":"0x".to_owned()+&"00".repeat(224),
+            "transactionHash":"0x".to_owned()+&"44".repeat(32),
+            "blockHash":"0x".to_owned()+&"55".repeat(32),
+            "blockNumber":"0x100", "logIndex":"0x2", "removed":false
+        })
+    }
+    #[test]
+    fn configured_channel_does_not_fall_back_to_pending() {
+        assert_eq!(FeedChannel::from_name("leader-logs"), FeedChannel::LeaderOrderFilledLogs);
+        assert_eq!(FeedChannel::from_name("leader-logs-primary"), FeedChannel::LeaderOrderFilledLogs);
+        assert_eq!(FeedChannel::from_name("primary"), FeedChannel::PendingTransactions);
+    }
+    #[test]
+    fn event_identity_both_index_positions() {
+        let event = sample();
+        for (wallet, expected) in [("11".repeat(20), [0x11;20]), ("22".repeat(20), [0x22;20])] {
+            let proof = detect_leader_log(&event, &[wallet]).expect("indexed leader");
+            assert_eq!(proof.leader, expected);
+            assert_eq!(proof.log_index, 2);
+        }
+    }
+    #[test]
+    fn no_wallet_no_topic_no_mined_identity_means_refusal() {
+        let baseline = sample();
+        let watch = vec!["11".repeat(20)];
+        assert_eq!(detect_leader_log(&baseline, &["66".repeat(20)]), Err(LeaderLogRefusal::UnauthenticatedLeader));
+        let mut x = baseline.clone(); x["topics"][0] = serde_json::json!("0x1234");
+        assert_eq!(detect_leader_log(&x, &watch), Err(LeaderLogRefusal::WrongEvent));
+        let mut x = baseline.clone(); x["removed"] = serde_json::json!(true);
+        assert_eq!(detect_leader_log(&x, &watch), Err(LeaderLogRefusal::RemovedOrUnmined));
+        let mut x = baseline.clone(); x["address"] = serde_json::json!("0x1234");
+        assert_eq!(detect_leader_log(&x, &watch), Err(LeaderLogRefusal::WrongExchange));
+        let mut x = baseline.clone(); x["blockHash"] = serde_json::Value::Null;
+        assert_eq!(detect_leader_log(&x, &watch), Err(LeaderLogRefusal::MissingIdentity));
+        let mut x = baseline.clone(); x["data"] = serde_json::json!("0x00");
+        assert_eq!(detect_leader_log(&x, &watch), Err(LeaderLogRefusal::InvalidEnvelope));
     }
 }

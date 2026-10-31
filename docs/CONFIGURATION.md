@@ -13,6 +13,25 @@ The engine retains its existing TOML configuration format; runtime operator and 
 
 Only examples ship. Do not commit any populated layer. The bot does not load `.env` files automatically; the service templates use systemd's `EnvironmentFile` mechanism.
 
+## Leader-fill detection (COPYBOT-FEED)
+
+The low-traffic confirmed-fill channel uses the existing `[[feed]]` schema. Set `name = "leader-logs"` (or `leader-logs-<label>`) to select it explicitly; any other name retains the legacy pending-transaction channel. There is **no automatic downgrade to the pending firehose** if log verification, RPC lookup, subscription or decoding fails.
+
+```toml
+[[feed]]
+name = "leader-logs"
+url = "wss://polygon-bor-rpc.publicnode.com"
+sockets = 1
+```
+
+This public endpoint is a **no-SLA example**, not a recommended production SLA. The program derives the required transaction/receipt JSON-RPC HTTP endpoint by replacing this URL's `wss://` prefix with `https://` and preserving the host, path and query; choose a provider whose WSS and HTTPS RPC share the same endpoint path and whose plan supports `eth_subscribe` (`logs` and `newHeads`), `eth_getTransactionReceipt` and `eth_getTransactionByHash`. A `ws://` URL is refused for the confirmed log source. Use only a Polygon mainnet provider; never put credentials in a checked-in TOML file, telemetry or a support log.
+
+One socket subscribes to **four filtered `OrderFilled` topics** (two V2 CTF exchanges × maker/taker proxy position), plus `newHeads` for stream liveness and registry-change resubscription. The canonical mined receipt must contain the identical event, successful status and configured leader topic; the corresponding transaction must contain supported `matchOrders` calldata and a matching leader order. Only then does the original decoder, replay guard and decision path receive the confirmed transaction. The leader's index topic is the **proxy wallet**, not the relayer's transaction sender. No order signing or submission is triggered by the subscription itself.
+
+A second `[[feed]]` with a different name and a provider-supplied pending WSS URL can be configured as a **speculative mempool accelerator**, but that re-enables broad pending traffic and the original unconfirmed calldata-maker identity limitation. For cost-constrained monitoring use only `leader-logs`; do not claim pending data is authenticated by a mined receipt. The CLOB market WebSocket cannot identify a wallet and must remain market data, never a leader signal. The public Data API `/activity?user=<proxy>&type=TRADE` is useful as out-of-band reconciliation, not a lower-latency authenticated trigger; `/trades` may show fewer recent records.
+
+This change does not authorize live trading: the 24-hour dry observation and existing order/journal safety gates remain binding. On any prolonged disconnection or resubscription, missing historical events are **not recovered by the WebSocket alone**; independently reconcile Data API and receipts before considering the stream complete.
+
 ## Sizing
 
 `mode = "pct"` uses a fractional copy percentage: `0.005` means 0.5%, not 5%. `shares` and `usd` are also accepted by the existing parser. Percentage copying is subject to minimum order sizes, budgets, execution prices, and the configured exit policy; it is not a guarantee of an exact share ratio.
