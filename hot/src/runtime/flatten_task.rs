@@ -1,6 +1,7 @@
 //! Operator-requested flatten execution. The caller owns the live-mode gate.
 
-use super::accounting::book_and_resolve;
+use super::accounting::{book_matched_fak_race, fak_owner_submit_ready};
+use super::control::latch_buys;
 use super::execution::submit_tracked;
 use super::exits::rescue_exit;
 use super::telemetry::{now_ms, Emitter};
@@ -232,6 +233,20 @@ SOLD — the wallet still holds everything it held before.",
                     if shares <= 0.0 {
                         continue;
                     }
+                    // Operator flatten still needs the canonical FAK journal:
+                    // do not sign/POST a sell that would fall back to zero fee.
+                    if let Err(error) = fak_owner_submit_ready(fak4.as_ref()) {
+                        latch_buys(&lane, &inc4, "fak_owner_unavailable",
+                            "flatten FAK has no valid canonical journal");
+                        e4.emit(serde_json::json!({
+                            "t":now_ms(), "ev":"flatten_unconfirmed",
+                            "lane":lane.cfg.name, "token":tok,
+                            "reason":"fak_owner_unavailable",
+                            "detail":format!("{error:?}"),
+                        }));
+                        unconfirmed += 1;
+                        continue;
+                    }
                     attempted += 1;
                     let neg = quote.negative_risk;
                     let (ma, ta) = copybot_hot::order::amounts(limit, shares, 1);
@@ -268,7 +283,7 @@ SOLD — the wallet still holds everything it held before.",
                         }
                     };
                     let flat_hash = hex::encode(ord.digest());
-                    let (outcome, _) = match submit_tracked(
+                    let (outcome, results) = match submit_tracked(
                             &pend4,
                             &e4,
                             &copybot_hot::provenance::Provenance::own(
@@ -303,21 +318,11 @@ SOLD — the wallet still holds everything it held before.",
                         }
                     };
                     match &outcome {
-                        copybot_hot::race_send::Outcome::Matched { body, .. } => {
-                            let (booked, _) = book_and_resolve(
-                                &c4,
-                                &pend4,
-                                &r4,
-                                &inc4,
-                                &e4,
-                                &lane.cfg.name,
-                                tok,
-                                1,
-                                limit,
-                                body,
-                                None,
-                                &flat_hash,
-                                false,
+                        copybot_hot::race_send::Outcome::Matched { .. } => {
+                            let (booked, _) = book_matched_fak_race(
+                                fak4.as_ref(), &c4, &pend4, &r4, &inc4, &e4,
+                                &flat_hash, &lane.cfg.name, &outcome, &results,
+                                paths4.len(),
                             );
                             if booked {
                                 let _ = wake4.send(tok.clone());

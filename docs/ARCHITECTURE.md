@@ -54,6 +54,16 @@ In **dry observation only**, affordability now uses the configured lane's **virt
 
 No real POST, signing-key operation, service restart or modification to the running DRY24 observation was performed by D621. Exit/flatten/merge primary, GTC/resting, settlement and portfolio reconciliation are still separately durable and unverified. Full A4 and the 24-hour KILL threshold remain unmet; no live or shadow GO.
 
+## D622 direct merge/flatten FAK booking migration (source only; no real POST)
+
+The direct SELL FAK branches in `runtime::merge::spawn_reconcile` and `runtime::flatten_task::spawn` now require the same boot-held canonical journal's `verify_owner` before signing or sending an order, and pass the **observed** `Outcome::Matched` plus completed HTTP `PathResult` inventory into `book_matched_fak_race`. The journal fsyncs exact order ID/size/price/explicit fee evidence before idempotent Ledger/PendingLog projection; unknown or conflicting monetary evidence retains PendingLog and emits `merge_unconfirmed` / `flatten_unconfirmed`, without counting a sale as durable or waking follow-on activity. Existing `submit_tracked` D621 mutex admission serializes token reservations across writers before any network request. Exit-rescue retry remains on the same strict FAK journal.
+
+These are source and **synthetic** tests only: no live/shadow trades, signer calls, deployments or observer restarts were performed by the gates. GTC/resting, settlement/redemption and some orphan/reconciliation paths remain outside full A4, and the response schema / type3 signed POST acceptance and charged fee are still unverified.
+
+### D622 DRY24 coverage distinction
+
+The independent, read-only gap checker in the D622 evidence directory queries the public Polymarket Data API's wallet-filtered trade feed with explicit UTC start/end and complete cursor pagination. It derives WSS frame-stall windows from the observer's existing `feed_stats` snapshots without changing its files or process, and separately counts leader trade records/unique transaction hashes versus the observer's decoded `skip` / `would_fire` / `fire` events. Data API rows are **external candidate evidence**, not conclusive proof that each candidate was an independently eligible, on-chain settled `matchOrders` signal; receipt/contract corroboration and denominator matching remain required before stating 95% detection. The pinned DRY24 binary also predates D621's virtual-bankroll/no-float-ULP fixes. Therefore neither a Data API trade count nor the old dry run's cash refusals can be silently promoted into a passing 24-hour kill gate.
+
 ## First-principles product and invariants
 
 The product is a **single-operator, one-process Polygon CLOB copy executor** that responds to *observed* leader settlement activity, sizes follower orders, signs/submits to the configured CLOB, tracks ambiguous fills/resting orders, reconciles inventory, and exposes a local operator view. Its Python services observe and corroborate evidence; they do not independently own trading state. It is **not** an early-leader-order detector, backtester, generic on-chain strategy, or multi-tenant trading service.

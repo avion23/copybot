@@ -1,6 +1,7 @@
 //! Native merge execution, reconciliation task and historical pair-ledger seeding.
 
-use super::accounting::book_and_resolve;
+use super::accounting::{book_matched_fak_race, fak_owner_submit_ready};
+use super::control::latch_buys;
 use super::execution::submit_tracked;
 use super::exits::rescue_exit;
 use super::telemetry::{now_ms, Emitter};
@@ -693,6 +694,20 @@ naked exposure and is flattened regardless of the merge outcome"
                             if shares <= 0.0 {
                                 continue;
                             }
+                            // Merge-residual FAK must hold the SAME money owner
+                            // as the feed and sweep. Refuse before signing/POST
+                            // if its lease or journal inode is unavailable.
+                            if let Err(error) = fak_owner_submit_ready(fak5.as_ref()) {
+                                latch_buys(&lane, &inc5, "fak_owner_unavailable",
+                                    "merge FAK has no valid canonical journal");
+                                e5.emit(serde_json::json!({
+                                    "t": now_ms(), "ev":"merge_skip",
+                                    "lane":lane.cfg.name, "token":tok,
+                                    "why":"fak_owner_unavailable",
+                                    "detail":format!("{error:?}"),
+                                }));
+                                continue;
+                            }
                             let (ma, ta) = copybot_hot::order::amounts(limit, shares, 1);
                             let ord = copybot_hot::order::Order {
                                 salt: copybot_hot::order::safe_salt(now_ms()),
@@ -726,7 +741,7 @@ naked exposure and is flattened regardless of the merge outcome"
                                 Err(_) => continue,
                             };
                             let m_hash = hex::encode(ord.digest());
-                            let (outcome, _) = match submit_tracked(
+                            let (outcome, results) = match submit_tracked(
                                     &pend5,
                                     &e5,
                                     &copybot_hot::provenance::Provenance::own(
@@ -758,23 +773,21 @@ naked exposure and is flattened regardless of the merge outcome"
                                 }
                             };
                             match &outcome {
-                                copybot_hot::race_send::Outcome::Matched { body, .. } => {
-                                    book_and_resolve(
-                                        &c5,
-                                        &pend5,
-                                        &r5,
-                                        &inc5,
-                                        &e5,
-                                        &lane.cfg.name,
-                                        tok,
-                                        1,
-                                        limit,
-                                        body,
-                                        None,
-                                        &m_hash,
-                                        false,
+                                copybot_hot::race_send::Outcome::Matched { .. } => {
+                                    let (booked, _) = book_matched_fak_race(
+                                        fak5.as_ref(), &c5, &pend5, &r5, &inc5, &e5,
+                                        &m_hash, &lane.cfg.name, &outcome, &results,
+                                        paths5.len(),
                                     );
-                                    let _ = wake5.send(tok.to_string());
+                                    if booked {
+                                        let _ = wake5.send(tok.to_string());
+                                    } else {
+                                        e5.emit(serde_json::json!({
+                                            "t":now_ms(), "ev":"merge_unconfirmed",
+                                            "lane":lane.cfg.name, "tok":tok,
+                                            "why":"matched_but_fak_money_unverified",
+                                        }));
+                                    }
                                 }
                                 copybot_hot::race_send::Outcome::Rejected { body } => {
                                     rescue_exit(

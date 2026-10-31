@@ -188,6 +188,105 @@ fn synthetic_sweep_sell_uses_exact_fee_and_terminal_journal_projection() {
     drop(reopened);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn direct_merge_and_flatten_sell_sources_commit_identical_proven_money() {
+    // These two production callers now share this one witnessed 2xx journal
+    // edge. No network socket or signing key is involved in either fixture.
+    for source in ["merge_residual", "flatten_direct"] {
+        let (dir, c, p, r, i, e, path) = fixture(source);
+        let _ = c.lock().unwrap().ledger.book_fill_ex(
+            "alpha", "tok", 0, 10.0, 0.40, 0.0, None, "seed", false,
+        ).expect("seeded inventory");
+        let hash = format!("{source}-hash");
+        {
+            let mut pending = p.lock().unwrap();
+            pending.resolve("h1", "test_closed", None).unwrap();
+            pending.reserve_for_submit(Pending {
+                lane:"alpha".into(), token:"tok".into(), side:1,
+                order_hash:hash.clone(), shares:8.0, limit:0.3,
+                ts:23, why:source.into(), resting:false,
+            }, false).unwrap();
+        }
+        let journal = open_fak_journal_for_live(true, &path, &c, &p, &r, &i)
+            .expect("private journal");
+        assert!(fak_owner_submit_ready(Some(&journal)).is_ok());
+        let body = format!(
+            r#"{{"status":"matched","success":true,"orderID":"0x{hash}","makingAmount":"8","takingAmount":"3.6","feeAmount":"0.01"}}"#
+        );
+        let outcome = Outcome::Matched {
+            body:body.clone(), winner:source.into(), ms:2.0,
+        };
+        let results = [PathResult {
+            path:source.into(), http:200, body, ms:2.0,
+        }];
+        let (booked, qty) = book_matched_fak_race(
+            Some(&journal), &c, &p, &r, &i, &e,
+            &hash, "alpha", &outcome, &results, 1,
+        );
+        assert!(booked, "{source} must book only proved money");
+        assert_eq!(qty, 8.0);
+        assert!(!p.lock().unwrap().is_open(&hash));
+        assert_eq!(journal.commits().unwrap().len(), 1);
+        {
+            let ledger = c.lock().unwrap();
+            let receipt = ledger.ledger.recorded_order(&hash).unwrap();
+            assert_eq!(receipt.receipt.price, 0.45);
+            assert_eq!(receipt.fee, 0.01);
+            assert_eq!(ledger.ledger.holdings("alpha")["tok"], 2.0);
+        }
+        drop(journal);
+        let reopened = copybot_hot::order_commit::AtomicFakJournal::open(
+            dir.join("ctl.fak_commit")
+        ).unwrap();
+        let mut ledger = c.lock().unwrap();
+        let mut pend = p.lock().unwrap();
+        let counts = reopened.repair_legacy(&mut ledger.ledger, &mut pend).unwrap();
+        assert_eq!(counts.fills_booked, 0);
+        assert_eq!(counts.pending_closed, 0);
+        drop(pend);
+        drop(ledger);
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+#[test]
+fn direct_merge_and_flatten_unknown_fee_refuse_without_legacy_fallback() {
+    for source in ["merge_missing_fee", "flatten_missing_fee"] {
+        let (dir, c, p, r, i, e, path) = fixture(source);
+        let _ = c.lock().unwrap().ledger.book_fill_ex(
+            "alpha", "tok", 0, 10.0, 0.40, 0.0, None, "seed", false,
+        ).unwrap();
+        let hash = format!("{source}-hash");
+        {
+            let mut pending = p.lock().unwrap();
+            pending.resolve("h1", "test_closed", None).unwrap();
+            pending.reserve_for_submit(Pending {
+                lane:"alpha".into(), token:"tok".into(), side:1,
+                order_hash:hash.clone(), shares:8.0, limit:0.3,
+                ts:24, why:source.into(), resting:false,
+            }, false).unwrap();
+        }
+        let journal = open_fak_journal_for_live(true, &path, &c, &p, &r, &i).unwrap();
+        let body = format!(
+            r#"{{"status":"matched","success":true,"orderID":"0x{hash}","makingAmount":"8","takingAmount":"3.6"}}"#
+        );
+        let outcome = Outcome::Matched { body:body.clone(), winner:source.into(), ms:2.0 };
+        let results = [PathResult { path:source.into(), http:200, body, ms:2.0 }];
+        let (booked, qty) = book_matched_fak_race(
+            Some(&journal), &c, &p, &r, &i, &e,
+            &hash, "alpha", &outcome, &results, 1,
+        );
+        assert!(!booked);
+        assert_eq!(qty, 0.0);
+        assert!(p.lock().unwrap().is_open(&hash),
+            "unknown fees cannot release the signed reservation");
+        assert!(!c.lock().unwrap().ledger.was_order_booked(&hash));
+        assert_eq!(journal.commits().unwrap().len(), 0);
+        drop(journal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
     #[test]
     fn journal_only_crash_is_recovered_at_boot_without_network_or_post() {
         let (dir, c, p, r, i, _e, path) = fixture("restart");
