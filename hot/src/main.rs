@@ -903,6 +903,7 @@ still be holding something, check that the funder address is right."
         runtime::orphan_sweep::spawn(
             &control, &router, &emitter, &funder, pk, &signer_addr,
             sig_type, &clob, &creds, &pending_log, &order_paths,
+            &incidents, &fak_journal,
         );
     }
     if live {

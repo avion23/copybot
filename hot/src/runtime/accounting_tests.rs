@@ -193,7 +193,7 @@ fn synthetic_sweep_sell_uses_exact_fee_and_terminal_journal_projection() {
 fn direct_merge_and_flatten_sell_sources_commit_identical_proven_money() {
     // These two production callers now share this one witnessed 2xx journal
     // edge. No network socket or signing key is involved in either fixture.
-    for source in ["merge_residual", "flatten_direct"] {
+    for source in ["merge_residual", "flatten_direct", "orphan_exit"] {
         let (dir, c, p, r, i, e, path) = fixture(source);
         let _ = c.lock().unwrap().ledger.book_fill_ex(
             "alpha", "tok", 0, 10.0, 0.40, 0.0, None, "seed", false,
@@ -252,7 +252,7 @@ fn direct_merge_and_flatten_sell_sources_commit_identical_proven_money() {
 }
 #[test]
 fn direct_merge_and_flatten_unknown_fee_refuse_without_legacy_fallback() {
-    for source in ["merge_missing_fee", "flatten_missing_fee"] {
+    for source in ["merge_missing_fee", "flatten_missing_fee", "orphan_missing_fee"] {
         let (dir, c, p, r, i, e, path) = fixture(source);
         let _ = c.lock().unwrap().ledger.book_fill_ex(
             "alpha", "tok", 0, 10.0, 0.40, 0.0, None, "seed", false,

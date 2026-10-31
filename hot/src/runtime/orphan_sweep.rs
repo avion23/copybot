@@ -1,6 +1,8 @@
 //! Orphan holding diagnostic and optional exit submission; called only under main live gate.
 //! One worker retains its own cadence, warning suppression and tracked submission path.
 
+use super::accounting::{book_matched_fak_race, fak_owner_submit_ready};
+use super::control::latch_buys;
 use super::execution::submit_tracked;
 use super::telemetry::{now_ms, Emitter};
 use copybot_hot::control::Control;
@@ -22,6 +24,8 @@ pub(crate) fn spawn(
     creds: &Arc<Option<copybot_hot::auth::ApiCreds>>,
     pending_log: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
     order_paths: &Arc<Vec<(String, reqwest::Client)>>,
+    incidents: &Arc<std::sync::Mutex<copybot_hot::incidents::Incidents>>,
+    fak_journal: &Option<Arc<copybot_hot::order_commit::AtomicFakJournal>>,
 ) {
         let fire = std::env::var("ORPHAN_SWEEP").ok().as_deref() == Some("1");
         eprintln!(
@@ -42,6 +46,8 @@ pub(crate) fn spawn(
         let user6 = funder.clone();
         let pend6 = pending_log.clone();
         let paths6 = order_paths.clone();
+        let inc6 = incidents.clone();
+        let fak6 = fak_journal.clone();
         tokio::spawn(async move {
             let http = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -186,6 +192,22 @@ pub(crate) fn spawn(
                     if !fire {
                         continue;
                     }
+                    // Orphan sell is FAK and requires the same canonical
+                    // fsynced money owner as normal and rescue sells. This
+                    // check happens before a signer or HTTP POST is used.
+                    if let Err(reason) = fak_owner_submit_ready(fak6.as_ref()) {
+                        if let Some(lane) = r6.snapshot().iter().find(|l| l.cfg.name == o.lane) {
+                            latch_buys(lane, &inc6, "fak_owner_unavailable",
+                                "orphan exit FAK has no intact money owner; exposure retained");
+                        }
+                        e6.emit(serde_json::json!({
+                            "t": now_ms(), "ev":"orphan_exit_unconfirmed",
+                            "lane":o.lane, "tok":o.token,
+                            "why":"fak_owner_unavailable",
+                            "detail":format!("{reason:?}"),
+                        }));
+                        continue;
+                    }
                     let (Some(cr), Some(key)) = (creds6.as_ref().as_ref(), pk6.as_ref())
                     else { continue };
                     let (ma, ta) = copybot_hot::order::amounts(limit, shares, 1);
@@ -216,7 +238,7 @@ pub(crate) fn spawn(
                     let hdr_vec: Vec<(&'static str, String)> = hdrs
                         .into_iter()
                         .collect();
-                    let outcome = match submit_tracked(
+                    let (outcome, results) = match submit_tracked(
                             &pend6,
                             &e6,
                             &copybot_hot::provenance::Provenance::mirrored(
@@ -232,7 +254,7 @@ pub(crate) fn spawn(
                                 None,
                                 None,
                             ),
-                            sweep_hash,
+                            sweep_hash.clone(),
                             false,
                             &paths6,
                             &format!("{clob6}/order"),
@@ -243,18 +265,38 @@ pub(crate) fn spawn(
                         )
                         .await
                     {
-                        Ok((outcome, _)) => outcome,
+                        Ok(value) => value,
                         Err(e) => {
                             eprintln!("[orphan] REFUSING TO SUBMIT: {e}");
                             continue;
                         }
                     };
-                    e6.emit(
-                        serde_json::json!(
-                            { "t" : now_ms(), "ev" : "orphan_exit_resp", "lane" : o.lane,
-                            "outcome" : format!("{outcome:?}") }
-                        ),
-                    );
+                    // Booking is not a side effect of merely receiving a
+                    // matched-looking body: require witnessed 2xx, exact
+                    // price/fee and journal fsync before ledger projection.
+                    let (booked, shares_booked) = if matches!(
+                        outcome, copybot_hot::race_send::Outcome::Matched { .. }
+                    ) {
+                        book_matched_fak_race(
+                            fak6.as_ref(), &c6, &pend6, &r6, &inc6, &e6,
+                            &sweep_hash, &o.lane, &outcome, &results, paths6.len(),
+                        )
+                    } else { (false, 0.0) };
+                    e6.emit(serde_json::json!({
+                        "t": now_ms(), "ev":"orphan_exit_resp", "lane":o.lane,
+                        "outcome":format!("{outcome:?}"),
+                        "booked":booked, "shares_booked":shares_booked,
+                    }));
+                    if matches!(outcome, copybot_hot::race_send::Outcome::Matched { .. })
+                        && !booked
+                    {
+                        e6.emit(serde_json::json!({
+                            "t": now_ms(), "ev":"orphan_exit_unconfirmed",
+                            "lane":o.lane, "tok":o.token,
+                            "why":"matched_but_money_unverified",
+                            "order_hash":sweep_hash,
+                        }));
+                    }
                 }
             }
         });
