@@ -57,10 +57,25 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| (d.as_nanos().saturating_sub(raw.seen_ns)) as f64 / 1000.0)
             .unwrap_or(0.0);
-        if feed_race.is_duplicate(&raw, &emitter) {
+        // Corroboration must be observed even when the chain WSS arrived first.
+        if raw.stage != copybot_hot::feeds::FillStage::DataApiCorroboration
+            && feed_race.is_duplicate(&raw,&emitter) {continue;}
+        feed_registry.record_win(&raw.source);
+        if matches!(raw.stage, copybot_hot::feeds::FillStage::Recovered
+            | copybot_hot::feeds::FillStage::DataApiCorroboration) {
+            // Typed late observations carry real settled token/side/size/price
+            // but are NEVER submitted as fresh copy orders on reconnect.
+            for proof in raw.confirmed_fills.as_deref().unwrap_or(&[]) {
+                emitter.emit(serde_json::json!({
+                    "t":now_ms(), "ev":"leader_fill_observed_not_admitted",
+                    "stage":format!("{:?}",raw.stage), "tx":raw.hash,
+                    "block_time":proof.block_time,"log_index":proof.log_index,
+                    "token":proof.order.token_id,"side":proof.order.side,
+                    "shares":proof.order.fill_size,"price":proof.order.price,
+                }));
+            }
             continue;
         }
-        feed_registry.record_win(&raw.source);
         runtime::merge::observe_leader_pair_tx(&raw, &router, &pair_ledger, &emitter, &errors_path);
         let present = participants(&raw.input);
         if present.is_empty() {
@@ -82,7 +97,12 @@ pub(crate) async fn run(mut rx: mpsc::UnboundedReceiver<RawTx>, ctx: Context) {
             if !present.iter().any(|p| p == &w20) {
                 continue;
             }
-            for d in decode_all(&raw.input, &w20) {
+            let decoded: Vec<_> = match &raw.confirmed_fills {
+                Some(fills) => fills.iter().filter(|f| f.wallet == w20)
+                    .map(|f| f.order.clone()).collect(),
+                None => decode_all(&raw.input, &w20),
+            };
+            for d in decoded {
                 if lane.cfg.exclude_political
                     && politics
                         .read()

@@ -11,6 +11,7 @@ pub mod exit_rescue;
 pub mod control;
 pub mod custody;
 pub mod feeds;
+pub mod leader_recovery;
 pub mod guardwatch;
 pub mod firerate;
 pub mod incidents;

@@ -212,3 +212,157 @@ pub fn decode_pending(calldata: &[u8], wallet_20: &[u8; 20]) -> Option<Decoded> 
     let mut all = decode_all(calldata, wallet_20);
     if all.len() == 1 { all.pop() } else { None }
 }
+
+
+/// V2 OrderFilled bytes: [maker side, token ID, maker fill amount, taker fill
+/// amount, fee metadata]. The first word is **side** (0 BUY, 1 SELL), not an
+/// asset ID. The indexed maker topic authenticates the order owner. A taker
+/// topic alone is only counterparty evidence and MUST NOT authorize copying.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderFilled {
+    pub maker: [u8; 20],
+    pub token_id: String,
+    pub side: u8,
+    pub shares_micro: u128,
+    pub quote_micro: u128,
+    pub log_index: u64,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmedLeaderFill {
+    pub wallet: [u8; 20],
+    pub transaction_hash: String,
+    pub block_time: u64,
+    pub log_index: u64,
+    /// Same admission type as the existing matchOrders decoder; price and
+    /// filled shares are taken from the actual settled OrderFilled event.
+    pub order: Decoded,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillDetectionError {
+    InvalidOrderFilled,
+    MissingSignedMakerOrder,
+    AmbiguousSignedMakerOrder,
+    UnverifiableAmount,
+}
+
+pub fn decode_v2_order_filled(
+    data: &[u8], maker: [u8; 20], log_index: u64,
+) -> Result<OrderFilled, FillDetectionError> {
+    if data.len() != 224 { return Err(FillDetectionError::InvalidOrderFilled); }
+    let side = word_usize(data, 0).ok_or(FillDetectionError::InvalidOrderFilled)?;
+    if side > 1 { return Err(FillDetectionError::InvalidOrderFilled); }
+    let token_id = word_dec_string(data, 32).ok_or(FillDetectionError::InvalidOrderFilled)?;
+    if token_id == "0" { return Err(FillDetectionError::InvalidOrderFilled); }
+    let ma = word_u128(data, 64).ok_or(FillDetectionError::InvalidOrderFilled)?;
+    let ta = word_u128(data, 96).ok_or(FillDetectionError::InvalidOrderFilled)?;
+    let (quote, shares) = if side == 0 { (ma, ta) } else { (ta, ma) };
+    if shares == 0 || quote == 0 || quote >= shares {
+        return Err(FillDetectionError::UnverifiableAmount);
+    }
+    Ok(OrderFilled {maker, token_id, side:side as u8,
+        shares_micro:shares, quote_micro:quote, log_index})
+}
+
+/// A canonical topic only authenticates a maker *address*. Pair it with the
+/// actual signed maker order in matchOrders; counterparty taker topics do not
+/// establish the leader's intention. Preserve the real order salt/condition,
+/// but use settled fill amount and price rather than the order's limit.
+pub fn verified_order_fills(
+    calldata: &[u8], wallet: &[u8; 20], events: &[OrderFilled],
+    tx_hash: &str, block_time: u64,
+) -> Result<Vec<ConfirmedLeaderFill>, FillDetectionError> {
+    let orders = decode_all(calldata, wallet);
+    if orders.is_empty() || block_time == 0 {
+        return Err(FillDetectionError::MissingSignedMakerOrder);
+    }
+    let mut result = Vec::with_capacity(orders.len());
+    for mut order in orders {
+        if result.iter().any(|x: &ConfirmedLeaderFill| {
+            x.order.token_id == order.token_id && x.order.side == order.side
+        }) {
+            return Err(FillDetectionError::AmbiguousSignedMakerOrder);
+        }
+        let matching: Vec<_> = events.iter().filter(|event| {
+            &event.maker == wallet && event.token_id == order.token_id
+                && event.side == order.side
+        }).collect();
+        if matching.is_empty() {return Err(FillDetectionError::MissingSignedMakerOrder);}
+        let mut shares: u128 = 0;
+        let mut quote: u128 = 0;
+        for event in &matching {
+            shares = shares.checked_add(event.shares_micro).ok_or(FillDetectionError::UnverifiableAmount)?;
+            quote = quote.checked_add(event.quote_micro).ok_or(FillDetectionError::UnverifiableAmount)?;
+        }
+        let size = shares as f64 / 1e6;
+        let price = quote as f64 / shares as f64;
+        if !size.is_finite() || !price.is_finite() || !(0.0..1.0).contains(&price) {
+            return Err(FillDetectionError::UnverifiableAmount);
+        }
+        order.fill_size = size;
+        order.price = price;
+        // A better execution price may fill more shares than implied by the
+        // signed limit price. Never reject a real settled fill as oversized.
+        order.order_size = order.order_size.max(size);
+        result.push(ConfirmedLeaderFill {
+            wallet:*wallet, transaction_hash:tx_hash.to_owned(), block_time,
+            log_index:matching.iter().map(|x| x.log_index).min().unwrap_or(0),
+            order,
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod settled_log_tests {
+    use super::*;
+    fn put_word(data: &mut [u8], offset:usize, value:u128) {
+        data[offset+16..offset+32].copy_from_slice(&value.to_be_bytes());
+    }
+    #[test]
+    fn settled_event_joins_signed_calldata_and_replaces_limit_price() {
+        let maker=[0x22;20];
+        let mut abi=vec![0u8;448];
+        put_word(&mut abi,0,1); // nonzero condition
+        put_word(&mut abi,32,160); // taker order at word5
+        put_word(&mut abi,64,384); // empty maker orders
+        put_word(&mut abi,96,5_000_000); // taker quote fill
+        put_word(&mut abi,128,416); // empty maker fill list
+        put_word(&mut abi,160,2); // real signed order salt
+        abi[204..224].copy_from_slice(&maker); // ABI padded maker
+        put_word(&mut abi,256,123456); // token ID
+        put_word(&mut abi,288,100_000_000); // maker amount
+        put_word(&mut abi,320,200_000_000); // taker amount
+        let mut calldata=MATCH_SELECTOR.to_vec();calldata.extend(abi);
+        let original=decode_all(&calldata,&maker);
+        assert_eq!(original.len(),1);
+        assert!((original[0].price-0.5).abs()<1e-9);
+        let event=OrderFilled {maker,token_id:"123456".into(),side:0,
+            shares_micro:10_000_000,quote_micro:4_000_000,log_index:7};
+        let settled=verified_order_fills(&calldata,&maker,&[event.clone()],"fixture",100).unwrap();
+        assert_eq!(settled.len(),1);
+        assert_eq!(settled[0].order.token_id,"123456");
+        assert!((settled[0].order.price-0.4).abs()<1e-9);
+        assert_eq!(settled[0].order.fill_size,10.0);
+        assert_eq!(settled[0].order.salt[31],2);
+        assert_eq!(settled[0].block_time,100);
+        let another=[0x33;20];
+        assert_eq!(verified_order_fills(&calldata,&another,&[event],"fixture",100),
+            Err(FillDetectionError::MissingSignedMakerOrder));
+    }
+    #[test]
+    fn v2_buy_and_sell_are_typed_and_invalid_rows_refuse() {
+        let maker=[0x22;20];let mut b=vec![0u8;224];
+        put_word(&mut b, 32, 12345);
+        put_word(&mut b, 64, 5_000_000);
+        put_word(&mut b, 96, 10_000_000);
+        let buy=decode_v2_order_filled(&b,maker,7).unwrap();
+        assert_eq!((buy.side,buy.token_id.as_str(),buy.shares_micro,buy.quote_micro),(0,"12345",10_000_000,5_000_000));
+        put_word(&mut b,0,1);
+        put_word(&mut b,64,10_000_000);
+        put_word(&mut b,96,5_000_000);
+        let sell=decode_v2_order_filled(&b,maker,8).unwrap();
+        assert_eq!((sell.side,sell.shares_micro,sell.quote_micro),(1,10_000_000,5_000_000));
+        put_word(&mut b,0,2);
+        assert_eq!(decode_v2_order_filled(&b,maker,9),Err(FillDetectionError::InvalidOrderFilled));
+    }
+}

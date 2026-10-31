@@ -15,7 +15,14 @@ pub struct RawTx {
     /// Confirmed OrderFilled identity from the canonical receipt. None denotes
     /// the explicitly unconfirmed, legacy pending-transaction accelerator.
     pub authenticated_leaders: Option<Vec<[u8; 20]>>,
+    /// Confirmed on-chain maker fills, with actual execution price and size.
+    /// Pending source leaves this None; it cannot fabricate chain proof.
+    pub confirmed_fills: Option<Vec<crate::calldata::ConfirmedLeaderFill>>,
+    pub stage: FillStage,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillStage { UnconfirmedPending, ConfirmedLive, Recovered, DataApiCorroboration }
+
 /// A pending transaction source is useful only when it delivers full objects.
 /// A hash-only subscription is not a source of settlement calldata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +293,16 @@ pub fn spawn_all(
                 );
         }
     }
+    // One independent 2-second public Data API corroborator per process,
+    // not one per configured socket. It yields only stage-typed inspection
+    // evidence and can never trigger an order even when it wins the race.
+    if let Some(provider)=feeds.iter()
+        .find(|f|FeedChannel::from_name(&f.name)==FeedChannel::LeaderOrderFilledLogs) {
+        let provider=provider.url.clone();
+        handles.push(tokio::spawn(crate::leader_recovery::corroborate_data_api(
+            provider,tx,watched,
+        )));
+    }
     (handles, FeedRegistry { per, total })
 }
 pub fn backoff_ms(consecutive_failures: u32) -> u64 {
@@ -309,12 +326,15 @@ async fn run_socket(
 ) {
     const HEALTHY_SESSION: Duration = Duration::from_secs(60);
     let mut consecutive_failures: u32 = 0;
+    // Retained in the socket owner, not reset on a WSS reconnect.
+    let mut recovery = crate::leader_recovery::RecoveryCursor::default();
     loop {
         let started = std::time::Instant::now();
         let outcome = match channel {
             FeedChannel::PendingTransactions => pump(&name, &url, &tx, &stats, watched.clone()).await,
             FeedChannel::LeaderOrderFilledLogs => {
-                pump_leader_logs(&name, &url, &tx, &stats, watched.clone()).await
+                crate::leader_recovery::pump_leader_logs(&name, &url, &tx, &stats, watched.clone(),
+                    &mut recovery).await
             }
         };
         let ran = started.elapsed();
@@ -460,6 +480,8 @@ async fn pump(
                 to: to.clone(),
                 seen_ns,
                 authenticated_leaders: None,
+                confirmed_fills: None,
+                stage: FillStage::UnconfirmedPending,
             })
             .is_err()
         {
@@ -495,6 +517,9 @@ pub struct LeaderLog {
     pub block_hash: String,
     pub log_index: u64,
     pub leader: [u8; 20],
+    pub maker: [u8; 20],
+    pub taker: [u8; 20],
+    pub block_number: u64,
 }
 
 fn valid_hash(s: &str) -> bool {
@@ -508,14 +533,14 @@ fn log_wallet(s: &str) -> Option<[u8; 20]> {
     hex::decode_to_slice(&s[26..], &mut wallet).ok()?;
     Some(wallet)
 }
-fn valid_index(s: &str) -> Option<u64> {
+pub(crate) fn valid_index(s: &str) -> Option<u64> {
     u64::from_str_radix(s.strip_prefix("0x")?, 16).ok()
 }
 
 /// Exactly one leader-indexed topic position per filter, with both verified
 /// V2 exchanges. A wildcard maker/taker filter is forbidden: it would ingest
 /// every user's fills. The same filter is used for WSS and canonical RPC.
-fn leader_log_filter(watched: &[String], maker: bool, block: Option<u64>) -> serde_json::Value {
+pub(crate) fn leader_log_filter(watched: &[String], maker: bool, block: Option<u64>) -> serde_json::Value {
     let topic_wallets: Vec<String> = watched.iter()
         .map(|s| format!("0x{}{}", "0".repeat(24), s)).collect();
     let topics = if maker {
@@ -564,13 +589,15 @@ pub fn detect_leader_log(
     if value["data"].as_str().filter(|v| v.starts_with("0x") && v.len() == 450 && v[2..].bytes().all(|b| b.is_ascii_hexdigit())).is_none() {
         return Err(LeaderLogRefusal::InvalidEnvelope);
     }
-    let leaders: Vec<_> = [2usize, 3usize].iter().filter_map(|&i| topics[i].as_str().and_then(log_wallet)).collect();
-    let leader = leaders.into_iter().find(|wallet| watched.iter().any(|w| w == &hex::encode(wallet)))
+    let maker = topics[2].as_str().and_then(log_wallet).ok_or(LeaderLogRefusal::InvalidEnvelope)?;
+    let taker = topics[3].as_str().and_then(log_wallet).ok_or(LeaderLogRefusal::InvalidEnvelope)?;
+    let leader = [maker,taker].into_iter().find(|wallet| watched.iter().any(|w| w == &hex::encode(wallet)))
         .ok_or(LeaderLogRefusal::UnauthenticatedLeader)?;
-    Ok(LeaderLog { tx: tx.to_ascii_lowercase(), block_hash: block_hash.to_ascii_lowercase(), log_index: index, leader })
+    Ok(LeaderLog { tx: tx.to_ascii_lowercase(), block_hash: block_hash.to_ascii_lowercase(),
+        log_index:index, leader, maker, taker, block_number:block_num })
 }
 
-async fn public_rpc(
+pub(crate) async fn public_rpc(
     http: &reqwest::Client,
     url: &str,
     method: &str,
@@ -593,7 +620,7 @@ async fn public_rpc(
 /// One bounded JSON-RPC batch carries both indexed maker/taker filters in
 /// ONE HTTP request. A malformed/error/missing/duplicate RPC result refuses
 /// the whole batch, never silently authenticating a partial receipt.
-fn parse_leader_log_batch(value: &serde_json::Value) -> Result<Vec<serde_json::Value>, &'static str> {
+pub(crate) fn parse_leader_log_batch(value: &serde_json::Value) -> Result<Vec<serde_json::Value>, &'static str> {
     let replies = value.as_array().ok_or("leader-log batch reply is not an array")?;
     if replies.len() != 2 { return Err("leader-log batch missing filter reply"); }
     let mut seen = [false; 2];
@@ -614,7 +641,7 @@ fn parse_leader_log_batch(value: &serde_json::Value) -> Result<Vec<serde_json::V
     Ok(logs)
 }
 
-async fn public_leader_logs(
+pub(crate) async fn public_leader_logs(
     http: &reqwest::Client,
     url: &str,
     watched: &[String],
@@ -639,18 +666,18 @@ async fn public_leader_logs(
 /// eth_getLogs for its exact block. Only leader logs are fetched; a full
 /// receipt would include other traders' fills. Then fetch the one matching
 /// matchOrders transaction. EVM reverted transactions cannot emit mined logs.
-async fn resolve_leader_log(
+pub(crate) async fn resolve_leader_log(
     http: &reqwest::Client,
     rpc_url: &str,
     event: &serde_json::Value,
     identified: &LeaderLog,
     watched: &[String],
-) -> Result<(PendingObject, Vec<[u8; 20]>), String> {
+) -> Result<(PendingObject, Vec<crate::calldata::ConfirmedLeaderFill>), String> {
     let block = event["blockNumber"].as_str().and_then(valid_index)
         .ok_or("leader event has no mined block number")?;
     if block == 0 {return Err("leader event has zero block number".into());}
     let mut exact = false;
-    let mut leaders = Vec::new();
+    let mut direct = Vec::new();
     for log in public_leader_logs(http, rpc_url, watched, block).await? {
         let candidate = detect_leader_log(&log, watched)
             .map_err(|_| "RPC log filter included unauthenticated event")?;
@@ -661,12 +688,21 @@ async fn resolve_leader_log(
             && log["topics"] == event["topics"] && log["data"] == event["data"] {
             exact = true;
         }
-        leaders.push(candidate.leader);
+        // Indexed taker is the settlement counterparty. It is NOT the
+        // signed maker order: in 85 sampled txs many such taker events
+        // represent the opposite side/asset and must not authorize copy.
+        if watched.iter().any(|w| *w == hex::encode(candidate.maker)) {
+            let data = log["data"].as_str().ok_or("missing OrderFilled data")?;
+            let raw = hex::decode(data.strip_prefix("0x").ok_or("invalid log data prefix")?)
+                .map_err(|_| "invalid OrderFilled event data")?;
+            let parsed = crate::calldata::decode_v2_order_filled(&raw,candidate.maker,candidate.log_index)
+                .map_err(|_| "unsupported V2 OrderFilled value encoding")?;
+            direct.push(parsed);
+        }
     }
-    if !exact || leaders.is_empty() {
-        return Err("websocket log not present in canonical leader-only block logs".into());
+    if !exact || direct.is_empty() {
+        return Err("canonical maker OrderFilled proof missing for leader".into());
     }
-    leaders.sort(); leaders.dedup();
     let tx = public_rpc(http, rpc_url, "eth_getTransactionByHash", serde_json::json!([identified.tx])).await?;
     let hash = tx["hash"].as_str().ok_or("transaction hash missing")?;
     let dest = tx["to"].as_str().ok_or("transaction destination missing")?;
@@ -679,16 +715,30 @@ async fn resolve_leader_log(
         return Err("settled transaction is not supported matchOrders calldata".into());
     }
     let bytes = hex::decode(&input[2..]).map_err(|_| "invalid settled calldata hex")?;
-    if !leaders.iter().all(|wallet| !crate::calldata::decode_all(&bytes, wallet).is_empty()) {
-        return Err("receipt leader cannot be matched to supported settlement calldata".into());
+    let header = public_rpc(http,rpc_url,"eth_getBlockByNumber",
+        serde_json::json!([format!("0x{block:x}"),false])).await?;
+    if header["hash"].as_str().map(|s| s.to_ascii_lowercase()).as_deref()
+        != Some(identified.block_hash.as_str()) {
+        return Err("mined block identity changed during fill validation".into());
     }
-    Ok((PendingObject {hash: identified.tx.clone(), input: input.to_owned(), to: dest}, leaders))
+    let block_time = header["timestamp"].as_str().and_then(valid_index)
+        .filter(|s| *s > 0).ok_or("verified block timestamp absent")?;
+    let mut makers: Vec<_> = direct.iter().map(|x| x.maker).collect();
+    makers.sort(); makers.dedup();
+    let mut fills = Vec::new();
+    for maker in makers {
+        fills.extend(crate::calldata::verified_order_fills(
+            &bytes,&maker,&direct,&identified.tx,block_time,
+        ).map_err(|_| "canonical OrderFilled cannot authenticate signed leader order")?);
+    }
+    if fills.is_empty() {return Err("no authenticated leader order fills".into());}
+    Ok((PendingObject {hash: identified.tx.clone(), input: input.to_owned(), to: dest}, fills))
 }
 
 /// Deliberately bounded, keyless public-provider policy. A caller's old
 /// Alchemy/paid pending URL must NOT silently become the default log provider.
 /// A future public provider needs an explicit, measured update to this list.
-fn free_leader_rpc_endpoint(wss: &str) -> Option<&'static str> {
+pub(crate) fn free_leader_rpc_endpoint(wss: &str) -> Option<&'static str> {
     match wss {
         "wss://polygon-bor-rpc.publicnode.com" | "wss://polygon-bor-rpc.publicnode.com/" => {
             Some("https://polygon-bor-rpc.publicnode.com")
@@ -699,130 +749,6 @@ fn free_leader_rpc_endpoint(wss: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-
-/// Live confirmed-log source: only two leader-indexed maker/taker filters.
-/// One tiny eth_blockNumber RPC heartbeat/minute replaces 57,600 full
-/// newHeads notifications/day. Never subscribe to another user's trades.
-async fn pump_leader_logs(
-    name: &str,
-    url: &str,
-    out: &mpsc::UnboundedSender<RawTx>,
-    stats: &StatsSink,
-    watched: Arc<WatchedAddresses>,
-) -> Result<(), String> {
-    let rpc_url = free_leader_rpc_endpoint(url).ok_or_else(||
-        "leader-logs refuses unverified or metered URL; use keyless PublicNode/dRPC".to_owned()
-    )?;
-    let mut leaders = watched.snapshot();
-    while leaders.is_empty() {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        leaders = watched.snapshot();
-    }
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(8))
-        .build().map_err(|_| "leader-logs RPC client unavailable")?;
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await
-        .map_err(|_| "leader-logs websocket unavailable")?;
-    for (i, is_maker) in [true, false].iter().enumerate() {
-        let filter = leader_log_filter(&leaders, *is_maker, None);
-        let sub = serde_json::json!({"jsonrpc":"2.0", "id":i + 1, "method":"eth_subscribe",
-            "params":["logs", filter]});
-        ws.send(Message::Text(sub.to_string())).await.map_err(|_| "leader-logs subscribe failed")?;
-    }
-    let mut acknowledged = std::collections::HashSet::new();
-    while acknowledged.len() < 2 {
-        let incoming = tokio::time::timeout(Duration::from_secs(15), ws.next()).await
-            .map_err(|_| "leader-logs subscription ack timeout")?;
-        let Some(Ok(Message::Text(t))) = incoming else {return Err("leader-logs ack socket closed".into())};
-        let msg: serde_json::Value = serde_json::from_str(&t).map_err(|_| "invalid leader-logs ack")?;
-        if msg.get("error").is_some() {return Err("leader-logs subscription rejected".into())}
-        if let Some(id) = msg["id"].as_u64() {
-            if !(1..=2).contains(&id) || msg["result"].as_str().filter(|x| !x.is_empty()).is_none() {
-                return Err("leader-logs subscription acknowledgement malformed".into());
-            }
-            acknowledged.insert(id);
-        }
-    }
-    let mut delivered = std::collections::HashSet::<String>::new();
-    let mut delivered_order = std::collections::VecDeque::<String>::new();
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    heartbeat.tick().await; // consume the immediate first tick
-    let mut heartbeat_pending = false;
-    let mut last_block: Option<u64> = None;
-    loop {
-        let msg = tokio::select! {
-            _ = heartbeat.tick() => {
-                if heartbeat_pending {
-                    return Err("leader-logs block heartbeat unanswered; reconnect".into());
-                }
-                ws.send(Message::Text(serde_json::json!({
-                    "jsonrpc":"2.0", "id":3, "method":"eth_blockNumber", "params":[]
-                }).to_string())).await.map_err(|_| "leader-logs heartbeat send failed")?;
-                heartbeat_pending = true;
-                continue;
-            }
-            incoming = ws.next() => match incoming {
-                Some(Ok(m)) => m,
-                Some(Err(_)) => return Err("leader-logs websocket receive failed".into()),
-                None => return Err("leader-logs websocket closed".into()),
-            }
-        };
-        let body = match msg {
-            Message::Text(t) => t,
-            Message::Ping(payload) => { ws.send(Message::Pong(payload)).await.map_err(|_| "leader-logs pong failed")?; continue; }
-            Message::Pong(_) => continue,
-            Message::Close(_) => return Err("leader-logs websocket closed".into()),
-            _ => continue,
-        };
-        if watched.snapshot() != leaders { return Ok(()); }
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|_| "malformed leader-logs subscription notification")?;
-        if json.get("error").is_some() { return Err("leader-logs provider rejected RPC or subscription".into()); }
-        if json.get("id").is_some() {
-            if json["id"].as_u64() != Some(3) || !heartbeat_pending {
-                return Err("unsolicited leader-logs RPC response".into());
-            }
-            let height = json["result"].as_str().and_then(valid_index)
-                .filter(|b| *b > 0).ok_or("invalid leader-logs heartbeat block")?;
-            if last_block.is_some_and(|prev| height <= prev) {
-                return Err("leader-logs RPC block height stopped advancing".into());
-            }
-            last_block = Some(height);
-            heartbeat_pending = false;
-            continue;
-        }
-        let Some(event) = json.pointer("/params/result") else {return Err("leader-logs notification has no result".into())};
-        let seen_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "wall clock unavailable")?.as_nanos();
-        let lead = detect_leader_log(event, &leaders)
-            .map_err(|_| "leader-logs unverified event: refused")?;
-        stats.frame();
-        if delivered.contains(&lead.tx) { continue; }
-        // The WSS log can beat the provider's HTTP receipt index; recheck
-        // the same authenticated identity a bounded number of times.
-        let mut resolved = None;
-        for attempt in 0..3 {
-            match resolve_leader_log(&http, rpc_url, event, &lead, &leaders).await {
-                Ok(found) => {resolved = Some(found); break;}
-                Err(reason) if attempt == 2 => return Err(reason),
-                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
-            }
-        }
-        let (tx, authenticated_leaders) = resolved.ok_or("leader-logs resolution unavailable")?;
-        let input = hex::decode(tx.input.strip_prefix("0x").ok_or("settled calldata missing 0x")?)
-            .map_err(|_| "invalid settled calldata")?;
-        let raw = RawTx { source: name.to_owned(), hash: tx.hash.clone(), input,
-            to_neg_risk: tx.to == NEG_RISK_CTF_EXCHANGE_V2, to: tx.to,
-            seen_ns, authenticated_leaders: Some(authenticated_leaders) };
-        if out.send(raw).is_err() { return Ok(()); }
-        stats.exchange_tx();
-        delivered.insert(tx.hash.clone()); delivered_order.push_back(tx.hash);
-        if delivered_order.len() > 8192 {
-            if let Some(old) = delivered_order.pop_front() {delivered.remove(&old);}
-        }
-    }
-}
-
 
 #[cfg(test)]
 mod leader_log_tests {
